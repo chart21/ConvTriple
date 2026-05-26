@@ -14,6 +14,7 @@
 
 #include "core/keys.hpp"
 #include "ot/bit-triple-generator.h"
+#include "protocols/ot_proto.hpp"
 #include "utils.hpp"
 
 namespace Iface {
@@ -39,6 +40,12 @@ void generateBoolTriplesCheetah(uint8_t a[], uint8_t b[], uint8_t c[], int bitle
                                 uint64_t num_triples, const std::string& ip, int port, int party,
                                 int threads = 1, TripleGenMethod method = _16KKOT_to_4OT,
                                 unsigned io_offset = 1);
+
+void generateBool3TupleCheetah(Beaver3Tuples tuples, uint64_t num_tuples, const std::string& ip,
+                               int port, int party);
+
+void generateBool4TupleCheetah(Beaver4Tuples tuples, uint64_t num_tuples, const std::string& ip,
+                               int port, int party);
 
 void generateArithTriplesCheetah(const UINT_TYPE a[], const UINT_TYPE b[], UINT_TYPE c[],
                                  int bitlength, uint64_t num_triples, const std::string& ip,

@@ -112,6 +112,72 @@ void generateBoolTriplesCheetah(uint8_t a[], uint8_t b[], uint8_t c[],
     // keys.disconnect();
 }
 
+void generateBool3TupleCheetah(Beaver3Tuples tuples, uint64_t num_tuples, const std::string& ip,
+                               int port, int party) {
+    int threads = 1;
+    unsigned io_offset = 1;
+
+    Utils::log(Utils::Level::INFO, "P", party - 1, ": num_tuples (BOOL3): ", num_tuples);
+    auto& keys = Keys<IO::NetIO>::instance(party, ip, port, threads, io_offset);
+
+    auto start = measure::now();
+
+    auto** ios = keys.get_ios(threads);
+    TripleGenerator<IO::NetIO> triple_gen(party, ios[0], keys.get_otpack(0), false);
+
+    switch (party) {
+        case emp::ALICE:
+            Server::tuple3_gen(triple_gen, tuples, num_tuples);
+            break;
+        case emp::BOB:
+            Client::tuple3_gen(triple_gen, tuples, num_tuples);
+            break;
+        default:
+            Utils::log(Utils::Level::ERROR, "Unknown party: P", party - 1);
+            return;
+    }
+
+    Utils::log(Utils::Level::INFO, "P", party - 1,
+               ": Bool3 tuple time[s]: ", Utils::to_sec(Utils::time_diff(start)));
+    std::string unit;
+    double data = 0;
+    data += Utils::to_MB(ios[0]->counter, unit);
+    Utils::log(Utils::Level::INFO, "P", party - 1, ": Bool3 tuple data[", unit, "]: ", data);
+}
+
+void generateBool4TupleCheetah(Beaver4Tuples tuples, uint64_t num_tuples, const std::string& ip,
+                               int port, int party) {
+    int threads = 1;
+    unsigned io_offset = 1;
+
+    Utils::log(Utils::Level::INFO, "P", party - 1, ": num_tuples (BOOL4): ", num_tuples);
+    auto& keys = Keys<IO::NetIO>::instance(party, ip, port, threads, io_offset);
+
+    auto start = measure::now();
+
+    auto** ios = keys.get_ios(threads);
+    TripleGenerator<IO::NetIO> triple_gen(party, ios[0], keys.get_otpack(0), false);
+
+    switch (party) {
+        case emp::ALICE:
+            Server::tuple4_gen(triple_gen, tuples, num_tuples);
+            break;
+        case emp::BOB:
+            Client::tuple4_gen(triple_gen, tuples, num_tuples);
+            break;
+        default:
+            Utils::log(Utils::Level::ERROR, "Unknown party: P", party - 1);
+            return;
+    }
+
+    Utils::log(Utils::Level::INFO, "P", party - 1,
+               ": Bool4 tuple time[s]: ", Utils::to_sec(Utils::time_diff(start)));
+    std::string unit;
+    double data = 0;
+    data += Utils::to_MB(ios[0]->counter, unit);
+    Utils::log(Utils::Level::INFO, "P", party - 1, ": Bool4 tuple data[", unit, "]: ", data);
+}
+
 void generateArithTriplesCheetah(const UINT_TYPE a[], const UINT_TYPE b[], UINT_TYPE c[],
                                  int bitlength, uint64_t num_triples, const std::string& ip,
                                  int port, int party, int threads, Utils::PROTO proto,
