@@ -128,6 +128,30 @@ endif()
 message(STATUS "TRIPLE_VERIFY: ${TRIPLE_VERIFY}")
 message(STATUS "TRIPLE_COLOR: ${TRIPLE_COLOR}")
 
+set(tuples3_test cheetah_tuples3_test)
+add_executable(${tuples3_test} tuples3_test.cpp)
+target_link_libraries(${tuples3_test} PRIVATE ${HE_LIB} Eigen3::Eigen)
+target_include_directories(${tuples3_test} PRIVATE ${EIGEN3_INCLUDE_DIR})
+target_compile_definitions(${tuples3_test} PUBLIC USE_CHEETAH=1)
+target_compile_options(
+    ${tuples3_test} PRIVATE
+    "$<$<CONFIG:Debug>:-g3;-ggdb;-Og;-Wall;-Wextra>"
+    "$<$<CONFIG:Release>:-Wall;-Wextra>"
+    "-march=native;-Wno-ignored-attributes;-Wno-ignored-qualifiers;-Wno-unused-parameter"
+)
+
+set(tuples4_test cheetah_tuples4_test)
+add_executable(${tuples4_test} tuples4_test.cpp)
+target_link_libraries(${tuples4_test} PRIVATE ${HE_LIB} Eigen3::Eigen)
+target_include_directories(${tuples4_test} PRIVATE ${EIGEN3_INCLUDE_DIR})
+target_compile_definitions(${tuples4_test} PUBLIC USE_CHEETAH=1)
+target_compile_options(
+    ${tuples4_test} PRIVATE
+    "$<$<CONFIG:Debug>:-g3;-ggdb;-Og;-Wall;-Wextra>"
+    "$<$<CONFIG:Release>:-Wall;-Wextra>"
+    "-march=native;-Wno-ignored-attributes;-Wno-ignored-qualifiers;-Wno-unused-parameter"
+)
+
 file(GLOB_RECURSE SRC_FILES
     "${CMAKE_CURRENT_SOURCE_DIR}/*.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/*.hpp"
