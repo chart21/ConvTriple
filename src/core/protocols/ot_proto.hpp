@@ -20,38 +20,43 @@
 #include "core/utils.hpp"
 #include "ot/cheetah-ot_pack.h"
 
-struct Beaver3Tuples {
-    uint8_t * a;
-    uint8_t * b;
-    uint8_t * c;
+template <typename Datatype>
+struct Beaver3TuplesD {
+    Datatype* a;
+    Datatype* b;
+    Datatype* c;
 
-    uint8_t * ab;
-    uint8_t * ac;
-    uint8_t * bc;
+    Datatype* ab;
+    Datatype* ac;
+    Datatype* bc;
     
-    uint8_t * abc;
+    Datatype* abc;
 };
 
-struct Beaver4Tuples {
-    uint8_t * a;
-    uint8_t * b;
-    uint8_t * c;
-    uint8_t * d;
+template <typename Datatype>
+struct Beaver4TuplesD {
+    Datatype* a;
+    Datatype* b;
+    Datatype* c;
+    Datatype* d;
 
-    uint8_t * ab;
-    uint8_t * ac;
-    uint8_t * ad;
-    uint8_t * bc;
-    uint8_t * bd;
-    uint8_t * cd;
-    
-    uint8_t * abc;
-    uint8_t * abd;
-    uint8_t * acd;
-    uint8_t * bcd;
-    
-    uint8_t * abcd;
+    Datatype* ab;
+    Datatype* ac;
+    Datatype* ad;
+    Datatype* bc;
+    Datatype* bd;
+    Datatype* cd;
+
+    Datatype* abc;
+    Datatype* abd;
+    Datatype* acd;
+    Datatype* bcd;
+
+    Datatype* abcd;
 };
+
+using Beaver3Tuples = Beaver3TuplesD<uint8_t>;
+using Beaver4Tuples = Beaver4TuplesD<uint8_t>; 
 
 /// Packs bits in-place without resizing the buffer.
 inline void pack_bool(uint8_t* bytes, size_t num_bits) {
