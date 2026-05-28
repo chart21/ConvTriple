@@ -54,7 +54,7 @@ class PROF : public seal::MMProf {
     seal::MemoryPoolHandle get_pool(uint64_t) { return *handle; }
 };
 
-void generateBoolCOTTriplesCheetah(uint8_t a[], uint8_t b[], uint8_t c[],
+void generateBoolCOTMultTriplesCheetah(uint8_t a[], uint8_t b[], uint8_t c[],
                                 int bitlength [[maybe_unused]], uint64_t num_triples,
                                 const std::string& ip, int port, int party, int threads,
                                 TripleGenMethod method, unsigned io_offset) {
@@ -82,10 +82,10 @@ void generateBoolCOTTriplesCheetah(uint8_t a[], uint8_t b[], uint8_t c[],
             int current = std::min(end - total, static_cast<int>(MAX_BOOL / threads));
             switch (cur_party) {
             case emp::ALICE:
-                Server::cot_multiply_shares(emp::ALICE, triple_gen.otpack(), a + total, b + total, c + total, current);
+                cot_multiply_shares(emp::ALICE, triple_gen.otpack, a + total, b + total, c + total, current);
                 break;
             case emp::BOB:
-                Client::cot_multiply_shares(emp::BOB, triple_gen.otpack(), a + total, b + total, c + total, current);
+                cot_multiply_shares(emp::BOB, triple_gen.otpack, a + total, b + total, c + total, current);
                 break;
             }
             total += current;
