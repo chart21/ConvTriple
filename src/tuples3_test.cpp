@@ -173,7 +173,7 @@ bool run(int party, const std::string& ip, int port, size_t num_tuples) {
     TripleGenerator<IO::NetIO> triple_gen(party, ios[0], keys.get_otpack(0), false);
 
     auto tuple_gen_start = measure::now();
-    Iface::generateBool3TupleCheetah(buffers.as_tuples(), num_tuples, ip, port, party);
+    Iface::generateBool3TupleCheetah(buffers.as_tuples(), num_tuples, ip, port, party, 1, 1);
     const auto secs_passed = Utils::to_sec(Utils::time_diff(tuple_gen_start));
     std::cout << std::format("{}: tuples generated in: {:.2f} seconds / {:.2f} triples per second\n",
         party_name(party), secs_passed, static_cast<double>(num_tuples) / secs_passed);

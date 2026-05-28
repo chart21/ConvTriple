@@ -187,7 +187,7 @@ bool run(int party, const std::string& ip, int port, size_t num_tuples) {
 
     auto tuple_gen_start = measure::now();
 
-    Iface::generateBool4TupleCheetah(buffers.as_tuples(), num_tuples, ip, port, party);
+    Iface::generateBool4TupleCheetah(buffers.as_tuples(), num_tuples, ip, port, party, 1, 1);
 
     const auto secs_passed = Utils::to_sec(Utils::time_diff(tuple_gen_start));
     std::cout << std::format("{}: tuples generated in: {:.2f} seconds / {:.2f} triples per second\n",

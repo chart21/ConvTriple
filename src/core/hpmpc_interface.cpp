@@ -113,9 +113,9 @@ void generateBoolTriplesCheetah(uint8_t a[], uint8_t b[], uint8_t c[],
 }
 
 void generateBool3TupleCheetah(Beaver3Tuples tuples, uint64_t num_tuples, const std::string& ip,
-                               int port, int party) {
-    int threads = 1;
-    unsigned io_offset = 1;
+                               int port, int party, int threads, unsigned io_offset) {
+    // int threads = 1;
+    // unsigned io_offset = 1;
 
     Utils::log(Utils::Level::INFO, "P", party - 1, ": num_tuples (BOOL3): ", num_tuples);
     auto& keys = Keys<IO::NetIO>::instance(party, ip, port, threads, io_offset);
@@ -146,9 +146,9 @@ void generateBool3TupleCheetah(Beaver3Tuples tuples, uint64_t num_tuples, const 
 }
 
 void generateBool4TupleCheetah(Beaver4Tuples tuples, uint64_t num_tuples, const std::string& ip,
-                               int port, int party) {
-    int threads = 1;
-    unsigned io_offset = 1;
+                               int port, int party, int threads, unsigned io_offset) {
+    // int threads = 1;
+    // unsigned io_offset = 1;
 
     Utils::log(Utils::Level::INFO, "P", party - 1, ": num_tuples (BOOL4): ", num_tuples);
     auto& keys = Keys<IO::NetIO>::instance(party, ip, port, threads, io_offset);
