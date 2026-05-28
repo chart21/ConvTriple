@@ -54,6 +54,62 @@ class PROF : public seal::MMProf {
     seal::MemoryPoolHandle get_pool(uint64_t) { return *handle; }
 };
 
+void generateBoolCOTTriplesCheetah(uint8_t a[], uint8_t b[], uint8_t c[],
+                                int bitlength [[maybe_unused]], uint64_t num_triples,
+                                const std::string& ip, int port, int party, int threads,
+                                TripleGenMethod method, unsigned io_offset) {
+    Utils::log(Utils::Level::INFO, "P", party - 1, ": num_triples (BOOL COT MULT): ", num_triples);
+    // std::atomic<int> setup = 0;
+    auto& keys = Keys<IO::NetIO>::instance(party, ip, port, threads, io_offset);
+
+    auto start = measure::now();
+
+    auto** ios = keys.get_ios(threads);
+
+    auto func = [&](int wid, int start, int end) -> Code {
+        if (start >= end)
+            return Code::OK;
+
+        int cur_party = wid & 1 ? OTHER_PARTY(party) : party;
+        // auto start_setup = measure::now();
+
+        // sci::OTPack<IO::NetIO> pack(ios + wid, 1, cur_party, true, false);
+        TripleGenerator<IO::NetIO> triple_gen(cur_party, ios[wid], keys.get_otpack(wid), false);
+
+        // setup += Utils::time_diff(start_setup);
+
+        for (int total = start; total < end;) {
+            int current = std::min(end - total, static_cast<int>(MAX_BOOL / threads));
+            switch (cur_party) {
+            case emp::ALICE:
+                Server::cot_multiply_shares(emp::ALICE, triple_gen.otpack(), a + total, b + total, c + total, current);
+                break;
+            case emp::BOB:
+                Client::cot_multiply_shares(emp::BOB, triple_gen.otpack(), a + total, b + total, c + total, current);
+                break;
+            }
+            total += current;
+        }
+        return Code::OK;
+    };
+
+    gemini::ThreadPool tpool(threads);
+    gemini::LaunchWorks(tpool, num_triples, func);
+
+    Utils::log(Utils::Level::INFO, "P", party - 1,
+               ": Bool COT Mult triple time[s]: ", Utils::to_sec(Utils::time_diff(start)));
+    std::string unit;
+    double data = 0;
+    for (int i = 0; i < threads; ++i) data += Utils::to_MB(ios[i]->counter, unit);
+    Utils::log(Utils::Level::INFO, "P", party - 1, ": Bool COT Mult triple data[", unit, "]: ", data);
+
+    // Utils::log(Utils::Level::INFO, "P", party - 1, ": Setup time [s]: ",
+    //            Utils::to_sec(setup.load())
+    //                / (num_triples > static_cast<size_t>(threads) ? threads : num_triples));
+
+    // keys.disconnect();
+}
+
 void generateBoolTriplesCheetah(uint8_t a[], uint8_t b[], uint8_t c[],
                                 int bitlength [[maybe_unused]], uint64_t num_triples,
                                 const std::string& ip, int port, int party, int threads,
@@ -114,67 +170,97 @@ void generateBoolTriplesCheetah(uint8_t a[], uint8_t b[], uint8_t c[],
 
 void generateBool3TupleCheetah(Beaver3Tuples tuples, uint64_t num_tuples, const std::string& ip,
                                int port, int party, int threads, unsigned io_offset) {
-    // int threads = 1;
-    // unsigned io_offset = 1;
-
     Utils::log(Utils::Level::INFO, "P", party - 1, ": num_tuples (BOOL3): ", num_tuples);
     auto& keys = Keys<IO::NetIO>::instance(party, ip, port, threads, io_offset);
 
     auto start = measure::now();
 
     auto** ios = keys.get_ios(threads);
-    TripleGenerator<IO::NetIO> triple_gen(party, ios[0], keys.get_otpack(0), false);
 
-    switch (party) {
-        case emp::ALICE:
-            Server::tuple3_gen(triple_gen, tuples, num_tuples);
-            break;
-        case emp::BOB:
-            Client::tuple3_gen(triple_gen, tuples, num_tuples);
-            break;
-        default:
-            Utils::log(Utils::Level::ERROR, "Unknown party: P", party - 1);
-            return;
-    }
+    auto func = [&](int wid, int start, int end) -> Code {
+        if (start >= end)
+            return Code::OK;
+
+        int cur_party = wid & 1 ? OTHER_PARTY(party) : party;
+        TripleGenerator<IO::NetIO> triple_gen(cur_party, ios[wid], keys.get_otpack(wid), false);
+
+        for (int total = start; total < end;) {
+            int current = std::min(end - total, static_cast<int>(MAX_BOOL / threads));
+            Beaver3Tuples sub{
+                tuples.a + total, tuples.b + total, tuples.c + total,
+                tuples.ab + total, tuples.ac + total, tuples.bc + total,
+                tuples.abc + total
+            };
+            switch (cur_party) {
+                case emp::ALICE:
+                    Server::tuple3_gen(triple_gen, sub, current * 8);
+                    break;
+                case emp::BOB:
+                    Client::tuple3_gen(triple_gen, sub, current * 8);
+                    break;
+            }
+            total += current;
+        }
+        return Code::OK;
+    };
+
+    gemini::ThreadPool tpool(threads);
+    gemini::LaunchWorks(tpool, num_tuples / 8, func);
 
     Utils::log(Utils::Level::INFO, "P", party - 1,
                ": Bool3 tuple time[s]: ", Utils::to_sec(Utils::time_diff(start)));
     std::string unit;
     double data = 0;
-    data += Utils::to_MB(ios[0]->counter, unit);
+    for (int i = 0; i < threads; ++i) data += Utils::to_MB(ios[i]->counter, unit);
     Utils::log(Utils::Level::INFO, "P", party - 1, ": Bool3 tuple data[", unit, "]: ", data);
 }
 
 void generateBool4TupleCheetah(Beaver4Tuples tuples, uint64_t num_tuples, const std::string& ip,
                                int port, int party, int threads, unsigned io_offset) {
-    // int threads = 1;
-    // unsigned io_offset = 1;
-
     Utils::log(Utils::Level::INFO, "P", party - 1, ": num_tuples (BOOL4): ", num_tuples);
     auto& keys = Keys<IO::NetIO>::instance(party, ip, port, threads, io_offset);
 
     auto start = measure::now();
 
     auto** ios = keys.get_ios(threads);
-    TripleGenerator<IO::NetIO> triple_gen(party, ios[0], keys.get_otpack(0), false);
 
-    switch (party) {
-        case emp::ALICE:
-            Server::tuple4_gen(triple_gen, tuples, num_tuples);
-            break;
-        case emp::BOB:
-            Client::tuple4_gen(triple_gen, tuples, num_tuples);
-            break;
-        default:
-            Utils::log(Utils::Level::ERROR, "Unknown party: P", party - 1);
-            return;
-    }
+    auto func = [&](int wid, int start, int end) -> Code {
+        if (start >= end)
+            return Code::OK;
+
+        int cur_party = wid & 1 ? OTHER_PARTY(party) : party;
+        TripleGenerator<IO::NetIO> triple_gen(cur_party, ios[wid], keys.get_otpack(wid), false);
+
+        for (int total = start; total < end;) {
+            int current = std::min(end - total, static_cast<int>(MAX_BOOL / threads));
+            Beaver4Tuples sub{
+                tuples.a + total, tuples.b + total, tuples.c + total, tuples.d + total,
+                tuples.ab + total, tuples.ac + total, tuples.ad + total,
+                tuples.bc + total, tuples.bd + total, tuples.cd + total,
+                tuples.abc + total, tuples.abd + total, tuples.acd + total, tuples.bcd + total,
+                tuples.abcd + total
+            };
+            switch (cur_party) {
+                case emp::ALICE:
+                    Server::tuple4_gen(triple_gen, sub, current * 8);
+                    break;
+                case emp::BOB:
+                    Client::tuple4_gen(triple_gen, sub, current * 8);
+                    break;
+            }
+            total += current;
+        }
+        return Code::OK;
+    };
+
+    gemini::ThreadPool tpool(threads);
+    gemini::LaunchWorks(tpool, num_tuples / 8, func);
 
     Utils::log(Utils::Level::INFO, "P", party - 1,
                ": Bool4 tuple time[s]: ", Utils::to_sec(Utils::time_diff(start)));
     std::string unit;
     double data = 0;
-    data += Utils::to_MB(ios[0]->counter, unit);
+    for (int i = 0; i < threads; ++i) data += Utils::to_MB(ios[i]->counter, unit);
     Utils::log(Utils::Level::INFO, "P", party - 1, ": Bool4 tuple data[", unit, "]: ", data);
 }
 
