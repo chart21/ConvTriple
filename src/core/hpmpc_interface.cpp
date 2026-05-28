@@ -57,7 +57,7 @@ class PROF : public seal::MMProf {
 void generateBoolCOTMultTriplesCheetah(uint8_t a[], uint8_t b[], uint8_t c[],
                                 int bitlength [[maybe_unused]], uint64_t num_triples,
                                 const std::string& ip, int port, int party, int threads,
-                                TripleGenMethod method, unsigned io_offset) {
+                                unsigned io_offset) {
     Utils::log(Utils::Level::INFO, "P", party - 1, ": num_triples (BOOL COT MULT): ", num_triples);
     // std::atomic<int> setup = 0;
     auto& keys = Keys<IO::NetIO>::instance(party, ip, port, threads, io_offset);

@@ -35,6 +35,10 @@ void exchange_keys(Channel** ios, const SerKey& pkey, seal::PublicKey& o_pkey,
         break;
     }
 }
+void generateBoolCOTMultTriplesCheetah(uint8_t a[], uint8_t b[], uint8_t c[],
+                                int bitlength [[maybe_unused]], uint64_t num_triples,
+                                const std::string& ip, int port, int party, int threads,
+                                 unsigned io_offset = 1);
 
 void generateBoolTriplesCheetah(uint8_t a[], uint8_t b[], uint8_t c[], int bitlength,
                                 uint64_t num_triples, const std::string& ip, int port, int party,
