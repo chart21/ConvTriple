@@ -110,6 +110,55 @@ void generateBoolCOTMultTriplesCheetah(uint8_t a[], uint8_t b[], uint8_t c[],
     // keys.disconnect();
 }
 
+void generateRandomMultiplicationsCheetah(uint8_t a[], uint8_t b[], uint64_t num_muls,
+                                          const std::string& ip, int port, int party,
+                                          int threads, unsigned io_offset) {
+    assert(num_muls % 8 == 0 && "num_muls must be a multiple of 8");
+    Utils::log(Utils::Level::INFO, "P", party - 1, ": num_muls (BOOL MUL): ", num_muls);
+    auto& keys = Keys<IO::NetIO>::instance(party, ip, port, threads, io_offset);
+
+    auto start = measure::now();
+    auto** ios = keys.get_ios(threads);
+
+    uint64_t num_bytes = num_muls / 8;
+
+    auto func = [&](int wid, int start, int end) -> Code {
+        if (start >= end)
+            return Code::OK;
+
+        int cur_party = wid & 1 ? OTHER_PARTY(party) : party;
+        auto* otpack = keys.get_otpack(wid);
+
+        uint64_t total_bytes = end - start;
+        uint64_t current_muls = total_bytes * 8;
+
+        std::memset(a + start, 0, total_bytes);
+        std::memset(b + start, 0, total_bytes);
+
+        switch (cur_party) {
+        case emp::ALICE:
+            Server::mul_gen(otpack, a + start, b + start, current_muls);
+            break;
+        case emp::BOB:
+            Client::mul_gen(otpack, a + start, b + start, current_muls);
+            break;
+        default:
+            Utils::log(Utils::Level::ERROR, "Unknown party: P", party - 1);
+        }
+        return Code::OK;
+    };
+
+    gemini::ThreadPool tpool(threads);
+    gemini::LaunchWorks(tpool, num_bytes, func);
+
+    Utils::log(Utils::Level::INFO, "P", party - 1,
+               ": Bool mul time[s]: ", Utils::to_sec(Utils::time_diff(start)));
+    std::string unit;
+    double data = 0;
+    for (int i = 0; i < threads; ++i) data += Utils::to_MB(ios[i]->counter, unit);
+    Utils::log(Utils::Level::INFO, "P", party - 1, ": Bool mul data[", unit, "]: ", data);
+}
+
 void generateBoolTriplesCheetah(uint8_t a[], uint8_t b[], uint8_t c[],
                                 int bitlength [[maybe_unused]], uint64_t num_triples,
                                 const std::string& ip, int port, int party, int threads,

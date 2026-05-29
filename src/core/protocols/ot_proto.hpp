@@ -177,6 +177,11 @@ void tuple3_gen(TripleGenerator<Channel>& generator, Beaver3Tuples data, size_t 
 template <class Channel>
 void tuple4_gen(TripleGenerator<Channel>& generator, Beaver4Tuples data, size_t num_tuples);
 
+/// Generate random (a, u), (b, v) with ab = u ^ v. See also `Client::mul_gen`.
+/// Implements Algorithm 1 from https://ia.cr/2013/552.
+template <class IO>
+void mul_gen(const sci::OTPack<IO>* otpack, uint8_t* a, uint8_t* u, size_t num_muls);
+
 } // namespace Server
 
 namespace Client {
@@ -193,6 +198,12 @@ void tuple3_gen(TripleGenerator<Channel>& generator, Beaver3Tuples data, size_t 
 
 template <class Channel>
 void tuple4_gen(TripleGenerator<Channel>& generator, Beaver4Tuples data, size_t num_tuples);
+
+/// Generate random (a, u), (b, v) with ab = u ^ v. See also `Server::mul_gen`.
+/// Implements Algorithm 1 from https://ia.cr/2013/552.
+template <class IO>
+void mul_gen(const sci::OTPack<IO>* otpack, uint8_t* b, uint8_t* v, size_t num_muls);
+
 } // namespace Client
 
 template <class Channel>
@@ -415,6 +426,38 @@ void Client::tuple4_gen(TripleGenerator<Channel>& generator, Beaver4Tuples data,
                    {data.ac, data.ad, data.bc, data.bd, data.abc, data.abd, data.acd,
                     data.bcd, data.abcd},
                    num_bytes);
+}
+
+template <class IO>
+void Server::mul_gen(const sci::OTPack<IO>* otpack, uint8_t* a, uint8_t* u, size_t num_muls){
+    auto a_buf = std::make_unique<bool[]>(num_muls);
+    auto x_a = std::make_unique<uint8_t[]>(num_muls);
+    otpack->silent_ot_reversed->template recv_ot_rm_rc<uint8_t>(x_a.get(), a_buf.get(), num_muls, 1);
+    otpack->io->flush();
+
+    // pack `bool`s
+    for (size_t i = 0; i < num_muls; i++) {
+        size_t byte_idx = i / 8;
+        size_t bit_idx = i % 8;
+        u[byte_idx] |= x_a[i] << bit_idx;
+        a[byte_idx] |= static_cast<uint8_t>(a_buf[i]) << bit_idx;
+    }
+}
+
+template <class IO>
+void Client::mul_gen(const sci::OTPack<IO>* otpack, uint8_t* b, uint8_t* v, size_t num_muls){
+    auto x0 = std::make_unique<uint8_t[]>(num_muls);
+    auto x1 = std::make_unique<uint8_t[]>(num_muls);
+    otpack->silent_ot_reversed->template send_ot_rm_rc<uint8_t>(x0.get(), x1.get(), num_muls, 1);
+    otpack->io->flush();
+
+    for (size_t i = 0; i < num_muls; ++i) {
+        size_t byte_idx = i / 8;
+        size_t bit_idx = i % 8;
+        uint8_t x0_bit = x0[i] << bit_idx;
+        b[byte_idx] |= x0_bit ^ (x1[i] << bit_idx); 
+        v[byte_idx] |= x0_bit;
+    }
 }
 
 #endif

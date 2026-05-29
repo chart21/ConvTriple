@@ -152,6 +152,23 @@ target_compile_options(
     "-march=native;-Wno-ignored-attributes;-Wno-ignored-qualifiers;-Wno-unused-parameter"
 )
 
+set(mul_gen_test cheetah_mul_gen_test)
+add_executable(${mul_gen_test} mul_gen_test.cpp)
+target_link_libraries(${mul_gen_test} PRIVATE ${HE_LIB} Eigen3::Eigen)
+target_include_directories(${mul_gen_test} PRIVATE ${EIGEN3_INCLUDE_DIR})
+target_compile_definitions(${mul_gen_test} PUBLIC USE_CHEETAH=1)
+target_compile_definitions(${mul_gen_test} PRIVATE
+    LOGLEVEL=${TRIPLE_LOG_LEVEL}
+    PRG_SEED=${TRIPLE_SEED}
+    TRIPLE_BITLEN=${TRIPLE_BITLEN}
+)
+target_compile_options(
+    ${mul_gen_test} PRIVATE
+    "$<$<CONFIG:Debug>:-g3;-ggdb;-Og;-Wall;-Wextra>"
+    "$<$<CONFIG:Release>:-Wall;-Wextra>"
+    "-march=native;-Wno-ignored-attributes;-Wno-ignored-qualifiers;-Wno-unused-parameter"
+)
+
 file(GLOB_RECURSE SRC_FILES
     "${CMAKE_CURRENT_SOURCE_DIR}/*.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/*.hpp"
