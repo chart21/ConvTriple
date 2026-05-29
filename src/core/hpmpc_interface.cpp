@@ -205,7 +205,7 @@ void generateBool3TupleCheetah(Beaver3Tuples tuples, uint64_t num_tuples, const 
     };
 
     gemini::ThreadPool tpool(threads);
-    gemini::LaunchWorks(tpool, num_tuples / 8, func);
+    gemini::LaunchWorks(tpool, num_tuples, func);
 
     Utils::log(Utils::Level::INFO, "P", party - 1,
                ": Bool3 tuple time[s]: ", Utils::to_sec(Utils::time_diff(start)));
@@ -254,7 +254,7 @@ void generateBool4TupleCheetah(Beaver4Tuples tuples, uint64_t num_tuples, const 
     };
 
     gemini::ThreadPool tpool(threads);
-    gemini::LaunchWorks(tpool, num_tuples / 8, func);
+    gemini::LaunchWorks(tpool, num_tuples, func);
 
     Utils::log(Utils::Level::INFO, "P", party - 1,
                ": Bool4 tuple time[s]: ", Utils::to_sec(Utils::time_diff(start)));
