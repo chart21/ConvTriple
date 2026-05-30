@@ -76,11 +76,28 @@ class PRG128 {
     }
 
     void random_data(void* data, int nbytes) {
-        random_block((block128*)data, nbytes / 16);
-        if (nbytes % 16 != 0) {
+        char* dst = (char*)data;
+        int nblocks = nbytes / 16;
+        int remainder = nbytes % 16;
+        if ((reinterpret_cast<uintptr_t>(data) & 15) == 0) {
+            random_block((block128*)dst, nblocks);
+        } else {
+            block128 buf[AES_BATCH_SIZE];
+            constexpr int batch = AES_BATCH_SIZE;
+            int done = 0;
+            for (; done + batch <= nblocks; done += batch) {
+                random_block(buf, batch);
+                memcpy(dst + done * 16, buf, batch * 16);
+            }
+            if (done < nblocks) {
+                random_block(buf, nblocks - done);
+                memcpy(dst + done * 16, buf, (nblocks - done) * 16);
+            }
+        }
+        if (remainder != 0) {
             block128 extra;
             random_block(&extra, 1);
-            memcpy((nbytes / 16 * 16) + (char*)data, &extra, nbytes % 16);
+            memcpy(dst + nblocks * 16, &extra, remainder);
         }
     }
 
@@ -91,16 +108,7 @@ class PRG128 {
     }
 
     void random_data_unaligned(void* data, int nbytes) {
-        block128 tmp[AES_BATCH_SIZE];
-        for (int i = 0; i < nbytes / (AES_BATCH_SIZE * 16); i++) {
-            random_block(tmp, AES_BATCH_SIZE);
-            memcpy((16 * i * AES_BATCH_SIZE) + (uint8_t*)data, tmp, 16 * AES_BATCH_SIZE);
-        }
-        if (nbytes % (16 * AES_BATCH_SIZE) != 0) {
-            random_block(tmp, AES_BATCH_SIZE);
-            memcpy((nbytes / (16 * AES_BATCH_SIZE) * (16 * AES_BATCH_SIZE)) + (uint8_t*)data, tmp,
-                   nbytes % (16 * AES_BATCH_SIZE));
-        }
+        random_data(data, nbytes);
     }
 
     void random_block(block128* data, int nblocks = 1) {
@@ -210,11 +218,28 @@ class PRG256 {
     }
 
     void random_data(void* data, int nbytes) {
-        random_block((block128*)data, nbytes / 16);
-        if (nbytes % 16 != 0) {
+        char* dst = (char*)data;
+        int nblocks = nbytes / 16;
+        int remainder = nbytes % 16;
+        if ((reinterpret_cast<uintptr_t>(data) & 15) == 0) {
+            random_block((block128*)dst, nblocks);
+        } else {
+            block128 buf[AES_BATCH_SIZE];
+            constexpr int batch = AES_BATCH_SIZE;
+            int done = 0;
+            for (; done + batch <= nblocks; done += batch) {
+                random_block(buf, batch);
+                memcpy(dst + done * 16, buf, batch * 16);
+            }
+            if (done < nblocks) {
+                random_block(buf, nblocks - done);
+                memcpy(dst + done * 16, buf, (nblocks - done) * 16);
+            }
+        }
+        if (remainder != 0) {
             block128 extra;
             random_block(&extra, 1);
-            memcpy((nbytes / 16 * 16) + (char*)data, &extra, nbytes % 16);
+            memcpy(dst + nblocks * 16, &extra, remainder);
         }
     }
 
@@ -225,16 +250,7 @@ class PRG256 {
     }
 
     void random_data_unaligned(void* data, int nbytes) {
-        block128 tmp[AES_BATCH_SIZE];
-        for (int i = 0; i < nbytes / (AES_BATCH_SIZE * 16); i++) {
-            random_block(tmp, AES_BATCH_SIZE);
-            memcpy((16 * i * AES_BATCH_SIZE) + (uint8_t*)data, tmp, 16 * AES_BATCH_SIZE);
-        }
-        if (nbytes % (16 * AES_BATCH_SIZE) != 0) {
-            random_block(tmp, AES_BATCH_SIZE);
-            memcpy((nbytes / (16 * AES_BATCH_SIZE) * (16 * AES_BATCH_SIZE)) + (uint8_t*)data, tmp,
-                   nbytes % (16 * AES_BATCH_SIZE));
-        }
+        random_data(data, nbytes);
     }
 
     void random_block(block128* data, int nblocks = 1) {
