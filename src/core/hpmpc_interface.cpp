@@ -84,10 +84,10 @@ void generateBoolCOTMultTriplesCheetah(uint8_t a[], uint8_t b[], uint8_t c[],
             int current = std::min(end - total, static_cast<int>(MAX_BOOL / threads));
             switch (cur_party) {
             case emp::ALICE:
-                cot_multiply_shares(emp::ALICE, triple_gen.otpack, a + total, b + total, c + total, current);
+                cot_multiply_shares(emp::ALICE, triple_gen.otpack, a + total, b + total, c + total, current * 8);
                 break;
             case emp::BOB:
-                cot_multiply_shares(emp::BOB, triple_gen.otpack, a + total, b + total, c + total, current);
+                cot_multiply_shares(emp::BOB, triple_gen.otpack, a + total, b + total, c + total, current * 8);
                 break;
             }
             total += current;
