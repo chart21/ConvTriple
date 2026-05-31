@@ -224,6 +224,8 @@ void generateBoolTriplesCheetah(uint8_t a[], uint8_t b[], uint8_t c[],
 void generateBool3TupleCheetah(Beaver3Tuples tuples, uint64_t num_tuples, const std::string& ip,
                                int port, int party, int threads, unsigned io_offset) {
     Utils::log(Utils::Level::INFO, "P", party - 1, ": num_tuples (BOOL3): ", num_tuples);
+    require_tuple_count_multiple_of_8(num_tuples);
+    uint64_t num_bytes = (num_tuples + 7) / 8;
     auto& keys = Keys<IO::NetIO>::instance(party, ip, port, threads, io_offset);
 
     auto start = measure::now();
@@ -258,7 +260,7 @@ void generateBool3TupleCheetah(Beaver3Tuples tuples, uint64_t num_tuples, const 
     };
 
     gemini::ThreadPool tpool(threads);
-    gemini::LaunchWorks(tpool, num_tuples, func);
+    gemini::LaunchWorks(tpool, num_bytes, func);
 
     Utils::log(Utils::Level::INFO, "P", party - 1,
                ": Bool3 tuple time[s]: ", Utils::to_sec(Utils::time_diff(start)));
@@ -271,6 +273,8 @@ void generateBool3TupleCheetah(Beaver3Tuples tuples, uint64_t num_tuples, const 
 void generateBool4TupleCheetah(Beaver4Tuples tuples, uint64_t num_tuples, const std::string& ip,
                                int port, int party, int threads, unsigned io_offset) {
     Utils::log(Utils::Level::INFO, "P", party - 1, ": num_tuples (BOOL4): ", num_tuples);
+    require_tuple_count_multiple_of_8(num_tuples);
+    uint64_t num_bytes = (num_tuples + 7) / 8;
     auto& keys = Keys<IO::NetIO>::instance(party, ip, port, threads, io_offset);
 
     auto start = measure::now();
@@ -307,7 +311,7 @@ void generateBool4TupleCheetah(Beaver4Tuples tuples, uint64_t num_tuples, const 
     };
 
     gemini::ThreadPool tpool(threads);
-    gemini::LaunchWorks(tpool, num_tuples, func);
+    gemini::LaunchWorks(tpool, num_bytes, func);
 
     Utils::log(Utils::Level::INFO, "P", party - 1,
                ": Bool4 tuple time[s]: ", Utils::to_sec(Utils::time_diff(start)));
