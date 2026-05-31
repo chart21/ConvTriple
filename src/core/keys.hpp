@@ -31,6 +31,7 @@ class Keys {
         return _ios;
     }
     const sci::OTPack<Channel>* get_otpack(int idx) const { return _ot_packs[idx]; }
+    unsigned get_io_offset() const { return _io_offset; }
 
     void disconnect();
 
@@ -83,14 +84,16 @@ class Keys {
         _connected = true;
 
         auto time = Utils::to_sec(Utils::time_diff(start));
-        Utils::log(Utils::Level::INFO, "P", party - 1, ": Key exchange time[s]: ", time);
+        Utils::log(Utils::Level::INFO, "P", party - 1, ", PID", io_offset, ": Key exchange   s PRE: ", time, " (threads: ", threads, ")");
         std::string unit;
-        double data = 0;
+        double data_sent = 0, data_recv = 0;
         for (size_t i = 0; i < threads; ++i) {
-            data += Utils::to_MB(_ios[i]->counter, unit);
+            data_sent += Utils::to_MB(_ios[i]->counter, unit);
+            data_recv += Utils::to_MB(_ios[i]->recv_counter, unit);
             _ios[i]->counter = 0;
+            _ios[i]->recv_counter = 0;
         }
-        Utils::log(Utils::Level::INFO, "P", party - 1, ": Key exchange data[", unit, "]: ", data);
+        Utils::log(Utils::Level::INFO, "P", party - 1, ", PID", io_offset, ": Key exchange   MB SENT PRE: ", data_sent, "   MB RECEIVED PRE: ", data_recv);
     }
 
     ~Keys() noexcept {

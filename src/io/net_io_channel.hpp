@@ -62,17 +62,18 @@ class NetIO : public IOChannel<NetIO> {
     LastCall last_call  = LastCall::None;
 
     NetIO(NetIO&& other) noexcept {
-        is_server  = other.is_server;
-        mysocket   = other.mysocket;
-        consocket  = other.consocket;
-        stream     = other.stream;
-        buffer     = other.buffer;
-        has_sent   = other.has_sent;
-        addr       = other.addr;
-        port       = other.port;
-        num_rounds = other.num_rounds;
-        last_call  = other.last_call;
-        counter    = other.counter;
+        is_server    = other.is_server;
+        mysocket     = other.mysocket;
+        consocket    = other.consocket;
+        stream       = other.stream;
+        buffer       = other.buffer;
+        has_sent     = other.has_sent;
+        addr         = other.addr;
+        port         = other.port;
+        num_rounds   = other.num_rounds;
+        last_call    = other.last_call;
+        counter      = other.counter;
+        recv_counter = other.recv_counter;
 
         other.mysocket  = -1;
         other.consocket = -1;
@@ -198,17 +199,18 @@ class NetIO : public IOChannel<NetIO> {
         if (buffer)
             delete[] buffer;
 
-        is_server  = other.is_server;
-        mysocket   = other.mysocket;
-        consocket  = other.consocket;
-        stream     = other.stream;
-        buffer     = other.buffer;
-        has_sent   = other.has_sent;
-        addr       = other.addr;
-        port       = other.port;
-        num_rounds = other.num_rounds;
-        last_call  = other.last_call;
-        counter    = other.counter;
+        is_server    = other.is_server;
+        mysocket     = other.mysocket;
+        consocket    = other.consocket;
+        stream       = other.stream;
+        buffer       = other.buffer;
+        has_sent     = other.has_sent;
+        addr         = other.addr;
+        port         = other.port;
+        num_rounds   = other.num_rounds;
+        last_call    = other.last_call;
+        counter      = other.counter;
+        recv_counter = other.recv_counter;
 
         other.mysocket  = -1;
         other.consocket = -1;

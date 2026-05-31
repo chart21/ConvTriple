@@ -5,6 +5,7 @@
 #include <seal/serializable.h>
 #include <sstream>
 #include <thread>
+#include <unordered_map>
 
 #include "emp-tool/utils/constants.h"
 #include "protocols/bn_direct_proto.hpp"
@@ -32,6 +33,22 @@ constexpr uint64_t MAX_ARITH = 20'000'000;
 
 namespace Iface {
 
+// Accumulator for aggregated TRIPLE_STATS
+struct TripleStatEntry {
+    double mb_sent = 0;
+    double mb_recv = 0;
+    double time_s  = 0;
+};
+
+static std::unordered_map<std::string, TripleStatEntry> g_triple_stats;
+
+static void accumulateTripleStat(const std::string& type, double sent, double recv, double time) {
+    auto& e = g_triple_stats[type];
+    e.mb_sent += sent;
+    e.mb_recv += recv;
+    e.time_s  += time;
+}
+
 class PROF : public seal::MMProf {
     std::unique_ptr<seal::MemoryPoolHandle> handle;
     std::shared_ptr<seal::util::MemoryPoolMT> pool;
@@ -58,7 +75,7 @@ void generateBoolCOTMultTriplesCheetah(uint8_t a[], uint8_t b[], uint8_t c[],
                                 int bitlength [[maybe_unused]], uint64_t num_triples,
                                 const std::string& ip, int port, int party, int threads,
                                 unsigned io_offset) {
-    Utils::log(Utils::Level::INFO, "P", party - 1, ": num_triples (BOOL COT MULT): ", num_triples);
+    Utils::log(Utils::Level::INFO, "P", party - 1, ", PID", io_offset, ": Generating ", num_triples, " BOOL COT MULT triples (threads: ", threads, ")");
     require_tuple_count_multiple_of_8(num_triples);
     uint64_t num_bytes = (num_triples + 7) / 8;
     // std::atomic<int> setup = 0;
@@ -98,15 +115,18 @@ void generateBoolCOTMultTriplesCheetah(uint8_t a[], uint8_t b[], uint8_t c[],
     gemini::ThreadPool tpool(threads);
     gemini::LaunchWorks(tpool, num_bytes, func);
 
-    Utils::log(Utils::Level::INFO, "P", party - 1,
-               ": Bool COT Mult triple time[s]: ", Utils::to_sec(Utils::time_diff(start)));
+    Utils::log(Utils::Level::INFO, "P", party - 1, ", PID", io_offset,
+               ": Bool COT Mult triple   s PRE: ", Utils::to_sec(Utils::time_diff(start)));
     std::string unit;
-    double data = 0;
+    double data_sent = 0, data_recv = 0;
     for (int i = 0; i < threads; ++i) {
-        data += Utils::to_MB(ios[i]->counter, unit);
+        data_sent += Utils::to_MB(ios[i]->counter, unit);
+        data_recv += Utils::to_MB(ios[i]->recv_counter, unit);
         ios[i]->counter = 0;
+        ios[i]->recv_counter = 0;
     }
-    Utils::log(Utils::Level::INFO, "P", party - 1, ": Bool COT Mult triple data[", unit, "]: ", data);
+    Utils::log(Utils::Level::INFO, "P", party - 1, ", PID", io_offset, ": Bool COT Mult triple   MB SENT PRE: ", data_sent, "   MB RECEIVED PRE: ", data_recv);
+    accumulateTripleStat("BOOL_COT_MULT", data_sent, data_recv, Utils::to_sec(Utils::time_diff(start)));
 
     // Utils::log(Utils::Level::INFO, "P", party - 1, ": Setup time [s]: ",
     //            Utils::to_sec(setup.load())
@@ -118,7 +138,7 @@ void generateBoolCOTMultTriplesCheetah(uint8_t a[], uint8_t b[], uint8_t c[],
 void generateRandomMultiplicationsCheetah(uint8_t a[], uint8_t b[], uint64_t num_muls,
                                           const std::string& ip, int port, int party,
                                           int threads, unsigned io_offset) {
-    Utils::log(Utils::Level::INFO, "P", party - 1, ": num_muls (BOOL MUL): ", num_muls);
+    Utils::log(Utils::Level::INFO, "P", party - 1, ", PID", io_offset, ": Generating ", num_muls, " random multiplications (threads: ", threads, ")");
     require_tuple_count_multiple_of_8(num_muls);
     uint64_t num_bytes = (num_muls + 7) / 8;
     auto& keys = Keys<IO::NetIO>::instance(party, ip, port, threads, io_offset);
@@ -148,7 +168,7 @@ void generateRandomMultiplicationsCheetah(uint8_t a[], uint8_t b[], uint64_t num
             Client::mul_gen(otpack, a + start, b + start, current_muls);
             break;
         default:
-            Utils::log(Utils::Level::ERROR, "Unknown party: P", party - 1);
+            Utils::log(Utils::Level::ERROR, "P", party - 1, ", PID", io_offset, ": Unknown party");
         }
         return Code::OK;
     };
@@ -156,22 +176,25 @@ void generateRandomMultiplicationsCheetah(uint8_t a[], uint8_t b[], uint64_t num
     gemini::ThreadPool tpool(threads);
     gemini::LaunchWorks(tpool, num_bytes, func);
 
-    Utils::log(Utils::Level::INFO, "P", party - 1,
-               ": Bool mul time[s]: ", Utils::to_sec(Utils::time_diff(start)));
+    Utils::log(Utils::Level::INFO, "P", party - 1, ", PID", io_offset,
+               ": Random mul   s PRE: ", Utils::to_sec(Utils::time_diff(start)));
     std::string unit;
-    double data = 0;
+    double data_sent = 0, data_recv = 0;
     for (int i = 0; i < threads; ++i) {
-        data += Utils::to_MB(ios[i]->counter, unit);
+        data_sent += Utils::to_MB(ios[i]->counter, unit);
+        data_recv += Utils::to_MB(ios[i]->recv_counter, unit);
         ios[i]->counter = 0;
+        ios[i]->recv_counter = 0;
     }
-    Utils::log(Utils::Level::INFO, "P", party - 1, ": Bool mul data[", unit, "]: ", data);
+    Utils::log(Utils::Level::INFO, "P", party - 1, ", PID", io_offset, ": Random mul   MB SENT PRE: ", data_sent, "   MB RECEIVED PRE: ", data_recv);
+    accumulateTripleStat("RANDOM_MUL", data_sent, data_recv, Utils::to_sec(Utils::time_diff(start)));
 }
 
 void generateBoolTriplesCheetah(uint8_t a[], uint8_t b[], uint8_t c[],
                                 int bitlength [[maybe_unused]], uint64_t num_triples,
                                 const std::string& ip, int port, int party, int threads,
                                 TripleGenMethod method, unsigned io_offset) {
-    Utils::log(Utils::Level::INFO, "P", party - 1, ": num_triples (BOOL): ", num_triples);
+    Utils::log(Utils::Level::INFO, "P", party - 1, ", PID", io_offset, ": Generating ", num_triples, " BOOL triples (threads: ", threads, ")");
     require_tuple_count_multiple_of_8(num_triples);
     uint64_t num_bytes = (num_triples + 7) / 8;
     // std::atomic<int> setup = 0;
@@ -213,15 +236,18 @@ void generateBoolTriplesCheetah(uint8_t a[], uint8_t b[], uint8_t c[],
     gemini::ThreadPool tpool(threads);
     gemini::LaunchWorks(tpool, num_bytes, func);
 
-    Utils::log(Utils::Level::INFO, "P", party - 1,
-               ": Bool triple time[s]: ", Utils::to_sec(Utils::time_diff(start)));
+    Utils::log(Utils::Level::INFO, "P", party - 1, ", PID", io_offset,
+               ": Bool triple   s PRE: ", Utils::to_sec(Utils::time_diff(start)));
     std::string unit;
-    double data = 0;
+    double data_sent = 0, data_recv = 0;
     for (int i = 0; i < threads; ++i) {
-        data += Utils::to_MB(ios[i]->counter, unit);
+        data_sent += Utils::to_MB(ios[i]->counter, unit);
+        data_recv += Utils::to_MB(ios[i]->recv_counter, unit);
         ios[i]->counter = 0;
+        ios[i]->recv_counter = 0;
     }
-    Utils::log(Utils::Level::INFO, "P", party - 1, ": Bool triple data[", unit, "]: ", data);
+    Utils::log(Utils::Level::INFO, "P", party - 1, ", PID", io_offset, ": Bool triple   MB SENT PRE: ", data_sent, "   MB RECEIVED PRE: ", data_recv);
+    accumulateTripleStat("BOOL", data_sent, data_recv, Utils::to_sec(Utils::time_diff(start)));
 
     // Utils::log(Utils::Level::INFO, "P", party - 1, ": Setup time [s]: ",
     //            Utils::to_sec(setup.load())
@@ -232,7 +258,7 @@ void generateBoolTriplesCheetah(uint8_t a[], uint8_t b[], uint8_t c[],
 
 void generateBool3TupleCheetah(Beaver3Tuples tuples, uint64_t num_tuples, const std::string& ip,
                                int port, int party, int threads, unsigned io_offset) {
-    Utils::log(Utils::Level::INFO, "P", party - 1, ": num_tuples (BOOL3): ", num_tuples);
+    Utils::log(Utils::Level::INFO, "P", party - 1, ", PID", io_offset, ": Generating ", num_tuples, " BOOL3 tuples (threads: ", threads, ")");
     require_tuple_count_multiple_of_8(num_tuples);
     uint64_t num_bytes = (num_tuples + 7) / 8;
     auto& keys = Keys<IO::NetIO>::instance(party, ip, port, threads, io_offset);
@@ -271,20 +297,23 @@ void generateBool3TupleCheetah(Beaver3Tuples tuples, uint64_t num_tuples, const 
     gemini::ThreadPool tpool(threads);
     gemini::LaunchWorks(tpool, num_bytes, func);
 
-    Utils::log(Utils::Level::INFO, "P", party - 1,
-               ": Bool3 tuple time[s]: ", Utils::to_sec(Utils::time_diff(start)));
+    Utils::log(Utils::Level::INFO, "P", party - 1, ", PID", io_offset,
+               ": Bool3 tuple   s PRE: ", Utils::to_sec(Utils::time_diff(start)));
     std::string unit;
-    double data = 0;
+    double data_sent = 0, data_recv = 0;
     for (int i = 0; i < threads; ++i) {
-        data += Utils::to_MB(ios[i]->counter, unit);
+        data_sent += Utils::to_MB(ios[i]->counter, unit);
+        data_recv += Utils::to_MB(ios[i]->recv_counter, unit);
         ios[i]->counter = 0;
+        ios[i]->recv_counter = 0;
     }
-    Utils::log(Utils::Level::INFO, "P", party - 1, ": Bool3 tuple data[", unit, "]: ", data);
+    Utils::log(Utils::Level::INFO, "P", party - 1, ", PID", io_offset, ": Bool3 tuple   MB SENT PRE: ", data_sent, "   MB RECEIVED PRE: ", data_recv);
+    accumulateTripleStat("BOOL3", data_sent, data_recv, Utils::to_sec(Utils::time_diff(start)));
 }
 
 void generateBool4TupleCheetah(Beaver4Tuples tuples, uint64_t num_tuples, const std::string& ip,
                                int port, int party, int threads, unsigned io_offset) {
-    Utils::log(Utils::Level::INFO, "P", party - 1, ": num_tuples (BOOL4): ", num_tuples);
+    Utils::log(Utils::Level::INFO, "P", party - 1, ", PID", io_offset, ": Generating ", num_tuples, " BOOL4 tuples (threads: ", threads, ")");
     require_tuple_count_multiple_of_8(num_tuples);
     uint64_t num_bytes = (num_tuples + 7) / 8;
     auto& keys = Keys<IO::NetIO>::instance(party, ip, port, threads, io_offset);
@@ -325,15 +354,18 @@ void generateBool4TupleCheetah(Beaver4Tuples tuples, uint64_t num_tuples, const 
     gemini::ThreadPool tpool(threads);
     gemini::LaunchWorks(tpool, num_bytes, func);
 
-    Utils::log(Utils::Level::INFO, "P", party - 1,
-               ": Bool4 tuple time[s]: ", Utils::to_sec(Utils::time_diff(start)));
+    Utils::log(Utils::Level::INFO, "P", party - 1, ", PID", io_offset,
+               ": Bool4 tuple   s PRE: ", Utils::to_sec(Utils::time_diff(start)));
     std::string unit;
-    double data = 0;
+    double data_sent = 0, data_recv = 0;
     for (int i = 0; i < threads; ++i) {
-        data += Utils::to_MB(ios[i]->counter, unit);
+        data_sent += Utils::to_MB(ios[i]->counter, unit);
+        data_recv += Utils::to_MB(ios[i]->recv_counter, unit);
         ios[i]->counter = 0;
+        ios[i]->recv_counter = 0;
     }
-    Utils::log(Utils::Level::INFO, "P", party - 1, ": Bool4 tuple data[", unit, "]: ", data);
+    Utils::log(Utils::Level::INFO, "P", party - 1, ", PID", io_offset, ": Bool4 tuple   MB SENT PRE: ", data_sent, "   MB RECEIVED PRE: ", data_recv);
+    accumulateTripleStat("BOOL4", data_sent, data_recv, Utils::to_sec(Utils::time_diff(start)));
 }
 
 void generateArithTriplesCheetah(const UINT_TYPE a[], const UINT_TYPE b[], UINT_TYPE c[],
@@ -341,8 +373,8 @@ void generateArithTriplesCheetah(const UINT_TYPE a[], const UINT_TYPE b[], UINT_
                                  int port, int party, int threads, Utils::PROTO proto,
                                  unsigned io_offset) {
     assert(bitlength == 32 && "[arith. triples] Unsupported bitlength");
-    Utils::log(Utils::Level::INFO, "P", party - 1, ": num_triples (ARITH): ", num_triples,
-               " " + Utils::proto_str(proto));
+    Utils::log(Utils::Level::INFO, "P", party - 1, ", PID", io_offset, ": Generating ", num_triples,
+               " ARITH triples ", Utils::proto_str(proto), " (threads: ", threads, ")");
     auto& keys = Keys<IO::NetIO>::instance(party, ip, port, threads, io_offset);
 
     auto start = measure::now();
@@ -391,7 +423,7 @@ void generateArithTriplesCheetah(const UINT_TYPE a[], const UINT_TYPE b[], UINT_
                 break;
             }
             default: {
-                Utils::log(Utils::Level::ERROR, "Unknown party: P", party - 1);
+                Utils::log(Utils::Level::ERROR, "P", party - 1, ", PID", io_offset, ": Unknown party");
             }
             }
 
@@ -404,12 +436,18 @@ void generateArithTriplesCheetah(const UINT_TYPE a[], const UINT_TYPE b[], UINT_
     gemini::ThreadPool tpool(threads);
     gemini::LaunchWorks(tpool, num_triples, func);
 
-    Utils::log(Utils::Level::INFO, "P", party - 1,
-               ": Arith triple time[s]: ", Utils::to_sec(Utils::time_diff(start)));
+    Utils::log(Utils::Level::INFO, "P", party - 1, ", PID", io_offset,
+               ": Arith triple   s PRE: ", Utils::to_sec(Utils::time_diff(start)));
     std::string unit;
-    double data = 0;
-    for (int i = 0; i < threads; ++i) data += Utils::to_MB(ios[i]->counter, unit);
-    Utils::log(Utils::Level::INFO, "P", party - 1, ": Arith triple data[", unit, "]: ", data);
+    double data_sent = 0, data_recv = 0;
+    for (int i = 0; i < threads; ++i) {
+        data_sent += Utils::to_MB(ios[i]->counter, unit);
+        data_recv += Utils::to_MB(ios[i]->recv_counter, unit);
+        ios[i]->counter = 0;
+        ios[i]->recv_counter = 0;
+    }
+    Utils::log(Utils::Level::INFO, "P", party - 1, ", PID", io_offset, ": Arith triple   MB SENT PRE: ", data_sent, "   MB RECEIVED PRE: ", data_recv);
+    accumulateTripleStat("ARITH", data_sent, data_recv, Utils::to_sec(Utils::time_diff(start)));
 
     keys.disconnect();
 }
@@ -418,8 +456,9 @@ void generateFCTriplesCheetah(Keys<IO::NetIO>& keys, const UINT_TYPE* a, const U
                               UINT_TYPE* c, int batch, uint64_t com_dim, uint64_t dim2, int party,
                               int threads, Utils::PROTO proto, int factor) {
     auto meta = Utils::init_meta_fc(com_dim, dim2);
-    Utils::log(Utils::Level::INFO, "P", party - 1, " FC: ", meta.input_shape, " x ",
-               meta.weight_shape, " ", Utils::proto_str(proto));
+    Utils::log(Utils::Level::INFO, "P", party - 1, ", PID", keys.get_io_offset(),
+               ": Generating FC triples ", meta.input_shape, " x ",
+               meta.weight_shape, " ", Utils::proto_str(proto), " (batch: ", batch, ", threads: ", threads, ")");
 
     auto start = measure::now();
 
@@ -463,15 +502,18 @@ void generateFCTriplesCheetah(Keys<IO::NetIO>& keys, const UINT_TYPE* a, const U
             c[i * dim2 + j] = C[i](j);
         }
 
-    Utils::log(Utils::Level::INFO, "P", party - 1,
-               ": FC triple time[s]: ", Utils::to_sec(Utils::time_diff(start)));
+    Utils::log(Utils::Level::INFO, "P", party - 1, ", PID", keys.get_io_offset(),
+               ": FC triple   s PRE: ", Utils::to_sec(Utils::time_diff(start)));
     std::string unit;
-    double data = 0;
+    double data_sent = 0, data_recv = 0;
     for (int i = 0; i < threads; ++i) {
-        data += Utils::to_MB(ios[i]->counter, unit);
+        data_sent += Utils::to_MB(ios[i]->counter, unit);
+        data_recv += Utils::to_MB(ios[i]->recv_counter, unit);
         ios[i]->counter = 0;
+        ios[i]->recv_counter = 0;
     }
-    Utils::log(Utils::Level::INFO, "P", party - 1, ": FC triple data[", unit, "]: ", data);
+    Utils::log(Utils::Level::INFO, "P", party - 1, ", PID", keys.get_io_offset(), ": FC triple   MB SENT PRE: ", data_sent, "   MB RECEIVED PRE: ", data_recv);
+    accumulateTripleStat("FC", data_sent, data_recv, Utils::to_sec(Utils::time_diff(start)));
 
     delete[] ai;
     delete[] bi;
@@ -492,15 +534,16 @@ void generateConvTriplesCheetahWrapper(Keys<IO::NetIO>& keys, const UINT_TYPE* a
     auto meta = Utils::init_meta_conv(parm.ic, parm.ih, parm.iw, parm.fc, parm.fh, parm.fw,
                                       parm.n_filters, parm.stride, parm.padding, is_shared_input);
 
-    Utils::log(Utils::Level::INFO, "P", party - 1, " CONV: ", meta.ishape, " x ", meta.fshape,
-               " x ", parm.n_filters, ", ", parm.stride, ", ", parm.padding, ", ",
-               Utils::proto_str(proto));
+    Utils::log(Utils::Level::INFO, "P", party - 1, ", PID", keys.get_io_offset(),
+               ": Generating CONV triples ", meta.ishape, " x ", meta.fshape,
+               " x ", parm.n_filters, ", stride: ", parm.stride, ", pad: ", parm.padding, ", ",
+               Utils::proto_str(proto), " (batch: ", parm.batchsize, ", threads: ", threads, ")");
 
     if (Utils::getOutDim(parm) == gemini::GetConv2DOutShape(meta)) {
         generateConvTriplesCheetah(keys, a, b, c, meta, parm.batchsize, party, threads, proto,
                                    factor);
     } else {
-        Utils::log(Utils::Level::INFO, "Adding padding manually");
+        Utils::log(Utils::Level::INFO, "P", party - 1, ", PID", keys.get_io_offset(), ": Adding padding manually");
 
         std::vector<UINT_TYPE> ai;
         std::tuple<int, int> dim;
@@ -586,8 +629,10 @@ void generateConvTriplesCheetah(Keys<IO::NetIO>& keys, size_t total_batches,
         offset += parm.batchsize;
     }
 
-    Utils::log(Utils::Level::INFO, "P", party - 1,
-               ": CONV NTT preprocessing time[s]:", Utils::to_sec(Utils::time_diff(start)));
+    auto time_ntt = Utils::to_sec(Utils::time_diff(start));
+    Utils::log(Utils::Level::INFO, "P", party - 1, ", PID", keys.get_io_offset(),
+               ": CONV_NTT   s PRE: ", time_ntt);
+    accumulateTripleStat("CONV_NTT", 0, 0, time_ntt);
 
     auto tmp = measure::now();
 
@@ -621,8 +666,8 @@ void generateConvTriplesCheetah(Keys<IO::NetIO>& keys, size_t total_batches,
     // if (party == emp::BOB)
     //     for (int i = 0; i < threads; ++i) ios[i]->flush();
 
-    Utils::log(Utils::Level::DEBUG, "P", party - 1,
-               ": send/recv[s]:", Utils::to_sec(Utils::time_diff(tmp)));
+    Utils::log(Utils::Level::DEBUG, "P", party - 1, ", PID", keys.get_io_offset(),
+               ": send/recv[s]: ", Utils::to_sec(Utils::time_diff(tmp)));
 
     tmp = measure::now();
 
@@ -653,8 +698,8 @@ void generateConvTriplesCheetah(Keys<IO::NetIO>& keys, size_t total_batches,
     enc_b.clear();
     enc_a2.clear();
 
-    Utils::log(Utils::Level::DEBUG, "P", party - 1,
-               ": computation[s]:", Utils::to_sec(Utils::time_diff(tmp)));
+    Utils::log(Utils::Level::DEBUG, "P", party - 1, ", PID", keys.get_io_offset(),
+               ": computation[s]: ", Utils::to_sec(Utils::time_diff(tmp)));
 
     tmp = measure::now();
 
@@ -689,8 +734,8 @@ void generateConvTriplesCheetah(Keys<IO::NetIO>& keys, size_t total_batches,
     // if (party == emp::ALICE)
     //     for (int i = 0; i < threads; ++i) ios[i]->flush();
 
-    Utils::log(Utils::Level::DEBUG, "P", party - 1,
-               ": recv/send[s]:", Utils::to_sec(Utils::time_diff(tmp)));
+    Utils::log(Utils::Level::DEBUG, "P", party - 1, ", PID", keys.get_io_offset(),
+               ": recv/send[s]: ", Utils::to_sec(Utils::time_diff(tmp)));
 
     tmp = measure::now();
 
@@ -718,18 +763,21 @@ void generateConvTriplesCheetah(Keys<IO::NetIO>& keys, size_t total_batches,
         offset += parm.batchsize;
     }
 
-    Utils::log(Utils::Level::DEBUG, "P", party - 1,
-               ": decryption[s]:", Utils::to_sec(Utils::time_diff(tmp)));
+    Utils::log(Utils::Level::DEBUG, "P", party - 1, ", PID", keys.get_io_offset(),
+               ": decryption[s]: ", Utils::to_sec(Utils::time_diff(tmp)));
 
     auto time = Utils::to_sec(Utils::time_diff(start));
-    Utils::log(Utils::Level::INFO, "P", party - 1, ": CONV triple time + NTT[s]: ", time);
+    Utils::log(Utils::Level::INFO, "P", party - 1, ", PID", keys.get_io_offset(), ": CONV triple   s PRE: ", time - time_ntt);
     std::string unit;
-    double data = 0;
+    double data_sent = 0, data_recv = 0;
     for (int i = 0; i < threads; ++i) {
-        data += Utils::to_MB(ios[i]->counter, unit);
+        data_sent += Utils::to_MB(ios[i]->counter, unit);
+        data_recv += Utils::to_MB(ios[i]->recv_counter, unit);
         ios[i]->counter = 0;
+        ios[i]->recv_counter = 0;
     }
-    Utils::log(Utils::Level::INFO, "P", party - 1, ": CONV triple data[", unit, "]: ", data);
+    Utils::log(Utils::Level::INFO, "P", party - 1, ", PID", keys.get_io_offset(), ": CONV triple   MB SENT PRE: ", data_sent, "   MB RECEIVED PRE: ", data_recv);
+    accumulateTripleStat("CONV", data_sent, data_recv, time - time_ntt);
 }
 
 void generateConvTriplesCheetah(Keys<IO::NetIO>& keys, const UINT_TYPE* a, const UINT_TYPE* b,
@@ -778,10 +826,10 @@ void generateConvTriplesCheetah(Keys<IO::NetIO>& keys, const UINT_TYPE* a, const
             if (cur_batch % ac_batch_size == 0) {
                 enc_B.clear();
                 if ((c = conv.encodeFilters(B, meta, enc_B, threads)) != Code::OK) {
-                    Utils::log(Utils::Level::ERROR, "Filters encoding failed: ", CodeMessage(c));
+                    Utils::log(Utils::Level::ERROR, "P", party - 1, ", PID", keys.get_io_offset(), ": Filters encoding failed: ", CodeMessage(c));
                 }
                 if ((c = conv.filtersToNtt(enc_B, threads)) != Code::OK) {
-                    Utils::log(Utils::Level::ERROR, "Filters to NTT failed: ", CodeMessage(c));
+                    Utils::log(Utils::Level::ERROR, "P", party - 1, ", PID", keys.get_io_offset(), ": Filters to NTT failed: ", CodeMessage(c));
                 }
             }
             time_ntt += Utils::to_sec(Utils::time_diff(start_ntt));
@@ -795,11 +843,11 @@ void generateConvTriplesCheetah(Keys<IO::NetIO>& keys, const UINT_TYPE* a, const
                 if (cur_batch % ac_batch_size == 0) {
                     enc_B.clear();
                     if ((c = conv.encodeFilters(B, meta, enc_B, threads)) != Code::OK) {
-                        Utils::log(Utils::Level::ERROR,
-                                   "Filters encoding failed: ", CodeMessage(c));
+                        Utils::log(Utils::Level::ERROR, "P", party - 1, ", PID", keys.get_io_offset(),
+                                   ": Filters encoding failed: ", CodeMessage(c));
                     }
                     if ((c = conv.filtersToNtt(enc_B, threads)) != Code::OK) {
-                        Utils::log(Utils::Level::ERROR, "Filters to NTT failed: ", CodeMessage(c));
+                        Utils::log(Utils::Level::ERROR, "P", party - 1, ", PID", keys.get_io_offset(), ": Filters to NTT failed: ", CodeMessage(c));
                     }
                 }
                 time_ntt += Utils::to_sec(Utils::time_diff(start_ntt));
@@ -817,28 +865,33 @@ void generateConvTriplesCheetah(Keys<IO::NetIO>& keys, const UINT_TYPE* a, const
         decode += Utils::to_sec(result.plain_op);
 
         if (result.ret != Code::OK) {
-            Utils::log(Utils::Level::ERROR, "CONV failed: ", CodeMessage(result.ret));
+            Utils::log(Utils::Level::ERROR, "P", party - 1, ", PID", keys.get_io_offset(), ": CONV failed: ", CodeMessage(result.ret));
         }
 
         // Utils::print_results(result, 0, batch, threads);
         for (long i = 0; i < C.NumElements(); ++i) c[i + C.NumElements() * cur_batch] = C.data()[i];
     }
 
-    Utils::log(Utils::Level::INFO, "P", party - 1, ": CONV NTT preprocessing time[s]: ", time_ntt);
-    Utils::log(Utils::Level::INFO, "P", party - 1, ": send/recv[s]: ", send_recv);
-    Utils::log(Utils::Level::INFO, "P", party - 1, ": compute[s]: ", compute);
-    Utils::log(Utils::Level::INFO, "P", party - 1, ": recv/send[s]: ", recv_send);
-    Utils::log(Utils::Level::INFO, "P", party - 1, ": decode[s]: ", decode);
+    Utils::log(Utils::Level::INFO, "P", party - 1, ", PID", keys.get_io_offset(), ": CONV_NTT   s PRE: ", time_ntt);
+    accumulateTripleStat("CONV_NTT", 0, 0, time_ntt);
+    Utils::log(Utils::Level::INFO, "P", party - 1, ", PID", keys.get_io_offset(), ": send/recv[s]: ", send_recv);
+    Utils::log(Utils::Level::INFO, "P", party - 1, ", PID", keys.get_io_offset(), ": compute[s]: ", compute);
+    Utils::log(Utils::Level::INFO, "P", party - 1, ", PID", keys.get_io_offset(), ": recv/send[s]: ", recv_send);
+    Utils::log(Utils::Level::INFO, "P", party - 1, ", PID", keys.get_io_offset(), ": decode[s]: ", decode);
 
-    Utils::log(Utils::Level::INFO, "P", party - 1,
-               ": CONV triple time + NTT[s]: ", Utils::to_sec(Utils::time_diff(start)));
+    auto time_total = Utils::to_sec(Utils::time_diff(start));
+    Utils::log(Utils::Level::INFO, "P", party - 1, ", PID", keys.get_io_offset(),
+               ": CONV triple   s PRE: ", time_total - time_ntt);
     std::string unit;
-    double data = 0;
+    double data_sent = 0, data_recv = 0;
     for (int i = 0; i < threads; ++i) {
-        data += Utils::to_MB(ios[i]->counter, unit);
+        data_sent += Utils::to_MB(ios[i]->counter, unit);
+        data_recv += Utils::to_MB(ios[i]->recv_counter, unit);
         ios[i]->counter = 0;
+        ios[i]->recv_counter = 0;
     }
-    Utils::log(Utils::Level::INFO, "P", party - 1, ": CONV triple data[", unit, "]: ", data);
+    Utils::log(Utils::Level::INFO, "P", party - 1, ", PID", keys.get_io_offset(), ": CONV triple   MB SENT PRE: ", data_sent, "   MB RECEIVED PRE: ", data_recv);
+    accumulateTripleStat("CONV", data_sent, data_recv, time_total - time_ntt);
 
     delete[] ai;
     delete[] bi;
@@ -848,8 +901,9 @@ void generateBNTriplesCheetah(Keys<IO::NetIO>& keys, const UINT_TYPE* a, const U
                               UINT_TYPE* c, int batch, size_t num_ele, size_t h, size_t w,
                               int party, int threads, Utils::PROTO proto, int factor) {
     auto meta = Utils::init_meta_bn(num_ele, h, w);
-    Utils::log(Utils::Level::INFO, "P", party - 1, " BN: ", meta.ishape, " x ", meta.vec_shape,
-               ", ", Utils::proto_str(proto));
+    Utils::log(Utils::Level::INFO, "P", party - 1, ", PID", keys.get_io_offset(),
+               ": Generating BN triples ", meta.ishape, " x ", meta.vec_shape,
+               " ", Utils::proto_str(proto), " (batch: ", batch, ", threads: ", threads, ")");
 
     auto start = measure::now();
 
@@ -891,15 +945,18 @@ void generateBNTriplesCheetah(Keys<IO::NetIO>& keys, const UINT_TYPE* a, const U
                         = C(i, j, k);
     }
 
-    Utils::log(Utils::Level::INFO, "P", party - 1,
-               ": BN triple time[s]: ", Utils::to_sec(Utils::time_diff(start)));
+    Utils::log(Utils::Level::INFO, "P", party - 1, ", PID", keys.get_io_offset(),
+               ": BN triple   s PRE: ", Utils::to_sec(Utils::time_diff(start)));
     std::string unit;
-    double data = 0;
+    double data_sent = 0, data_recv = 0;
     for (int i = 0; i < threads; ++i) {
-        data += Utils::to_MB(ios[i]->counter, unit);
+        data_sent += Utils::to_MB(ios[i]->counter, unit);
+        data_recv += Utils::to_MB(ios[i]->recv_counter, unit);
         ios[i]->counter = 0;
+        ios[i]->recv_counter = 0;
     }
-    Utils::log(Utils::Level::INFO, "P", party - 1, ": BN triple data[", unit, "]: ", data);
+    Utils::log(Utils::Level::INFO, "P", party - 1, ", PID", keys.get_io_offset(), ": BN triple   MB SENT PRE: ", data_sent, "   MB RECEIVED PRE: ", data_recv);
+    accumulateTripleStat("BN", data_sent, data_recv, Utils::to_sec(Utils::time_diff(start)));
 }
 
 void tmp(int party, int threads) {
@@ -955,9 +1012,8 @@ void tmp(int party, int threads) {
     size_t data = 0;
     for (int i = 0; i < threads; ++i) data += io[i]->counter;
     string st;
-    std::cout << "P" << party - 1 << ": time[s]: " << Utils::to_sec(Utils::time_diff(start))
-              << "\n";
-    std::cout << "P" << party - 1 << ": data: " << Utils::to_MB(data, st) << st << "\n";
+    Utils::log(Utils::Level::INFO, "P", party - 1, ": time[s]: ", Utils::to_sec(Utils::time_diff(start)));
+    Utils::log(Utils::Level::INFO, "P", party - 1, ": data[", st, "]: ", Utils::to_MB(data, st));
 
     for (int i = 0; i < threads; ++i) {
         delete io[i];
@@ -1006,15 +1062,18 @@ void do_multiplex(int num_input, const UINT_TYPE* x32, const uint8_t* sel_packed
     gemini::ThreadPool tpool(1);
     gemini::LaunchWorks(tpool, num_input, func);
 
-    Utils::log(Utils::Level::INFO, "P", party - 1,
-               ": multiplex time[s]: ", Utils::to_sec(Utils::time_diff(start)));
+    Utils::log(Utils::Level::INFO, "P", party - 1, ", PID", io_offset,
+               ": Multiplex   s PRE: ", Utils::to_sec(Utils::time_diff(start)));
     std::string unit;
-    double data = 0;
+    double data_sent = 0, data_recv = 0;
     for (int i = 0; i < threads; ++i) {
-        data += Utils::to_MB(ios[i]->counter, unit);
+        data_sent += Utils::to_MB(ios[i]->counter, unit);
+        data_recv += Utils::to_MB(ios[i]->recv_counter, unit);
         ios[i]->counter = 0;
+        ios[i]->recv_counter = 0;
     }
-    Utils::log(Utils::Level::INFO, "P", party - 1, ": multiplex data[", unit, "]: ", data);
+    Utils::log(Utils::Level::INFO, "P", party - 1, ", PID", io_offset, ": Multiplex   MB SENT PRE: ", data_sent, "   MB RECEIVED PRE: ", data_recv);
+    accumulateTripleStat("MULTIPLEX", data_sent, data_recv, Utils::to_sec(Utils::time_diff(start)));
 
 #ifdef VERIFY
     if (party == emp::BOB) {
@@ -1023,7 +1082,7 @@ void do_multiplex(int num_input, const UINT_TYPE* x32, const uint8_t* sel_packed
         ios[0]->send_data(y32, sizeof(*y32) * num_input);
         ios[0]->flush();
     } else {
-        Utils::log(Utils::Level::DEBUG, "Verifying MULTIPLEX: ", num_input);
+        Utils::log(Utils::Level::DEBUG, "P", party - 1, ", PID", io_offset, ": Verifying MULTIPLEX: ", num_input);
         std::vector<uint8_t> sel_b(num_input);
         std::vector<UINT_TYPE> x_b(num_input);
         std::vector<UINT_TYPE> y_b(num_input);
@@ -1045,9 +1104,9 @@ void do_multiplex(int num_input, const UINT_TYPE* x32, const uint8_t* sel_packed
         }
 
         if (passed)
-            Utils::log(Utils::Level::PASSED, "MULTIPLEX: PASSED");
+            Utils::log(Utils::Level::PASSED, "P", party - 1, ", PID", io_offset, ": MULTIPLEX: PASSED");
         else
-            Utils::log(Utils::Level::FAILED, "MULTIPLEX: FAILED");
+            Utils::log(Utils::Level::FAILED, "P", party - 1, ", PID", io_offset, ": MULTIPLEX: FAILED");
     }
 #endif
 
@@ -1114,15 +1173,18 @@ void generateOT(int party, const std::string& ip, int port, int threads, int io_
     delete[] a;
     delete[] b;
 
-    Utils::log(Utils::Level::INFO, "P", party - 1,
-               ": OT time[s]: ", Utils::to_sec(Utils::time_diff(start)));
+    Utils::log(Utils::Level::INFO, "P", party - 1, ", PID", io_offset,
+               ": OT   s PRE: ", Utils::to_sec(Utils::time_diff(start)));
     std::string unit;
-    double data = 0;
+    double data_sent = 0, data_recv = 0;
     for (int i = 0; i < threads; ++i) {
-        data += Utils::to_MB(ios[i]->counter, unit);
+        data_sent += Utils::to_MB(ios[i]->counter, unit);
+        data_recv += Utils::to_MB(ios[i]->recv_counter, unit);
         ios[i]->counter = 0;
+        ios[i]->recv_counter = 0;
     }
-    Utils::log(Utils::Level::INFO, "P", party - 1, ": OT data[", unit, "]: ", data);
+    Utils::log(Utils::Level::INFO, "P", party - 1, ", PID", io_offset, ": OT   MB SENT PRE: ", data_sent, "   MB RECEIVED PRE: ", data_recv);
+    accumulateTripleStat("OT", data_sent, data_recv, Utils::to_sec(Utils::time_diff(start)));
 
     keys.disconnect();
 }
@@ -1130,7 +1192,7 @@ void generateOT(int party, const std::string& ip, int port, int threads, int io_
 void generateCOT(int party, const UINT_TYPE* a, const uint8_t* b, UINT_TYPE* c,
                  const unsigned& num_triples, const std::string& ip, int port, int threads,
                  int io_offset) {
-    Utils::log(Utils::Level::DEBUG, "COT: ", num_triples);
+    Utils::log(Utils::Level::DEBUG, "P", party - 1, ", PID", io_offset, ": Generating ", num_triples, " COT triples");
     auto& keys = Keys<IO::NetIO>::instance(party, ip, port, threads, io_offset);
 
     auto start = measure::now();
@@ -1167,15 +1229,18 @@ void generateCOT(int party, const UINT_TYPE* a, const uint8_t* b, UINT_TYPE* c,
     gemini::ThreadPool tpool(1);
     gemini::LaunchWorks(tpool, num_triples, func);
 
-    Utils::log(Utils::Level::INFO, "P", party - 1,
-               ": COT time[s]: ", Utils::to_sec(Utils::time_diff(start)));
+    Utils::log(Utils::Level::INFO, "P", party - 1, ", PID", io_offset,
+               ": COT   s PRE: ", Utils::to_sec(Utils::time_diff(start)));
     std::string unit;
-    double data = 0;
+    double data_sent = 0, data_recv = 0;
     for (int i = 0; i < threads; ++i) {
-        data += Utils::to_MB(ios[i]->counter, unit);
+        data_sent += Utils::to_MB(ios[i]->counter, unit);
+        data_recv += Utils::to_MB(ios[i]->recv_counter, unit);
         ios[i]->counter = 0;
+        ios[i]->recv_counter = 0;
     }
-    Utils::log(Utils::Level::INFO, "P", party - 1, ": COT data[", unit, "]: ", data);
+    Utils::log(Utils::Level::INFO, "P", party - 1, ", PID", io_offset, ": COT   MB SENT PRE: ", data_sent, "   MB RECEIVED PRE: ", data_recv);
+    accumulateTripleStat("COT", data_sent, data_recv, Utils::to_sec(Utils::time_diff(start)));
 
 #ifdef VERIFY
     if (party == emp::BOB) {
@@ -1196,9 +1261,9 @@ void generateCOT(int party, const UINT_TYPE* a, const uint8_t* b, UINT_TYPE* c,
             }
         }
         if (passed)
-            Utils::log(Utils::Level::PASSED, "COT: PASSED");
+            Utils::log(Utils::Level::PASSED, "P", party - 1, ", PID", io_offset, ": COT: PASSED");
         else
-            Utils::log(Utils::Level::FAILED, "COT: FAILED");
+            Utils::log(Utils::Level::FAILED, "P", party - 1, ", PID", io_offset, ": COT: FAILED");
     }
 #endif
 
@@ -1313,8 +1378,10 @@ void generateConvTriplesCheetah2(Keys<IO::NetIO>& keys, size_t total_batches,
         offset += parm.batchsize;
     }
 
-    Utils::log(Utils::Level::INFO, "P", party - 1,
-               ": CONV NTT preprocessing time[s]:", Utils::to_sec(Utils::time_diff(start)));
+    auto time_ntt = Utils::to_sec(Utils::time_diff(start));
+    Utils::log(Utils::Level::INFO, "P", party - 1, ", PID", keys.get_io_offset(),
+               ": CONV_NTT   s PRE: ", time_ntt);
+    accumulateTripleStat("CONV_NTT", 0, 0, time_ntt);
 
     vector<vector<seal::Ciphertext>> M(total_batches);
     vector<Tensor<uint64_t>> C(total_batches);
@@ -1404,14 +1471,43 @@ void generateConvTriplesCheetah2(Keys<IO::NetIO>& keys, size_t total_batches,
     recv_thread.join();
 
     auto time = Utils::to_sec(Utils::time_diff(start));
-    Utils::log(Utils::Level::INFO, "P", party - 1, ": CONV triple time + NTT[s]: ", time);
+    Utils::log(Utils::Level::INFO, "P", party - 1, ", PID", keys.get_io_offset(), ": CONV triple   s PRE: ", time - time_ntt);
     std::string unit;
-    double data = 0;
-    for (int i = 0; i < threads; ++i) {
-        data += Utils::to_MB(ios[i]->counter, unit);
+    double data_sent = 0, data_recv = 0;
+    for (int i = 0; i < 2; ++i) {
+        data_sent += Utils::to_MB(ios[i]->counter, unit);
+        data_recv += Utils::to_MB(ios[i]->recv_counter, unit);
         ios[i]->counter = 0;
+        ios[i]->recv_counter = 0;
     }
-    Utils::log(Utils::Level::INFO, "P", party - 1, ": CONV triple data[", unit, "]: ", data);
+    Utils::log(Utils::Level::INFO, "P", party - 1, ", PID", keys.get_io_offset(), ": CONV triple   MB SENT PRE: ", data_sent, "   MB RECEIVED PRE: ", data_recv);
+    accumulateTripleStat("CONV", data_sent, data_recv, time - time_ntt);
+}
+
+void printTripleStats(int party, unsigned io_offset) {
+    if (g_triple_stats.empty())
+        return;
+
+    double total_sent = 0, total_recv = 0, total_time = 0;
+    for (const auto& [type, e] : g_triple_stats) {
+        Utils::log(Utils::Level::INFO, "P", party - 1, ", PID", io_offset,
+                   ": --TRIPLE_STATS (Aggregated)-- ", type,
+                   "   MB SENT PRE: ", e.mb_sent,
+                   "   MB RECEIVED PRE: ", e.mb_recv,
+                   "   s PRE: ", e.time_s);
+        total_sent += e.mb_sent;
+        total_recv += e.mb_recv;
+        total_time += e.time_s;
+    }
+    Utils::log(Utils::Level::INFO, "P", party - 1, ", PID", io_offset,
+               ": --TRIPLE_STATS (Total)--",
+               "   MB SENT PRE: ", total_sent,
+               "   MB RECEIVED PRE: ", total_recv,
+               "   s PRE: ", total_time);
+}
+
+void resetTripleStats() {
+    g_triple_stats.clear();
 }
 
 } // namespace Iface

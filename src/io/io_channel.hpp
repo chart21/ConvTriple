@@ -41,12 +41,16 @@ template <typename T>
 class IOChannel {
   public:
     uint64_t counter = 0;
+    uint64_t recv_counter = 0;
     void send_data(const void* data, int nbyte, const bool& count = true) {
         if (count)
             counter += nbyte;
         derived().send_data_internal(data, nbyte);
     }
-    void recv_data(void* data, int nbyte) { derived().recv_data_internal(data, nbyte); }
+    void recv_data(void* data, int nbyte) {
+        recv_counter += nbyte;
+        derived().recv_data_internal(data, nbyte);
+    }
 
     void send_block(const sci::block128* data, int nblock) {
         send_data(data, nblock * sizeof(sci::block128));

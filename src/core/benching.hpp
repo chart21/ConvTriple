@@ -151,7 +151,7 @@ class HE {
                   const std::shared_ptr<seal::PublicKey>& o_pkey);
 
     /**
-     * @return Total number of bytes send
+     * @return Total number of bytes sent
      */
     inline size_t counter_() {
         size_t counter = 0;
@@ -160,10 +160,22 @@ class HE {
     }
 
     /**
-     * Sets the byte counter back to zero (for all channels)
+     * @return Total number of bytes received
+     */
+    inline size_t recv_counter_() {
+        size_t counter = 0;
+        for (size_t i = 0; i < threads_; ++i) counter += ios_[i]->recv_counter;
+        return counter;
+    }
+
+    /**
+     * Sets the byte counters back to zero (for all channels)
      */
     inline void reset_counter_() {
-        for (size_t i = 0; i < threads_; ++i) ios_[i]->counter = 0;
+        for (size_t i = 0; i < threads_; ++i) {
+            ios_[i]->counter = 0;
+            ios_[i]->recv_counter = 0;
+        }
     }
 };
 

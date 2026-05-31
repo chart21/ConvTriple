@@ -97,6 +97,9 @@ void generateCOT(int party, const UINT_TYPE* a, const uint8_t* b, UINT_TYPE* c,
                  const unsigned& num_triples, const std::string& ip, int port, int threads,
                  int io_offset);
 
+void printTripleStats(int party, unsigned io_offset);
+void resetTripleStats();
+
 void tmp(int party, int threads);
 
 template <class T, bool LSB = true>
