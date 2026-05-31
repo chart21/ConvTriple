@@ -102,7 +102,10 @@ void generateBoolCOTMultTriplesCheetah(uint8_t a[], uint8_t b[], uint8_t c[],
                ": Bool COT Mult triple time[s]: ", Utils::to_sec(Utils::time_diff(start)));
     std::string unit;
     double data = 0;
-    for (int i = 0; i < threads; ++i) data += Utils::to_MB(ios[i]->counter, unit);
+    for (int i = 0; i < threads; ++i) {
+        data += Utils::to_MB(ios[i]->counter, unit);
+        ios[i]->counter = 0;
+    }
     Utils::log(Utils::Level::INFO, "P", party - 1, ": Bool COT Mult triple data[", unit, "]: ", data);
 
     // Utils::log(Utils::Level::INFO, "P", party - 1, ": Setup time [s]: ",
@@ -157,7 +160,10 @@ void generateRandomMultiplicationsCheetah(uint8_t a[], uint8_t b[], uint64_t num
                ": Bool mul time[s]: ", Utils::to_sec(Utils::time_diff(start)));
     std::string unit;
     double data = 0;
-    for (int i = 0; i < threads; ++i) data += Utils::to_MB(ios[i]->counter, unit);
+    for (int i = 0; i < threads; ++i) {
+        data += Utils::to_MB(ios[i]->counter, unit);
+        ios[i]->counter = 0;
+    }
     Utils::log(Utils::Level::INFO, "P", party - 1, ": Bool mul data[", unit, "]: ", data);
 }
 
@@ -211,7 +217,10 @@ void generateBoolTriplesCheetah(uint8_t a[], uint8_t b[], uint8_t c[],
                ": Bool triple time[s]: ", Utils::to_sec(Utils::time_diff(start)));
     std::string unit;
     double data = 0;
-    for (int i = 0; i < threads; ++i) data += Utils::to_MB(ios[i]->counter, unit);
+    for (int i = 0; i < threads; ++i) {
+        data += Utils::to_MB(ios[i]->counter, unit);
+        ios[i]->counter = 0;
+    }
     Utils::log(Utils::Level::INFO, "P", party - 1, ": Bool triple data[", unit, "]: ", data);
 
     // Utils::log(Utils::Level::INFO, "P", party - 1, ": Setup time [s]: ",
@@ -266,7 +275,10 @@ void generateBool3TupleCheetah(Beaver3Tuples tuples, uint64_t num_tuples, const 
                ": Bool3 tuple time[s]: ", Utils::to_sec(Utils::time_diff(start)));
     std::string unit;
     double data = 0;
-    for (int i = 0; i < threads; ++i) data += Utils::to_MB(ios[i]->counter, unit);
+    for (int i = 0; i < threads; ++i) {
+        data += Utils::to_MB(ios[i]->counter, unit);
+        ios[i]->counter = 0;
+    }
     Utils::log(Utils::Level::INFO, "P", party - 1, ": Bool3 tuple data[", unit, "]: ", data);
 }
 
@@ -317,7 +329,10 @@ void generateBool4TupleCheetah(Beaver4Tuples tuples, uint64_t num_tuples, const 
                ": Bool4 tuple time[s]: ", Utils::to_sec(Utils::time_diff(start)));
     std::string unit;
     double data = 0;
-    for (int i = 0; i < threads; ++i) data += Utils::to_MB(ios[i]->counter, unit);
+    for (int i = 0; i < threads; ++i) {
+        data += Utils::to_MB(ios[i]->counter, unit);
+        ios[i]->counter = 0;
+    }
     Utils::log(Utils::Level::INFO, "P", party - 1, ": Bool4 tuple data[", unit, "]: ", data);
 }
 
@@ -995,7 +1010,10 @@ void do_multiplex(int num_input, const UINT_TYPE* x32, const uint8_t* sel_packed
                ": multiplex time[s]: ", Utils::to_sec(Utils::time_diff(start)));
     std::string unit;
     double data = 0;
-    for (int i = 0; i < threads; ++i) data += Utils::to_MB(ios[i]->counter, unit);
+    for (int i = 0; i < threads; ++i) {
+        data += Utils::to_MB(ios[i]->counter, unit);
+        ios[i]->counter = 0;
+    }
     Utils::log(Utils::Level::INFO, "P", party - 1, ": multiplex data[", unit, "]: ", data);
 
 #ifdef VERIFY
@@ -1100,7 +1118,10 @@ void generateOT(int party, const std::string& ip, int port, int threads, int io_
                ": OT time[s]: ", Utils::to_sec(Utils::time_diff(start)));
     std::string unit;
     double data = 0;
-    for (int i = 0; i < threads; ++i) data += Utils::to_MB(ios[i]->counter, unit);
+    for (int i = 0; i < threads; ++i) {
+        data += Utils::to_MB(ios[i]->counter, unit);
+        ios[i]->counter = 0;
+    }
     Utils::log(Utils::Level::INFO, "P", party - 1, ": OT data[", unit, "]: ", data);
 
     keys.disconnect();
@@ -1150,7 +1171,10 @@ void generateCOT(int party, const UINT_TYPE* a, const uint8_t* b, UINT_TYPE* c,
                ": COT time[s]: ", Utils::to_sec(Utils::time_diff(start)));
     std::string unit;
     double data = 0;
-    for (int i = 0; i < threads; ++i) data += Utils::to_MB(ios[i]->counter, unit);
+    for (int i = 0; i < threads; ++i) {
+        data += Utils::to_MB(ios[i]->counter, unit);
+        ios[i]->counter = 0;
+    }
     Utils::log(Utils::Level::INFO, "P", party - 1, ": COT data[", unit, "]: ", data);
 
 #ifdef VERIFY
