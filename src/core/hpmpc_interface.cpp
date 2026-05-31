@@ -59,6 +59,8 @@ void generateBoolCOTMultTriplesCheetah(uint8_t a[], uint8_t b[], uint8_t c[],
                                 const std::string& ip, int port, int party, int threads,
                                 unsigned io_offset) {
     Utils::log(Utils::Level::INFO, "P", party - 1, ": num_triples (BOOL COT MULT): ", num_triples);
+    require_tuple_count_multiple_of_8(num_triples);
+    uint64_t num_bytes = (num_triples + 7) / 8;
     // std::atomic<int> setup = 0;
     auto& keys = Keys<IO::NetIO>::instance(party, ip, port, threads, io_offset);
 
@@ -94,7 +96,7 @@ void generateBoolCOTMultTriplesCheetah(uint8_t a[], uint8_t b[], uint8_t c[],
     };
 
     gemini::ThreadPool tpool(threads);
-    gemini::LaunchWorks(tpool, num_triples, func);
+    gemini::LaunchWorks(tpool, num_bytes, func);
 
     Utils::log(Utils::Level::INFO, "P", party - 1,
                ": Bool COT Mult triple time[s]: ", Utils::to_sec(Utils::time_diff(start)));
@@ -114,6 +116,8 @@ void generateRandomMultiplicationsCheetah(uint8_t a[], uint8_t b[], uint64_t num
                                           const std::string& ip, int port, int party,
                                           int threads, unsigned io_offset) {
     Utils::log(Utils::Level::INFO, "P", party - 1, ": num_muls (BOOL MUL): ", num_muls);
+    require_tuple_count_multiple_of_8(num_muls);
+    uint64_t num_bytes = (num_muls + 7) / 8;
     auto& keys = Keys<IO::NetIO>::instance(party, ip, port, threads, io_offset);
 
     auto start = measure::now();
@@ -147,7 +151,7 @@ void generateRandomMultiplicationsCheetah(uint8_t a[], uint8_t b[], uint64_t num
     };
 
     gemini::ThreadPool tpool(threads);
-    gemini::LaunchWorks(tpool, num_muls, func);
+    gemini::LaunchWorks(tpool, num_bytes, func);
 
     Utils::log(Utils::Level::INFO, "P", party - 1,
                ": Bool mul time[s]: ", Utils::to_sec(Utils::time_diff(start)));
@@ -162,6 +166,8 @@ void generateBoolTriplesCheetah(uint8_t a[], uint8_t b[], uint8_t c[],
                                 const std::string& ip, int port, int party, int threads,
                                 TripleGenMethod method, unsigned io_offset) {
     Utils::log(Utils::Level::INFO, "P", party - 1, ": num_triples (BOOL): ", num_triples);
+    require_tuple_count_multiple_of_8(num_triples);
+    uint64_t num_bytes = (num_triples + 7) / 8;
     // std::atomic<int> setup = 0;
     auto& keys = Keys<IO::NetIO>::instance(party, ip, port, threads, io_offset);
 
@@ -199,7 +205,7 @@ void generateBoolTriplesCheetah(uint8_t a[], uint8_t b[], uint8_t c[],
     };
 
     gemini::ThreadPool tpool(threads);
-    gemini::LaunchWorks(tpool, num_triples, func);
+    gemini::LaunchWorks(tpool, num_bytes, func);
 
     Utils::log(Utils::Level::INFO, "P", party - 1,
                ": Bool triple time[s]: ", Utils::to_sec(Utils::time_diff(start)));
