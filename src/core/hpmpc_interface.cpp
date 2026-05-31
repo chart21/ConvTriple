@@ -81,7 +81,7 @@ void generateBoolCOTMultTriplesCheetah(uint8_t a[], uint8_t b[], uint8_t c[],
         // setup += Utils::time_diff(start_setup);
 
         for (int total = start; total < end;) {
-            int current = std::min(end - total, static_cast<int>(MAX_BOOL / threads));
+            int current = std::min(end - total, static_cast<int>(MAX_BOOL / threads / 8));
             switch (cur_party) {
             case emp::ALICE:
                 cot_multiply_shares(emp::ALICE, triple_gen.otpack, a + total, b + total, c + total, current * 8);
@@ -240,7 +240,7 @@ void generateBool3TupleCheetah(Beaver3Tuples tuples, uint64_t num_tuples, const 
         TripleGenerator<IO::NetIO> triple_gen(cur_party, ios[wid], keys.get_otpack(wid), false);
 
         for (int total = start; total < end;) {
-            int current = std::min(end - total, static_cast<int>(MAX_BOOL / threads));
+            int current = std::min(end - total, static_cast<int>(MAX_BOOL / threads / 8));
             Beaver3Tuples sub{
                 tuples.a + total, tuples.b + total, tuples.c + total,
                 tuples.ab + total, tuples.ac + total, tuples.bc + total,
@@ -289,7 +289,7 @@ void generateBool4TupleCheetah(Beaver4Tuples tuples, uint64_t num_tuples, const 
         TripleGenerator<IO::NetIO> triple_gen(cur_party, ios[wid], keys.get_otpack(wid), false);
 
         for (int total = start; total < end;) {
-            int current = std::min(end - total, static_cast<int>(MAX_BOOL / threads));
+            int current = std::min(end - total, static_cast<int>(MAX_BOOL / threads / 8));
             Beaver4Tuples sub{
                 tuples.a + total, tuples.b + total, tuples.c + total, tuples.d + total,
                 tuples.ab + total, tuples.ac + total, tuples.ad + total,
