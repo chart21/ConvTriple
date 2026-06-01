@@ -134,7 +134,10 @@ class NetIO : public IOChannel<NetIO> {
                 usleep(1000);
             }
         }
-        // set_nodelay();
+        char* wan_opt = getenv("CHEETAH_WAN_OPT");
+        if (wan_opt && std::string(wan_opt) == "1") {
+            set_nodelay();
+        }
         stream = fdopen(consocket, "wb+");
         buffer = new char[NETWORK_BUFFER_SIZE];
         memset(buffer, 0, NETWORK_BUFFER_SIZE);
