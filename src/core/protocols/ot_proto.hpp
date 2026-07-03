@@ -171,8 +171,11 @@ void triple_gen(TripleGenerator<Channel>& triple, uint8_t* a, uint8_t* b, uint8_
 template <class Channel>
 void RunGen(TripleGenerator<Channel>& triple, const size_t& numTriple, const bool& packed);
 
+// party_local_mode: 0 = normal (all fields XOR-shared); 1 = this side is P0 (holds full b, zero
+// c share); 2 = this side is P1 (zero b share, full c). See RESHARE_OPT_SIM.
 template <class Channel>
-void tuple3_gen(TripleGenerator<Channel>& generator, Beaver3Tuples data, size_t num_tuples);
+void tuple3_gen(TripleGenerator<Channel>& generator, Beaver3Tuples data, size_t num_tuples,
+                int party_local_mode = 0);
 
 template <class Channel>
 void tuple4_gen(TripleGenerator<Channel>& generator, Beaver4Tuples data, size_t num_tuples);
@@ -193,8 +196,11 @@ void triple_gen(TripleGenerator<Channel>& triple, uint8_t* a, uint8_t* b, uint8_
 template <class Channel>
 void RunGen(TripleGenerator<Channel>& triple, const size_t& numTriple, const bool& packed);
 
+// party_local_mode: 0 = normal (all fields XOR-shared); 1 = this side is P0 (holds full b, zero
+// c share); 2 = this side is P1 (zero b share, full c). See RESHARE_OPT_SIM.
 template <class Channel>
-void tuple3_gen(TripleGenerator<Channel>& generator, Beaver3Tuples data, size_t num_tuples);
+void tuple3_gen(TripleGenerator<Channel>& generator, Beaver3Tuples data, size_t num_tuples,
+                int party_local_mode = 0);
 
 template <class Channel>
 void tuple4_gen(TripleGenerator<Channel>& generator, Beaver4Tuples data, size_t num_tuples);
@@ -275,19 +281,39 @@ inline void require_tuple_count_multiple_of_8(size_t num_tuples) {
 }
 
 template <class Channel>
-void Server::tuple3_gen(TripleGenerator<Channel>& generator, Beaver3Tuples data, size_t num_tuples) {
+void Server::tuple3_gen(TripleGenerator<Channel>& generator, Beaver3Tuples data, size_t num_tuples,
+                        int party_local_mode) {
     require_tuple_count_multiple_of_8(num_tuples);
 
     const bool packed = true;
     const TripleGenMethod triple_gen_method = TripleGenMethod::_2ROT;
     const size_t num_bytes = (num_tuples + 7) / 8;
-    
-    Server::triple_gen(generator, data.a, data.b, data.ab, num_bytes, packed, triple_gen_method);
+
     sci::PRG128 prg;
     std::random_device r;
     const uint64_t seed[2] = {r(), r()};
     prg.reseed(seed);
-    prg.random_data(data.c, num_bytes);
+
+    if (party_local_mode != 0) {
+        // Party-local mask fields (RESHARE_OPT_SIM support): b is known ENTIRELY to P0 (peer
+        // share = 0), c entirely to P1. The mode is pinned to the REAL party (the protocol role
+        // may be alternated per thread chunk to match the pre-built OT packs). Only valid when
+        // b/c exclusively mask wires whose value the respective party already knows (the
+        // zero-add MSB adders' A2B input wires).
+        prg.random_data(data.a, num_bytes);
+        if (party_local_mode == 1) {  // we are P0: full b, zero c
+            prg.random_data(data.b, num_bytes);
+            std::memset(data.c, 0, num_bytes);
+        } else {  // we are P1: zero b, full c
+            std::memset(data.b, 0, num_bytes);
+            prg.random_data(data.c, num_bytes);
+        }
+        cot_multiply_shares(emp::ALICE, generator.otpack, data.a, data.b, data.ab, num_tuples);
+    } else {
+        Server::triple_gen(generator, data.a, data.b, data.ab, num_bytes, packed,
+                           triple_gen_method);
+        prg.random_data(data.c, num_bytes);
+    }
 
     auto lhs = std::make_unique<uint8_t[]>(3 * num_bytes);
     auto rhs = std::make_unique<uint8_t[]>(3 * num_bytes);
@@ -376,19 +402,34 @@ void Client::RunGen(TripleGenerator<Channel>& triple, const size_t& numTriple, c
 }
 
 template <class Channel>
-void Client::tuple3_gen(TripleGenerator<Channel>& generator, Beaver3Tuples data, size_t num_tuples) {
+void Client::tuple3_gen(TripleGenerator<Channel>& generator, Beaver3Tuples data, size_t num_tuples,
+                        int party_local_mode) {
     require_tuple_count_multiple_of_8(num_tuples);
 
     const bool packed = true;
     const TripleGenMethod triple_gen_method = TripleGenMethod::_2ROT;
     const size_t num_bytes = (num_tuples + 7) / 8;
-    
-    Client::triple_gen(generator, data.a, data.b, data.ab, num_bytes, packed, triple_gen_method);
+
     sci::PRG128 prg;
     std::random_device r;
     const uint64_t seed[2] = {r(), r()};
     prg.reseed(seed);
+
+    if (party_local_mode != 0) {
+        // see Server::tuple3_gen; the mode follows the REAL party, not the (alternated) role
+        prg.random_data(data.a, num_bytes);
+        if (party_local_mode == 1) {  // we are P0: full b, zero c
+            prg.random_data(data.b, num_bytes);
+            std::memset(data.c, 0, num_bytes);
+        } else {  // we are P1: zero b, full c
+            std::memset(data.b, 0, num_bytes);
+            prg.random_data(data.c, num_bytes);
+        }
+        cot_multiply_shares(emp::BOB, generator.otpack, data.a, data.b, data.ab, num_tuples);
+    } else {
+    Client::triple_gen(generator, data.a, data.b, data.ab, num_bytes, packed, triple_gen_method);
     prg.random_data(data.c, num_bytes);
+    }
 
     auto lhs = std::make_unique<uint8_t[]>(3 * num_bytes);
     auto rhs = std::make_unique<uint8_t[]>(3 * num_bytes);

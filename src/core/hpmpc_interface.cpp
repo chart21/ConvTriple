@@ -257,8 +257,9 @@ void generateBoolTriplesCheetah(uint8_t a[], uint8_t b[], uint8_t c[],
 }
 
 void generateBool3TupleCheetah(Beaver3Tuples tuples, uint64_t num_tuples, const std::string& ip,
-                               int port, int party, int threads, unsigned io_offset) {
-    Utils::log(Utils::Level::INFO, "P", party - 1, ", PID", io_offset, ": Generating ", num_tuples, " BOOL3 tuples (threads: ", threads, ")");
+                               int port, int party, int threads, unsigned io_offset,
+                               bool party_local_bc) {
+    Utils::log(Utils::Level::INFO, "P", party - 1, ", PID", io_offset, ": Generating ", num_tuples, " BOOL3 tuples (threads: ", threads, ", party_local_bc: ", party_local_bc, ")");
     require_tuple_count_multiple_of_8(num_tuples);
     uint64_t num_bytes = (num_tuples + 7) / 8;
     auto& keys = Keys<IO::NetIO>::instance(party, ip, port, threads, io_offset);
@@ -271,7 +272,10 @@ void generateBool3TupleCheetah(Beaver3Tuples tuples, uint64_t num_tuples, const 
         if (start >= end)
             return Code::OK;
 
+        // The role alternation must match the pre-built per-wid OT packs; the field LOCALITY
+        // is pinned to the REAL party instead (mode 1: P0 holds full b; mode 2: P1 holds full c).
         int cur_party = wid & 1 ? OTHER_PARTY(party) : party;
+        const int local_mode = !party_local_bc ? 0 : (party == emp::ALICE ? 1 : 2);
         TripleGenerator<IO::NetIO> triple_gen(cur_party, ios[wid], keys.get_otpack(wid), false);
 
         for (int total = start; total < end;) {
@@ -283,10 +287,10 @@ void generateBool3TupleCheetah(Beaver3Tuples tuples, uint64_t num_tuples, const 
             };
             switch (cur_party) {
                 case emp::ALICE:
-                    Server::tuple3_gen(triple_gen, sub, current * 8);
+                    Server::tuple3_gen(triple_gen, sub, current * 8, local_mode);
                     break;
                 case emp::BOB:
-                    Client::tuple3_gen(triple_gen, sub, current * 8);
+                    Client::tuple3_gen(triple_gen, sub, current * 8, local_mode);
                     break;
             }
             total += current;

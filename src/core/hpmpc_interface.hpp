@@ -50,8 +50,11 @@ void generateRandomMultiplicationsCheetah(uint8_t a[], uint8_t b[], uint64_t num
                                           const std::string& ip, int port, int party,
                                           int threads = 1, unsigned io_offset = 1);
 
+// party_local_bc: generate .b known entirely to ALICE/P0 and .c entirely to BOB/P1 (peer share 0);
+// only safe when b/c exclusively mask wires whose value that party already knows (RESHARE_OPT_SIM).
 void generateBool3TupleCheetah(Beaver3Tuples tuples, uint64_t num_tuples, const std::string& ip,
-                               int port, int party, int threads = 1, unsigned io_offset = 1);
+                               int port, int party, int threads = 1, unsigned io_offset = 1,
+                               bool party_local_bc = false);
 
 void generateBool4TupleCheetah(Beaver4Tuples tuples, uint64_t num_tuples, const std::string& ip,
                                int port, int party, int threads = 1, unsigned io_offset = 1);
