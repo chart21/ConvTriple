@@ -60,6 +60,19 @@ Result perform_proto(const gemini::HomConv2DSS::Meta& meta, Channel** server,
                      const gemini::HomConv2DSS& conv, const size_t& threads = 1,
                      Utils::PROTO proto = Utils::PROTO::AB);
 
+/**
+ * AB2P: flipped-role AB2 with a PRESCRIBED output share (image owner side, emp::BOB).
+ * Receives the encrypted filters (cached across batches in enc_filters_cache when
+ * fresh_filters == false), evaluates conv(pt_image, ct_filters) - prescribed and sends the
+ * result back; this party's output share IS `prescribed` (not written here).
+ */
+template <class Channel>
+Result Protocol2Prescribed(const gemini::HomConv2DSS::Meta& meta, Channel** server,
+                           const gemini::HomConv2DSS& conv, const Tensor<uint64_t>& A1,
+                           const Tensor<uint64_t>& prescribed,
+                           std::vector<std::vector<seal::Ciphertext>>& enc_filters_cache,
+                           const size_t& threads, bool fresh_filters);
+
 #ifdef VERIFY
 template <class T>
 void Verify_Conv(IO::NetIO& io, const gemini::HomConv2DSS::Meta& meta,
@@ -146,6 +159,17 @@ template <class Channel>
 Result perform_proto(const gemini::HomConv2DSS::Meta& meta, Channel** client,
                      const gemini::HomConv2DSS& conv, const size_t& threads,
                      Utils::PROTO proto = Utils::PROTO::AB);
+
+/**
+ * AB2P: flipped-role AB2 with a PRESCRIBED output share (filter owner side, emp::ALICE).
+ * Encrypts and sends the filters (only when fresh_filters), then receives and decrypts the
+ * evaluated result: C2 = conv - peer's prescribed share.
+ */
+template <class Channel>
+Result Protocol2Prescribed(Channel** client, const gemini::HomConv2DSS& conv,
+                           const gemini::HomConv2DSS::Meta& meta,
+                           const std::vector<Tensor<uint64_t>>& B2, Tensor<uint64_t>& C2,
+                           const size_t& threads, bool fresh_filters);
 
 #ifdef VERIFY
 template <class T>
@@ -300,6 +324,104 @@ Result Client::Protocol2(Channel** client, const gemini::HomConv2DSS& conv,
     measures.send_recv += tmp.send_recv;
     measures.bytes = tmp.bytes;
 
+    return measures;
+}
+
+template <class Channel>
+Result Client::Protocol2Prescribed(Channel** client, const gemini::HomConv2DSS& conv,
+                                   const gemini::HomConv2DSS::Meta& meta,
+                                   const std::vector<Tensor<uint64_t>>& B2, Tensor<uint64_t>& C2,
+                                   const size_t& threads, bool fresh_filters) {
+    Result measures;
+
+    if (fresh_filters) {
+        ////////////////////////////////////////////////////////////////////////////
+        // Enc(B2) + send
+        ////////////////////////////////////////////////////////////////////////////
+        auto start = measure::now();
+
+        std::vector<std::vector<seal::Serializable<seal::Ciphertext>>> enc_B2;
+        measures.ret = conv.encryptFilters(B2, meta, enc_B2, threads);
+        if (measures.ret != Code::OK)
+            return measures;
+
+        measures.encryption = Utils::time_diff(start);
+
+        start = measure::now();
+        IO::send_encrypted_filters(*(client[0]), enc_B2);
+        client[0]->flush();
+        measures.send_recv = Utils::time_diff(start);
+    }
+
+    ////////////////////////////////////////////////////////////////////////////
+    // recv M2' = conv(A1, B2) - prescribed, decrypt
+    ////////////////////////////////////////////////////////////////////////////
+    auto start = measure::now();
+
+    std::vector<seal::Ciphertext> M2;
+    IO::recv_encrypted_vector(client, conv.getContext(), M2, threads);
+
+    measures.serial += Utils::time_diff(start);
+    start = measure::now();
+
+    measures.ret        = conv.decryptToTensor(M2, meta, C2, threads);
+    measures.decryption = Utils::time_diff(start);
+
+    for (size_t i = 0; i < threads; ++i) measures.bytes += client[i]->counter;
+    return measures;
+}
+
+template <class Channel>
+Result Server::Protocol2Prescribed(const gemini::HomConv2DSS::Meta& meta, Channel** server,
+                                   const gemini::HomConv2DSS& conv, const Tensor<uint64_t>& A1,
+                                   const Tensor<uint64_t>& prescribed,
+                                   std::vector<std::vector<seal::Ciphertext>>& enc_filters_cache,
+                                   const size_t& threads, bool fresh_filters) {
+    Result measures;
+
+    ////////////////////////////////////////////////////////////////////////////
+    // encode A1 (plaintext image)
+    ////////////////////////////////////////////////////////////////////////////
+    auto start = measure::now();
+
+    std::vector<seal::Plaintext> enc_A1;
+    measures.ret = conv.encodeImage(A1, meta, enc_A1, threads);
+    if (measures.ret != Code::OK)
+        return measures;
+
+    measures.encryption = Utils::time_diff(start);
+
+    ////////////////////////////////////////////////////////////////////////////
+    // recv Enc(B2) (cached across batches while the weights stay the same)
+    ////////////////////////////////////////////////////////////////////////////
+    if (fresh_filters) {
+        start = measure::now();
+        enc_filters_cache.clear();
+        IO::recv_encrypted_filters(*(server[0]), conv.getContext(), enc_filters_cache,
+                                   /*is_truncated*/ false);
+        measures.send_recv += Utils::time_diff(start);
+    }
+
+    ////////////////////////////////////////////////////////////////////////////
+    // M2' = conv(A1, Enc(B2)) - prescribed
+    ////////////////////////////////////////////////////////////////////////////
+    start = measure::now();
+
+    std::vector<seal::Ciphertext> M2;
+    measures.ret = conv.conv2DSSPrescribed(enc_filters_cache, enc_A1, meta, prescribed, M2, threads);
+    if (measures.ret != Code::OK)
+        return measures;
+
+    measures.cipher_op = Utils::time_diff(start);
+
+    ////////////////////////////////////////////////////////////////////////////
+    // serialize + send M2'
+    ////////////////////////////////////////////////////////////////////////////
+    start = measure::now();
+    IO::send_encrypted_vector(server, M2, threads);
+    measures.serial += Utils::time_diff(start);
+
+    for (size_t i = 0; i < threads; ++i) measures.bytes += server[i]->counter;
     return measures;
 }
 

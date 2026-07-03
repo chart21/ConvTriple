@@ -454,7 +454,8 @@ void generateArithTriplesCheetah(const UINT_TYPE a[], const UINT_TYPE b[], UINT_
 
 void generateFCTriplesCheetah(Keys<IO::NetIO>& keys, const UINT_TYPE* a, const UINT_TYPE* b,
                               UINT_TYPE* c, int batch, uint64_t com_dim, uint64_t dim2, int party,
-                              int threads, Utils::PROTO proto, int factor) {
+                              int threads, Utils::PROTO proto, int factor,
+                              const UINT_TYPE* prescribed) {
     auto meta = Utils::init_meta_fc(com_dim, dim2);
     Utils::log(Utils::Level::INFO, "P", party - 1, ", PID", keys.get_io_offset(),
                ": Generating FC triples ", meta.input_shape, " x ",
@@ -486,15 +487,37 @@ void generateFCTriplesCheetah(Keys<IO::NetIO>& keys, const UINT_TYPE* a, const U
 
     std::vector<Tensor<uint64_t>> C(batch);
 
-    switch (party) {
-    case emp::ALICE: {
-        Client::perform_proto(meta, ios, fc, A, B, C, threads, batch, proto);
-        break;
-    }
-    case emp::BOB: {
-        Server::perform_proto(meta, ios, fc, A, B, C, threads, batch, proto);
-        break;
-    }
+    if (proto == Utils::PROTO::AB2P) {
+        const size_t fresh_period = tmp > 0 ? tmp : 1;  // weights repeat within each factor group
+        switch (party) {
+        case emp::ALICE: {
+            Client::Protocol2Prescribed(ios, fc, meta, B, C, threads, batch, fresh_period);
+            break;
+        }
+        case emp::BOB: {
+            gemini::TensorShape out_shape({(int64_t)dim2});
+            std::vector<Tensor<uint64_t>> P(batch);
+            for (int i = 0; i < batch; ++i) {
+                P[i].Reshape(out_shape);
+                for (size_t j = 0; j < dim2; ++j)
+                    P[i](j) = prescribed ? (uint64_t)prescribed[(size_t)i * dim2 + j] : 0;
+            }
+            Server::Protocol2Prescribed(meta, ios, fc, A, P, threads, batch, fresh_period);
+            for (int i = 0; i < batch; ++i) C[i] = P[i];  // output share IS the prescribed value
+            break;
+        }
+        }
+    } else {
+        switch (party) {
+        case emp::ALICE: {
+            Client::perform_proto(meta, ios, fc, A, B, C, threads, batch, proto);
+            break;
+        }
+        case emp::BOB: {
+            Server::perform_proto(meta, ios, fc, A, B, C, threads, batch, proto);
+            break;
+        }
+        }
     }
 
     for (size_t i = 0; i < C.size(); ++i)
@@ -522,7 +545,7 @@ void generateFCTriplesCheetah(Keys<IO::NetIO>& keys, const UINT_TYPE* a, const U
 void generateConvTriplesCheetahWrapper(Keys<IO::NetIO>& keys, const UINT_TYPE* a,
                                        const UINT_TYPE* b, UINT_TYPE* c, Utils::ConvParm parm,
                                        int party, int threads, Utils::PROTO proto, int factor,
-                                       bool is_shared_input) {
+                                       bool is_shared_input, const UINT_TYPE* prescribed) {
 #if USE_CONV_CUDA
     if (proto == Utils::PROTO::AB2 || proto == Utils::PROTO::AB) {
         TROY::conv2d(keys.get_ios(threads), OTHER_PARTY(party), a, b, c, parm.batchsize, parm.ic,
@@ -541,7 +564,7 @@ void generateConvTriplesCheetahWrapper(Keys<IO::NetIO>& keys, const UINT_TYPE* a
 
     if (Utils::getOutDim(parm) == gemini::GetConv2DOutShape(meta)) {
         generateConvTriplesCheetah(keys, a, b, c, meta, parm.batchsize, party, threads, proto,
-                                   factor);
+                                   factor, prescribed);
     } else {
         Utils::log(Utils::Level::INFO, "P", party - 1, ", PID", keys.get_io_offset(), ": Adding padding manually");
 
@@ -557,7 +580,7 @@ void generateConvTriplesCheetahWrapper(Keys<IO::NetIO>& keys, const UINT_TYPE* a
         meta = Utils::init_meta_conv(parm.ic, parm.ih, parm.iw, parm.fc, parm.fh, parm.fw,
                                      parm.n_filters, parm.stride, parm.padding);
         generateConvTriplesCheetah(keys, ai.data(), b, c, meta, parm.batchsize, party, threads,
-                                   proto, factor);
+                                   proto, factor, prescribed);
     }
 }
 
@@ -782,10 +805,14 @@ void generateConvTriplesCheetah(Keys<IO::NetIO>& keys, size_t total_batches,
 
 void generateConvTriplesCheetah(Keys<IO::NetIO>& keys, const UINT_TYPE* a, const UINT_TYPE* b,
                                 UINT_TYPE* c, const gemini::HomConv2DSS::Meta& meta, int batch,
-                                int party, int threads, Utils::PROTO proto, int factor) {
+                                int party, int threads, Utils::PROTO proto, int factor,
+                                const UINT_TYPE* prescribed) {
     auto start = measure::now();
     auto& conv = keys.get_conv();
     auto** ios = keys.get_ios(threads);
+
+    // AB2P: BOB's encrypted-filter cache, valid while the weights stay the same (ac_batch)
+    std::vector<std::vector<seal::Ciphertext>> enc_B_ct;
 
     double time_ntt  = 0;
     double send_recv = 0;
@@ -820,6 +847,45 @@ void generateConvTriplesCheetah(Keys<IO::NetIO>& keys, const UINT_TYPE* a, const
         Tensor<uint64_t> C;
 
         Result result;
+        if (proto == Utils::PROTO::AB2P) {
+            const bool fresh_filters
+                = ac_batch_size > 0 ? (cur_batch % ac_batch_size == 0) : (cur_batch == 0);
+            switch (party) {
+            case emp::ALICE: {
+                time_ntt += Utils::to_sec(Utils::time_diff(start_ntt));
+                result = Client::Protocol2Prescribed(ios, conv, meta, B, C, threads, fresh_filters);
+                time_ntt += Utils::to_sec(result.encryption);
+                break;
+            }
+            case emp::BOB: {
+                auto out_shape = gemini::GetConv2DOutShape(meta);
+                const size_t n_out = out_shape.num_elements();
+                Tensor<uint64_t> presc(out_shape);
+                for (size_t i = 0; i < n_out; ++i)
+                    presc.data()[i]
+                        = prescribed ? (uint64_t)prescribed[(size_t)cur_batch * n_out + i] : 0;
+                time_ntt += Utils::to_sec(Utils::time_diff(start_ntt));
+                result = Server::Protocol2Prescribed(meta, ios, conv, A, presc, enc_B_ct, threads,
+                                                     fresh_filters);
+                C = presc;  // this party's output share IS the prescribed value
+                break;
+            }
+            }
+
+            send_recv += Utils::to_sec(result.send_recv);
+            compute += Utils::to_sec(result.cipher_op);
+            recv_send += Utils::to_sec(result.serial);
+            decode += Utils::to_sec(result.decryption);
+            decode += Utils::to_sec(result.plain_op);
+
+            if (result.ret != Code::OK) {
+                Utils::log(Utils::Level::ERROR, "P", party - 1, ", PID", keys.get_io_offset(),
+                           ": CONV (AB2P) failed: ", CodeMessage(result.ret));
+            }
+
+            for (long i = 0; i < C.NumElements(); ++i) c[i + C.NumElements() * cur_batch] = C.data()[i];
+            continue;
+        }
         switch (party) {
         case emp::ALICE: {
             Code c;

@@ -39,6 +39,8 @@ struct ConvParm {
 enum class PROTO {
     AB,
     AB2,
+    AB2P,  // AB2 with the HE roles flipped and the evaluating party PRESCRIBING its output share
+           // (MODELWEIGHTS_KNOWN_DURING_PREPROCESSING; no share-fixing communication needed)
 };
 
 inline std::string proto_str(const PROTO& proto) {
@@ -47,6 +49,8 @@ inline std::string proto_str(const PROTO& proto) {
         return "AB";
     case PROTO::AB2:
         return "AB2";
+    case PROTO::AB2P:
+        return "AB2P";
     default:
         return "UNKNOWN";
     }

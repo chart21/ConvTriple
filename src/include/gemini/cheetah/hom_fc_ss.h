@@ -75,6 +75,20 @@ class HomFCSS {
                    std::vector<seal::Ciphertext>& out_vec_share0, Tensor<uint64_t>& out_vec_share1,
                    size_t nthreads = 1) const;
 
+    // Prescribed-share ("flipped") variant: the WEIGHT owner encrypts its matrix ...
+    Code encryptWeightMatrix(const Tensor<uint64_t>& weight_matrix, const Meta& meta,
+                             std::vector<std::vector<seal::Serializable<seal::Ciphertext>>>& enc,
+                             size_t nthreads = 1) const;
+
+    // ... and the VECTOR owner evaluates W*x with ENCRYPTED matrix and PLAINTEXT vector, masking
+    // the result with CALLER-PRESCRIBED output-share values, so the weight owner decrypts
+    // (W*x - prescribed) and no share-fixing communication is needed. `prescribed` must have
+    // GetOutShape(meta). See HomConv2DSS::conv2DSSPrescribed.
+    Code MatVecMulPrescribed(const std::vector<std::vector<seal::Ciphertext>>& enc_matrix,
+                             const std::vector<seal::Plaintext>& vec, const Meta& meta,
+                             const Tensor<uint64_t>& prescribed,
+                             std::vector<seal::Ciphertext>& out_ct, size_t nthreads = 1) const;
+
     Code decryptToVector(const std::vector<seal::Ciphertext>& enc_vector, const Meta& meta,
                          Tensor<uint64_t>& out, size_t nthreads = 1) const;
 
@@ -105,6 +119,10 @@ class HomFCSS {
 
     Code addRandomMask(std::vector<seal::Ciphertext>& enc_tensor, Tensor<uint64_t>& mask_tensor,
                        const Meta& meta, gemini::ThreadPool& tp) const;
+
+    Code maskWithPrescribed(std::vector<seal::Ciphertext>& enc_tensor,
+                            const Tensor<uint64_t>& prescribed, const Meta& meta,
+                            gemini::ThreadPool& tp) const;
 
     Code removeUnusedCoeffs(std::vector<seal::Ciphertext>& ct, const Meta& meta,
                             double* density = nullptr) const;

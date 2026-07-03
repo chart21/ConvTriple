@@ -85,6 +85,22 @@ class HomConv2DSS {
     Code filtersToNtt(std::vector<std::vector<seal::Plaintext>>& encoded_filters,
                       size_t nthreads = 1) const;
 
+    // Prescribed-share ("flipped") variant: the FILTER owner encrypts its filters ...
+    Code encryptFilters(const std::vector<Tensor<uint64_t>>& filters, const Meta& meta,
+                        std::vector<std::vector<seal::Serializable<seal::Ciphertext>>>& enc_filters,
+                        size_t nthreads = 1) const;
+
+    // ... and the IMAGE owner evaluates conv(pt_image, ct_filters) and masks the result with
+    // CALLER-PRESCRIBED output-share coefficients, so the filter owner decrypts (conv - prescribed)
+    // and no share-fixing communication is needed. `prescribed` must have GetConv2DOutShape(meta).
+    // Used for MODELWEIGHTS_KNOWN_DURING_PREPROCESSING where the image owner's triple share must
+    // equal a PRNG-derived value. Filter cts are NTT-transformed in place on first use (cacheable
+    // across batches); `image` polys are consumed (NTT-transformed in place).
+    Code conv2DSSPrescribed(std::vector<std::vector<seal::Ciphertext>>& enc_filters,
+                            std::vector<seal::Plaintext>& image, const Meta& meta,
+                            const Tensor<uint64_t>& prescribed,
+                            std::vector<seal::Ciphertext>& out_ct, size_t nthreads = 1) const;
+
     Code conv2DSS(const std::vector<seal::Ciphertext>& img_share0,
                   const std::vector<seal::Plaintext>& img_share1,
                   const std::vector<std::vector<seal::Plaintext>>& filters, const Meta& meta,
@@ -106,6 +122,14 @@ class HomConv2DSS {
                            const std::vector<seal::Plaintext>& filter, const Meta& meta,
                            seal::Ciphertext* out_buff, size_t out_buff_sze,
                            bool to_ntt = false) const;
+
+    size_t conv2DOneFilterPrescribed(const std::vector<seal::Plaintext>& image,
+                                     const std::vector<seal::Ciphertext>& filter,
+                                     seal::Ciphertext* out_buff, size_t out_buff_sze) const;
+
+    Code maskWithPrescribed(std::vector<seal::Ciphertext>& enc_tensor,
+                            const Tensor<uint64_t>& prescribed, const Meta& meta,
+                            size_t nthreads = 1) const;
 
     Code sampleRandomMask(const std::vector<size_t>& targets, uint64_t* coeffs_buff,
                           size_t buff_size, seal::Plaintext& mask, seal::parms_id_type pid,

@@ -39,6 +39,18 @@ Result perform_proto(const HomFCSS::Meta& meta, Channel** server, const HomFCSS&
                      const size_t& threads = 1, const size_t& batch = 1,
                      Utils::PROTO proto = Utils::PROTO::AB2);
 
+/**
+ * AB2P: flipped-role AB2 with a PRESCRIBED output share (vector owner side, emp::BOB).
+ * Receives the encrypted weight matrix (re-received every fresh_period batch elements),
+ * evaluates W*x - prescribed[i] per element and sends the results back; this party's output
+ * shares ARE `prescribed` (not written here).
+ */
+template <class Channel>
+Result Protocol2Prescribed(const HomFCSS::Meta& meta, Channel** server, const HomFCSS& fc,
+                           const vector<Tensor<uint64_t>>& A1,
+                           const vector<Tensor<uint64_t>>& prescribed, const size_t& threads,
+                           const size_t& batch, const size_t& fresh_period);
+
 #ifdef VERIFY
 template <class T>
 void Verify_FC(IO::NetIO& io, const HomFCSS::Meta& meta, const HomFCSS& fc, const Tensor<T>& A1,
@@ -69,6 +81,16 @@ template <class Channel>
 Result perform_proto(const HomFCSS::Meta& meta, Channel** client, const HomFCSS& fc,
                      const size_t& threads, const size_t& batch = 1,
                      Utils::PROTO proto = Utils::PROTO::AB2);
+
+/**
+ * AB2P: flipped-role AB2 with a PRESCRIBED output share (weight owner side, emp::ALICE).
+ * Encrypts and sends the weight matrix (every fresh_period batch elements), then receives and
+ * decrypts the evaluated results: C2[i] = W*x_i - peer's prescribed share.
+ */
+template <class Channel>
+Result Protocol2Prescribed(Channel** client, const HomFCSS& fc, const HomFCSS::Meta& meta,
+                           const vector<Tensor<uint64_t>>& B2, vector<Tensor<uint64_t>>& C2,
+                           const size_t& threads, const size_t& batch, const size_t& fresh_period);
 
 #ifdef VERIFY
 template <class T>
@@ -151,6 +173,111 @@ Result Client::Protocol2(Channel** client, const HomFCSS& hom_fc, const HomFCSS:
     Result final;
     for (size_t i = 0; i < threads; ++i) final.bytes += client[i]->counter;
     return final;
+}
+
+template <class Channel>
+Result Client::Protocol2Prescribed(Channel** client, const HomFCSS& fc, const HomFCSS::Meta& meta,
+                                   const vector<Tensor<uint64_t>>& B2, vector<Tensor<uint64_t>>& C2,
+                                   const size_t& threads, const size_t& batch,
+                                   const size_t& fresh_period) {
+    Result measures;
+
+    for (size_t i = 0; i < batch; ++i) {
+        if (i % fresh_period == 0) {
+            ////////////////////////////////////////////////////////////////////////////
+            // Enc(B2) + send
+            ////////////////////////////////////////////////////////////////////////////
+            auto start = measure::now();
+
+            vector<vector<seal::Serializable<seal::Ciphertext>>> enc_B2;
+            if (Code::OK != (measures.ret = fc.encryptWeightMatrix(B2[i], meta, enc_B2, threads)))
+                return measures;
+
+            measures.encryption += Utils::time_diff(start);
+            start = measure::now();
+
+            IO::send_encrypted_filters(*(client[0]), enc_B2);
+            client[0]->flush();
+
+            measures.send_recv += Utils::time_diff(start);
+        }
+
+        ////////////////////////////////////////////////////////////////////////////
+        // recv M2' = W*x - prescribed, decrypt
+        ////////////////////////////////////////////////////////////////////////////
+        auto start = measure::now();
+
+        vector<seal::Ciphertext> M2;
+        IO::recv_encrypted_vector(client, fc.getContext(), M2, threads);
+
+        measures.serial += Utils::time_diff(start);
+        start = measure::now();
+
+        if (Code::OK != (measures.ret = fc.decryptToVector(M2, meta, C2[i], threads)))
+            return measures;
+
+        measures.decryption += Utils::time_diff(start);
+    }
+
+    for (size_t i = 0; i < threads; ++i) measures.bytes += client[i]->counter;
+    return measures;
+}
+
+template <class Channel>
+Result Server::Protocol2Prescribed(const HomFCSS::Meta& meta, Channel** server, const HomFCSS& fc,
+                                   const vector<Tensor<uint64_t>>& A1,
+                                   const vector<Tensor<uint64_t>>& prescribed,
+                                   const size_t& threads, const size_t& batch,
+                                   const size_t& fresh_period) {
+    Result measures;
+    vector<vector<seal::Ciphertext>> enc_B2;  // encrypted weight matrix, cached across the batch
+
+    for (size_t i = 0; i < batch; ++i) {
+        ////////////////////////////////////////////////////////////////////////////
+        // encode A1[i] (plaintext vector)
+        ////////////////////////////////////////////////////////////////////////////
+        auto start = measure::now();
+
+        vector<seal::Plaintext> enc_A1;
+        if (Code::OK != (measures.ret = fc.encodeInputVector(A1[i], meta, enc_A1, threads)))
+            return measures;
+
+        measures.encryption += Utils::time_diff(start);
+
+        if (i % fresh_period == 0) {
+            ////////////////////////////////////////////////////////////////////////////
+            // recv Enc(B2)
+            ////////////////////////////////////////////////////////////////////////////
+            start = measure::now();
+            enc_B2.clear();
+            IO::recv_encrypted_filters(*(server[0]), fc.getContext(), enc_B2,
+                                       /*is_truncated*/ false);
+            measures.send_recv += Utils::time_diff(start);
+        }
+
+        ////////////////////////////////////////////////////////////////////////////
+        // M2' = W*x - prescribed[i]
+        ////////////////////////////////////////////////////////////////////////////
+        start = measure::now();
+
+        vector<seal::Ciphertext> M2;
+        if (Code::OK
+            != (measures.ret
+                = fc.MatVecMulPrescribed(enc_B2, enc_A1, meta, prescribed[i], M2, threads)))
+            return measures;
+
+        measures.cipher_op += Utils::time_diff(start);
+
+        ////////////////////////////////////////////////////////////////////////////
+        // serialize + send M2'
+        ////////////////////////////////////////////////////////////////////////////
+        start = measure::now();
+        IO::send_encrypted_vector(server, M2, threads);
+        measures.serial += Utils::time_diff(start);
+    }
+
+    for (size_t i = 0; i < threads; ++i) measures.bytes += server[i]->counter;
+    return measures;
 }
 
 template <class Channel>

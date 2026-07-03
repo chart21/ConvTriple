@@ -61,14 +61,18 @@ void generateArithTriplesCheetah(const UINT_TYPE a[], const UINT_TYPE b[], UINT_
                                  int port, int party, int threads = 1,
                                  Utils::PROTO proto = Utils::PROTO::AB, unsigned io_offset = 1);
 
+// For proto == AB2P, `prescribed` (image/vector owner only, layout == c) fixes that party's
+// output shares; the peer decrypts (product - prescribed). No share-fixing communication.
 void generateFCTriplesCheetah(Keys<IO::NetIO>& keys, const UINT_TYPE* a, const UINT_TYPE* b,
                               UINT_TYPE* c, int batch, uint64_t com_dim, uint64_t dim2, int party,
-                              int threads, Utils::PROTO proto, int factor = 1);
+                              int threads, Utils::PROTO proto, int factor = 1,
+                              const UINT_TYPE* prescribed = nullptr);
 
 void generateConvTriplesCheetahWrapper(Keys<IO::NetIO>& keys, const UINT_TYPE* a,
                                        const UINT_TYPE* b, UINT_TYPE* c, Utils::ConvParm parm,
                                        int party, int threads, Utils::PROTO proto, int factor = 1,
-                                       bool is_shared_input = false);
+                                       bool is_shared_input = false,
+                                       const UINT_TYPE* prescribed = nullptr);
 
 void generateConvTriplesCheetah(Keys<IO::NetIO>& keys, size_t total_batches,
                                 std::vector<Utils::ConvParm>& parms, UINT_TYPE** a, UINT_TYPE** b,
@@ -82,7 +86,8 @@ void generateConvTriplesCheetah2(Keys<IO::NetIO>& keys, size_t total_batches,
 
 void generateConvTriplesCheetah(Keys<IO::NetIO>& keys, const UINT_TYPE* a, const UINT_TYPE* b,
                                 UINT_TYPE* c, const gemini::HomConv2DSS::Meta& meta, int batch,
-                                int party, int threads, Utils::PROTO proto, int factor);
+                                int party, int threads, Utils::PROTO proto, int factor,
+                                const UINT_TYPE* prescribed = nullptr);
 
 void generateBNTriplesCheetah(Keys<IO::NetIO>& keys, const UINT_TYPE* a, const UINT_TYPE* b,
                               UINT_TYPE* c, int batch, size_t num_ele, size_t h, size_t w,

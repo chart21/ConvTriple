@@ -482,6 +482,132 @@ Code HomFCSS::MatVecMul(const std::vector<seal::Ciphertext>& vec_share0,
     return Code::OK;
 }
 
+Code HomFCSS::encryptWeightMatrix(
+    const Tensor<uint64_t>& weight_matrix, const Meta& meta,
+    std::vector<std::vector<seal::Serializable<seal::Ciphertext>>>& enc, size_t nthreads) const {
+    ENSURE_OR_RETURN(context_ && encryptor_, Code::ERR_CONFIG);
+
+    std::vector<std::vector<seal::Plaintext>> polys;
+    CHECK_ERR(encodeWeightMatrix(weight_matrix, meta, polys, nthreads),
+              "encryptWeightMatrix: encode");
+
+    enc.resize(polys.size());
+    auto encrypt_prg = [&](long wid, size_t start, size_t end) {
+        for (size_t j = start; j < end; ++j) {
+            seal::Serializable<seal::Ciphertext> dummy = encryptor_->encrypt_zero();
+            enc[j].resize(polys[j].size(), dummy);
+            for (size_t i = 0; i < polys[j].size(); ++i) {
+                try {
+                    enc[j][i] = encryptor_->encrypt_symmetric(polys[j][i]);
+                } catch (const std::logic_error& e) {
+                    LOG(WARNING) << "SEAL ERROR: " << e.what();
+                    return Code::ERR_INTERNAL;
+                }
+            }
+        }
+        return Code::OK;
+    };
+    gemini::ThreadPool tpool(nthreads);
+    return LaunchWorks(tpool, polys.size(), encrypt_prg);
+}
+
+// MatVecMul with the encryption roles flipped: matrix polys are ciphertexts, vector polys are
+// plaintexts, and the output shares are PRESCRIBED by the caller (see maskWithPrescribed).
+Code HomFCSS::MatVecMulPrescribed(const std::vector<std::vector<seal::Ciphertext>>& enc_matrix,
+                                  const std::vector<seal::Plaintext>& vec, const Meta& meta,
+                                  const Tensor<uint64_t>& prescribed,
+                                  std::vector<seal::Ciphertext>& out_ct, size_t nthreads) const {
+    ENSURE_OR_RETURN(context_ && evaluator_, Code::ERR_CONFIG);
+
+    auto split_shape      = getSplit(meta, poly_degree());
+    const size_t n_ct_in  = CeilDiv<size_t>(meta.input_shape.length(), split_shape.cols());
+    const size_t n_ct_out = CeilDiv<size_t>(meta.weight_shape.rows(), split_shape.rows());
+
+    ENSURE_OR_RETURN(vec.size() == n_ct_in, Code::ERR_INVALID_ARG);
+    ENSURE_OR_RETURN(enc_matrix.size() == n_ct_out, Code::ERR_INVALID_ARG);
+    for (const auto& c : enc_matrix) {
+        ENSURE_OR_RETURN(c.size() == n_ct_in, Code::ERR_INVALID_ARG);
+    }
+    ENSURE_OR_RETURN(prescribed.shape().IsSameSize(GetOutShape(meta)), Code::ERR_DIM_MISMATCH);
+
+    ThreadPool tpool(nthreads);
+
+    out_ct.resize(n_ct_out);
+    auto fma_prg = [&](long wid, size_t start, size_t end) {
+        for (size_t j = start; j < end; ++j) {
+            try {
+                evaluator_->multiply_plain(enc_matrix[j][0], vec[0], out_ct[j]);
+                for (size_t i = 1; i < n_ct_in; ++i) {
+                    seal::Ciphertext tmp;
+                    evaluator_->multiply_plain(enc_matrix[j][i], vec[i], tmp);
+                    evaluator_->add_inplace(out_ct[j], tmp);
+                }
+            } catch (const std::logic_error& e) {
+                LOG(WARNING) << "SEAL ERROR: " << e.what();
+                return Code::ERR_INTERNAL;
+            }
+        }
+        return Code::OK;
+    };
+    CHECK_ERR(LaunchWorks(tpool, n_ct_out, fma_prg), "fma");
+
+    CHECK_ERR(maskWithPrescribed(out_ct, prescribed, meta, tpool), "maskWithPrescribed");
+
+    if (scheme() == seal::scheme_type::bfv) {
+        for (auto& c : out_ct) {
+            truncate_for_decryption(c, *evaluator_, *context_);
+        }
+    }
+
+    removeUnusedCoeffs(out_ct, meta);
+    return Code::OK;
+}
+
+// addRandomMask with the shared coefficients PRESCRIBED by the caller (see the conv analog).
+Code HomFCSS::maskWithPrescribed(std::vector<seal::Ciphertext>& cts,
+                                 const Tensor<uint64_t>& prescribed, const Meta& meta,
+                                 gemini::ThreadPool& tpool) const {
+    ENSURE_OR_RETURN(pk_, Code::ERR_CONFIG);
+    TensorShape split_shape = getSplit(meta, poly_degree());
+    const size_t n_ct_out   = CeilDiv<size_t>(meta.weight_shape.rows(), split_shape.rows());
+    ENSURE_OR_RETURN(cts.size() == n_ct_out, Code::ERR_INVALID_ARG);
+    ENSURE_OR_RETURN(prescribed.shape().IsSameSize(GetOutShape(meta)), Code::ERR_DIM_MISMATCH);
+
+    std::vector<size_t> targets(split_shape.rows());
+    for (size_t i = 0; i < targets.size(); ++i) {
+        targets[i] = i * split_shape.cols();
+    }
+
+    const uint64_t plain = plain_modulus();
+    auto mask_prg = [&](long wid, size_t start, size_t end) {
+        RLWEPt mask;
+        std::vector<U64> coeffs(targets.size());
+        auto prng = context_->first_context_data()->parms().random_generator()->create();
+        for (size_t r_blk = start; r_blk < end; ++r_blk) {
+            auto& this_ct = cts.at(r_blk);
+
+            flood_ciphertext(this_ct, prng, *context_, *pk_, *evaluator_);
+            CHECK_ERR(sampleRandomMask(targets, coeffs.data(), coeffs.size(), mask,
+                                       this_ct.parms_id(), prng, this_ct.is_ntt_form()),
+                      "RandomMaskPoly");
+
+            // overwrite the shared coefficients with the caller-prescribed output share
+            auto row_bgn = r_blk * split_shape.rows();
+            auto row_end = std::min<size_t>(row_bgn + split_shape.rows(), meta.weight_shape.rows());
+            for (size_t r = row_bgn; r < row_end; ++r) {
+                mask[targets[r - row_bgn]] = prescribed(r) % plain;
+            }
+            internal::sub_poly_inplace(this_ct, mask, *context_, *evaluator_);
+        }
+
+        seal::util::seal_memzero(coeffs.data(), sizeof(uint64_t) * coeffs.size());
+        seal::util::seal_memzero(mask.data(), sizeof(uint64_t) * mask.coeff_count());
+        return Code::OK;
+    };
+
+    return LaunchWorks(tpool, n_ct_out, mask_prg);
+}
+
 Code HomFCSS::addRandomMask(std::vector<seal::Ciphertext>& cts, Tensor<uint64_t>& mask_vector,
                             const Meta& meta, gemini::ThreadPool& tpool) const {
     ENSURE_OR_RETURN(pk_, Code::ERR_CONFIG);
