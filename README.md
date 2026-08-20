@@ -2,7 +2,7 @@ Uses [OpenCheetah](https://github.com/Alibaba-Gemini-Lab/OpenCheetah/tree/main),
 [SecONNds](https://github.com/SecONNds/SecONNds_1_25/tree/main),
 [Troy-Nova](https://github.com/lightbulb128/troy-nova/tree/master) and
 [EMP-OT](https://github.com/emp-toolkit/emp-ot)
-to implement two protocols for 2PC and a few linear operations.
+to implement protocols for 2PC.
 
 
 # Overview
