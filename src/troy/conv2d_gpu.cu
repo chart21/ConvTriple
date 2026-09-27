@@ -1,4 +1,6 @@
+#include <algorithm>
 #include <chrono>
+#include <memory>
 #include <sstream>
 
 #include "constants.hpp"
@@ -33,6 +35,74 @@ troy::HeContextPointer setup() {
     return HeContext::create(parms, true, SecurityLevel::Classical128);
 #endif
 }
+
+namespace {
+
+// One context, encoder and key pair per process, on the device when there is one. Creating them per
+// convolution re-derived and re-uploaded the NTT tables and generated a new key for every layer.
+struct HeState {
+    troy::HeContextPointer he;
+    std::unique_ptr<troy::linear::PolynomialEncoderRing2k<INT_TYPE>> encoder;
+    troy::ParmsID first_parms_id;
+    std::unique_ptr<troy::KeyGenerator> keygen;
+    std::unique_ptr<troy::Encryptor> encryptor;
+    std::unique_ptr<troy::Evaluator> evaluator;
+    std::unique_ptr<troy::Decryptor> decryptor;
+};
+
+HeState& he_state() {
+    // Never destroyed: device memory must not be released after the CUDA runtime has shut down.
+    static HeState* state = [] {
+        auto* st    = new HeState;
+        st->he      = setup();
+        st->encoder = std::make_unique<troy::linear::PolynomialEncoderRing2k<INT_TYPE>>(st->he, BIT_LEN);
+        st->first_parms_id = st->encoder->context()->first_context_data_pointer()->parms_id();
+        if (troy::utils::device_count() > 0) {
+            st->he->to_device_inplace();
+            st->encoder->to_device_inplace();
+        } else {
+            std::cerr << RED << "Couldn't find a GPU" << NC << "\n";
+        }
+        st->keygen    = std::make_unique<troy::KeyGenerator>(st->he);
+        st->encryptor = std::make_unique<troy::Encryptor>(st->he);
+        st->encryptor->set_secret_key(st->keygen->secret_key());
+        st->evaluator = std::make_unique<troy::Evaluator>(st->he);
+        st->decryptor = std::make_unique<troy::Decryptor>(st->he, st->keygen->secret_key());
+        return st;
+    }();
+    return *state;
+}
+
+// A layer has ceil(ic/ci) * ceil(oc/co) weight plaintexts of a full polynomial each. The
+// communication-optimal tiling uses whole-image tiles, where ci = co = 1 on large images: ic * oc
+// plaintexts, more than a GPU holds for the wide ResNet layers. Encode and multiply them one
+// output-channel chunk at a time. The chunks keep the layer's tiling, so the encrypted input and the
+// output layout stay the same, and each chunk reuses the previous chunk's device memory.
+troy::linear::Cipher2d conv_by_output_chunks(const troy::linear::Conv2dHelper& helper,
+                                             const troy::Evaluator& evaluator,
+                                             const troy::linear::PolynomialEncoderRing2k<INT_TYPE>& encoder,
+                                             const troy::linear::Cipher2d& x, const INT_TYPE* w,
+                                             size_t ic, size_t oc, size_t kh, size_t kw) {
+    constexpr size_t max_plaintexts = 4096; // about 256 MiB of NTT-form weights per chunk
+    size_t co        = helper.output_channel_block;
+    size_t in_groups = (ic + helper.input_channel_block - 1) / helper.input_channel_block;
+    size_t chunk_oc  = std::max<size_t>(1, max_plaintexts / in_groups) * co;
+    troy::linear::Cipher2d y;
+    for (size_t o0 = 0; o0 < oc; o0 += chunk_oc) {
+        troy::linear::Conv2dHelper h = helper; // same blocks
+        h.output_channels = std::min(oc - o0, chunk_oc);
+        auto yc = h.conv2d(evaluator, x, h.encode_weights_ring2k(encoder, w + o0 * ic * kh * kw, std::nullopt));
+        if (o0 == 0) {
+            y = std::move(yc);
+            for (auto& row : y.data()) row.reserve((oc + co - 1) / co);
+        } else
+            for (size_t b = 0; b < yc.data().size(); b++)
+                for (auto& cipher : yc.data()[b]) y.data()[b].push_back(std::move(cipher));
+    }
+    return y;
+}
+
+} // namespace
 
 void conv2d(IO::NetIO** ios, int party, const INT_TYPE* a, const INT_TYPE* b, INT_TYPE* c,
             size_t bs, size_t ic, size_t ih, size_t iw, size_t kh, size_t kw, size_t oc,
@@ -104,38 +174,18 @@ void conv2d_ab2(IO::NetIO** ios, int party, const INT_TYPE* x, const INT_TYPE* w
                 size_t bs, size_t ic, size_t ih, size_t iw, size_t kh, size_t kw, size_t oc,
                 size_t stride, bool mod_switch) {
     using namespace troy;
-    auto he = setup();
-    linear::PolynomialEncoderRing2k<INT_TYPE> encoder(he, BIT_LEN);
-    if (utils::device_count() > 0) {
-        he->to_device_inplace();
-        encoder.to_device_inplace();
-    } else {
-        std::cerr << RED << "Couldn't find a GPU" << NC << "\n";
-    }
+    HeState& st  = he_state();
+    auto& he     = st.he;
+    auto& encoder = *st.encoder;
 
     size_t oh = ih - kh + 1;
     size_t ow = iw - kw + 1;
 
-    linear::Conv2dHelper helper_enc(bs, ic, oc, ih, iw, kh, kw, POLY_MOD,
-                                    linear::MatmulObjective::EncryptLeft);
-
-    KeyGenerator keygen(he);
-    Encryptor encryptor(he);
-    encryptor.set_secret_key(keygen.secret_key());
-    Evaluator evaluator(he);
-    Decryptor decryptor(he, keygen.secret_key());
+    const Encryptor& encryptor = *st.encryptor;
+    const Evaluator& evaluator = *st.evaluator;
+    const Decryptor& decryptor = *st.decryptor;
 
     vector<INT_TYPE> R = random_polynomial(bs * oc * oh * ow);
-
-    linear::Plain2d w_encoded;
-    if (party != ALICE) {
-        auto ntt = measure::now();
-        w_encoded
-            = helper_enc.encode_weights_ring2k(encoder, w, std::nullopt, false, evaluator, true);
-        double ntt_time = std::chrono::duration<double, std::milli>(measure::now() - ntt).count();
-        std::cerr << "P" << party - 1 << ": CONV NTT preprocessing time[s]: " << ntt_time / 1000.0
-                  << "\n";
-    }
 
     [[maybe_unused]] size_t size = 0;
     for (size_t cur = 0; cur < bs;) {
@@ -173,7 +223,8 @@ void conv2d_ab2(IO::NetIO** ios, int party, const INT_TYPE* x, const INT_TYPE* w
             if (x)
                 x_encrypted.add_plain_inplace(evaluator, x_encoded);
 
-            linear::Cipher2d y_encrypted = helper.conv2d(evaluator, x_encrypted, w_encoded, true);
+            linear::Cipher2d y_encrypted
+                = conv_by_output_chunks(helper, evaluator, encoder, x_encrypted, w, ic, oc, kh, kw);
             y_encrypted.sub_plain_inplace(evaluator, R_encoded);
             if (mod_switch)
                 y_encrypted.mod_switch_to_next_inplace(evaluator);
@@ -231,33 +282,16 @@ void conv2d_ab(IO::NetIO** ios, int party, const INT_TYPE* x, const INT_TYPE* w,
                size_t bs, size_t ic, size_t ih, size_t iw, size_t kh, size_t kw, size_t oc,
                size_t stride, bool mod_switch) {
     using namespace troy;
-    auto he = setup();
-    linear::PolynomialEncoderRing2k<INT_TYPE> encoder(he, BIT_LEN);
-    if (utils::device_count() > 0) {
-        he->to_device_inplace();
-        encoder.to_device_inplace();
-    } else {
-        std::cerr << RED << "Couldn't find a GPU" << NC << "\n";
-    }
+    HeState& st  = he_state();
+    auto& he     = st.he;
+    auto& encoder = *st.encoder;
 
     size_t oh = ih - kh + 1;
     size_t ow = iw - kw + 1;
 
-    linear::Conv2dHelper helper_enc(bs, ic, oc, ih, iw, kh, kw, POLY_MOD,
-                                    linear::MatmulObjective::EncryptLeft);
-
-    KeyGenerator keygen(he);
-    Encryptor encryptor(he);
-    encryptor.set_secret_key(keygen.secret_key());
-    Evaluator evaluator(he);
-    Decryptor decryptor(he, keygen.secret_key());
-
-    auto ntt = measure::now();
-    linear::Plain2d w_encoded
-        = helper_enc.encode_weights_ring2k(encoder, w, std::nullopt, false, evaluator, true);
-    double ntt_time = std::chrono::duration<double, std::milli>(measure::now() - ntt).count();
-    std::cerr << "P" << party - 1 << ": CONV NTT preprocessing time[s]: " << ntt_time / 1000.0
-              << "\n";
+    const Encryptor& encryptor = *st.encryptor;
+    const Evaluator& evaluator = *st.evaluator;
+    const Decryptor& decryptor = *st.decryptor;
 
     [[maybe_unused]] size_t size = 0;
     for (size_t cur = 0; cur < bs;) {
@@ -289,7 +323,8 @@ void conv2d_ab(IO::NetIO** ios, int party, const INT_TYPE* x, const INT_TYPE* w,
         other_x_encrypted.add_plain_inplace(
             evaluator, helper.encode_inputs_ring2k(encoder, x + x_offset, std::nullopt, true));
 
-        linear::Cipher2d y_encrypted = helper.conv2d(evaluator, other_x_encrypted, w_encoded, true);
+        linear::Cipher2d y_encrypted
+            = conv_by_output_chunks(helper, evaluator, encoder, other_x_encrypted, w, ic, oc, kh, kw);
         y_encrypted.sub_plain_inplace(evaluator, R_encoded);
         if (mod_switch)
             y_encrypted.mod_switch_to_next_inplace(evaluator);
@@ -424,15 +459,10 @@ void conv2d_ab2_reverse(IO::NetIO** ios, int party, const INT_TYPE* x, const INT
                         INT_TYPE* c, size_t bs, size_t ic, size_t ih, size_t iw, size_t kh,
                         size_t kw, size_t oc, size_t stride, bool mod_switch) {
     using namespace troy;
-    auto he = setup();
-    linear::PolynomialEncoderRing2k<INT_TYPE> encoder(he, BIT_LEN);
-    auto parmsid = encoder.context()->first_context_data_pointer()->parms_id();
-    if (utils::device_count() > 0) {
-        he->to_device_inplace();
-        encoder.to_device_inplace();
-    } else {
-        std::cout << RED << "Couldn't find a GPU" << NC << "\n";
-    }
+    HeState& st  = he_state();
+    auto& he     = st.he;
+    auto& encoder = *st.encoder;
+    const ParmsID parmsid = st.first_parms_id;
 
     size_t oh = ih - kh + 1;
     size_t ow = iw - kw + 1;
@@ -440,11 +470,9 @@ void conv2d_ab2_reverse(IO::NetIO** ios, int party, const INT_TYPE* x, const INT
     linear::Conv2dHelper helper_enc(bs, ic, oc, ih, iw, kh, kw, POLY_MOD,
                                     linear::MatmulObjective::EncryptRight);
 
-    KeyGenerator keygen(he);
-    Encryptor encryptor(he);
-    encryptor.set_secret_key(keygen.secret_key());
-    Evaluator evaluator(he);
-    Decryptor decryptor(he, keygen.secret_key());
+    const Encryptor& encryptor = *st.encryptor;
+    const Evaluator& evaluator = *st.evaluator;
+    const Decryptor& decryptor = *st.decryptor;
 
     linear::Cipher2d w_encrypted;
     if (party == BOB) {
@@ -477,7 +505,7 @@ void conv2d_ab2_reverse(IO::NetIO** ios, int party, const INT_TYPE* x, const INT
             vector<INT_TYPE> R = random_polynomial(batch_size * oc * oh * ow);
 
             linear::Plain2d x_encoded
-                = helper.encode_inputs_ring2k(encoder, x + x_offset, parmsid, false);
+                = helper.encode_inputs_ring2k(encoder, x + x_offset, parmsid);
             linear::Plain2d R_encoded = helper.encode_outputs_ring2k(encoder, R.data(), parmsid);
 
             linear::Cipher2d y_encrypted = helper.conv2d_reverse(evaluator, x_encoded, w_encrypted);
@@ -528,15 +556,10 @@ void conv2d_ab_reverse(IO::NetIO** ios, int party, const INT_TYPE* x, const INT_
                        INT_TYPE* c, size_t bs, size_t ic, size_t ih, size_t iw, size_t kh,
                        size_t kw, size_t oc, size_t stride, bool mod_switch) {
     using namespace troy;
-    auto he = setup();
-    linear::PolynomialEncoderRing2k<INT_TYPE> encoder(he, BIT_LEN);
-    auto parmsid = encoder.context()->first_context_data_pointer()->parms_id();
-    if (utils::device_count() > 0) {
-        he->to_device_inplace();
-        encoder.to_device_inplace();
-    } else {
-        std::cout << RED << "Couldn't find a GPU" << NC << "\n";
-    }
+    HeState& st  = he_state();
+    auto& he     = st.he;
+    auto& encoder = *st.encoder;
+    const ParmsID parmsid = st.first_parms_id;
 
     size_t oh = ih - kh + 1;
     size_t ow = iw - kw + 1;
@@ -544,11 +567,9 @@ void conv2d_ab_reverse(IO::NetIO** ios, int party, const INT_TYPE* x, const INT_
     linear::Conv2dHelper helper_enc(bs, ic, oc, ih, iw, kh, kw, POLY_MOD,
                                     linear::MatmulObjective::EncryptRight);
 
-    KeyGenerator keygen(he);
-    Encryptor encryptor(he);
-    encryptor.set_secret_key(keygen.secret_key());
-    Evaluator evaluator(he);
-    Decryptor decryptor(he, keygen.secret_key());
+    const Encryptor& encryptor = *st.encryptor;
+    const Evaluator& evaluator = *st.evaluator;
+    const Decryptor& decryptor = *st.decryptor;
 
     linear::Cipher2d w_encrypted;
     w_encrypted = helper_enc.encrypt_weights_ring2k(encryptor, encoder, w, std::nullopt);
@@ -576,7 +597,7 @@ void conv2d_ab_reverse(IO::NetIO** ios, int party, const INT_TYPE* x, const INT_
             vector<INT_TYPE> R = random_polynomial(batch_size * oc * oh * ow);
 
             linear::Plain2d x_encoded
-                = helper.encode_inputs_ring2k(encoder, x + x_offset, parmsid, false);
+                = helper.encode_inputs_ring2k(encoder, x + x_offset, parmsid);
             linear::Plain2d R_encoded = helper.encode_outputs_ring2k(encoder, R.data(), parmsid);
 
             linear::Cipher2d y_encrypted = helper.conv2d_reverse(evaluator, x_encoded, w_encrypted);
@@ -604,7 +625,7 @@ void conv2d_ab_reverse(IO::NetIO** ios, int party, const INT_TYPE* x, const INT_
             vector<INT_TYPE> R = random_polynomial(batch_size * oc * oh * ow);
 
             linear::Plain2d x_encoded
-                = helper.encode_inputs_ring2k(encoder, x + x_offset, parmsid, false);
+                = helper.encode_inputs_ring2k(encoder, x + x_offset, parmsid);
             linear::Plain2d R_encoded = helper.encode_outputs_ring2k(encoder, R.data(), parmsid);
 
             linear::Cipher2d y_encrypted = helper.conv2d_reverse(evaluator, x_encoded, w_encrypted);

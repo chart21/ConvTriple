@@ -1,6 +1,9 @@
 #!/bin/bash
 
-GPU_ARCH=${GPU_ARCHITECTURE:-"75"}
+# CUDA architecture of the local GPU (e.g. 89 for Ada), overridable with GPU_ARCHITECTURE. Building
+# for an older one makes the driver JIT-compile every kernel from PTX at startup.
+GPU_ARCH=${GPU_ARCHITECTURE:-$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader 2>/dev/null | head -1 | tr -d '.')}
+GPU_ARCH=${GPU_ARCH:-"75;80;86;89"}
 
 WORK_DIR="$PWD"
 DEPS="$WORK_DIR/deps"
@@ -61,16 +64,17 @@ cmake --build build --target install --parallel 8
 if [[ "$1" = "-gpu" ]]; then
     git clone "https://github.com/lightbulb128/troy-nova.git" $DEPS_DIR/troy-nova
     cd $DEPS_DIR/troy-nova
-    git checkout 3354734
+    # c1913dd: conv2d with batched multiply-accumulate (one kernel per layer instead of one per ciphertext)
+    git checkout c1913dd
+    git submodule update --init extern/zstd
     patch --quiet --no-backup-if-mismatch -N -p1 -i $WORK_DIR/patch/troy-nova.patch -d $DEPS_DIR/troy-nova
 
-    sed -i "2i #include <algorithm>" ./test/lwe.cu
-    sed -i "5i #include <cstdint>" ./src/utils/compression.h
-
+    # bundled zstd, built position-independent: a system libzstd.a cannot go into the shared libtroy
     cmake -B build . -DCMAKE_INSTALL_PREFIX=$BUILD_DIR \
         -DCMAKE_CUDA_ARCHITECTURES="$GPU_ARCH" -DCMAKE_BUILD_TYPE=$BUILD_MODE \
         -DCMAKE_PREFIX_PATH=$BUILD_DIR -DTROY_PYBIND=OFF -DTROY_TEST=OFF \
-        -DTROY_BENCH=OFF -DTROY_EXAMPLES=OFF
+        -DTROY_BENCH=OFF -DTROY_EXAMPLES=OFF \
+        -DCMAKE_DISABLE_FIND_PACKAGE_zstd=ON -DCMAKE_POSITION_INDEPENDENT_CODE=ON
     cmake --build build -t install -j
 fi
 
