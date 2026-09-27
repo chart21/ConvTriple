@@ -552,9 +552,23 @@ void generateConvTriplesCheetahWrapper(Keys<IO::NetIO>& keys, const UINT_TYPE* a
                                        bool is_shared_input, const UINT_TYPE* prescribed) {
 #if USE_CONV_CUDA
     if (proto == Utils::PROTO::AB2 || proto == Utils::PROTO::AB) {
-        TROY::conv2d(keys.get_ios(threads), OTHER_PARTY(party), a, b, c, parm.batchsize, parm.ic,
+        auto start = measure::now();
+        auto** ios = keys.get_ios(threads);
+        TROY::conv2d(ios, OTHER_PARTY(party), a, b, c, parm.batchsize, parm.ic,
                      parm.ih, parm.iw, parm.fh, parm.fw, parm.n_filters, parm.stride, parm.padding,
                      true, factor, proto == Utils::PROTO::AB);
+        // Same accounting as the CPU path (the counters would otherwise be charged to the next layer type)
+        std::string unit;
+        double data_sent = 0, data_recv = 0;
+        for (int i = 0; i < threads; ++i) {
+            data_sent += Utils::to_MB(ios[i]->counter, unit);
+            data_recv += Utils::to_MB(ios[i]->recv_counter, unit);
+            ios[i]->counter      = 0;
+            ios[i]->recv_counter = 0;
+        }
+        Utils::log(Utils::Level::INFO, "P", party - 1, ", PID", keys.get_io_offset(),
+                   ": CONV triple (GPU)   MB SENT PRE: ", data_sent, "   MB RECEIVED PRE: ", data_recv);
+        accumulateTripleStat("CONV", data_sent, data_recv, Utils::to_sec(Utils::time_diff(start)));
         return;
     }
 #endif
