@@ -27,7 +27,10 @@ troy::HeContextPointer setup() {
     SchemeType scheme = SchemeType::BFV;
 
     EncryptionParameters parms(scheme);
-    parms.set_coeff_modulus(CoeffModulus::create(poly_mod, {43, 33, 33}));
+    // Both primes carry data (no key-switching prime), like the CPU path's SEAL context: 109 bits leave
+    // room to flood the noise with 64 bits before the switch down to the 60-bit prime.
+    parms.set_coeff_modulus(CoeffModulus::create(poly_mod, {60, 49}));
+    parms.set_use_special_prime_for_encryption(true);
     parms.set_plain_modulus(plain_mod);
     parms.set_poly_modulus_degree(poly_mod);
 #if PRG_SEED != -1
@@ -49,6 +52,10 @@ struct HeState {
     std::unique_ptr<troy::Encryptor> encryptor;
     std::unique_ptr<troy::Evaluator> evaluator;
     std::unique_ptr<troy::Decryptor> decryptor;
+    // Encrypts zero under the other party's public key, from its own OS-seeded generator: the context's
+    // generator is seeded with PRG_SEED, so both parties would draw the same re-randomization.
+    std::unique_ptr<troy::Encryptor> rerandomizer;
+    std::unique_ptr<troy::utils::RandomGenerator> prng;
 };
 
 HeState& he_state() {
@@ -72,6 +79,90 @@ HeState& he_state() {
         return st;
     }();
     return *state;
+}
+
+// The first convolution exchanges public keys, so that outputs can be re-randomized under the key of
+// the party that decrypts them.
+void exchange_public_keys(IO::NetIO** ios, int party) {
+    HeState& st = he_state();
+    if (st.rerandomizer)
+        return;
+    std::stringstream mine;
+    st.keygen->create_public_key(false).save(mine, st.he);
+    std::stringstream theirs;
+    if (party == ALICE) {
+        send(ios, mine);
+        theirs = recv(ios);
+    } else {
+        theirs = recv(ios);
+        send(ios, mine);
+    }
+    troy::PublicKey other = troy::PublicKey::load_new(theirs, st.he);
+    if (troy::utils::device_count() > 0)
+        other.to_device_inplace();
+    st.rerandomizer = std::make_unique<troy::Encryptor>(st.he);
+    st.rerandomizer->set_public_key(other);
+    INT_TYPE seed[4];
+    random_ring(seed, 4);
+    st.prng = std::make_unique<troy::utils::RandomGenerator>(
+        (__uint128_t(seed[0]) << 96) | (__uint128_t(seed[1]) << 64) | (uint64_t(seed[2]) << 32) | seed[3]);
+}
+
+// c0 += e mod each prime, for one uniform 64-bit e per coefficient
+__global__ void flood_kernel(uint64_t* c0, const uint64_t* noise, const troy::Modulus* moduli, size_t n,
+                             size_t moduli_count) {
+    size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= n * moduli_count)
+        return;
+    const troy::Modulus& q = moduli[idx / n];
+    uint64_t v             = c0[idx] + q.reduce(noise[idx % n]);
+    c0[idx]                = v >= q.value() ? v - q.value() : v;
+}
+
+// Before a result goes back to the key owner, whose own ciphertext it was computed from: its c1 and its
+// noise are functions of the weights. Add an encryption of zero under the key owner's public key (a fresh
+// c1) and a uniform 64-bit noise term (hides the weight-dependent noise), like HomConv2DSS's
+// flood_ciphertext. At the full modulus, so that the switch to the last prime scales both away.
+void rerandomize(troy::linear::Cipher2d& y) {
+    HeState& st = he_state();
+    std::vector<troy::Ciphertext*> cts;
+    for (auto& row : y.data())
+        for (auto& ct : row) cts.push_back(&ct);
+    if (cts.empty())
+        return;
+    auto context_data = st.he->get_context_data(cts[0]->parms_id()).value();
+    auto moduli       = context_data->parms().coeff_modulus();
+    size_t n = cts[0]->poly_modulus_degree(), L = cts[0]->coeff_modulus_size();
+    bool device      = cts[0]->on_device();
+    constexpr size_t chunk = 256; // ciphertexts per batch of zero encryptions
+    std::vector<troy::Ciphertext> zeros;
+    troy::utils::Array<uint64_t> noise(n * chunk, device);
+    for (size_t i0 = 0; i0 < cts.size(); i0 += chunk) {
+        size_t m = std::min(chunk, cts.size() - i0);
+        zeros.assign(m, troy::Ciphertext());
+        std::vector<troy::Ciphertext*> zp;
+        std::vector<const troy::Ciphertext*> zc;
+        for (auto& z : zeros) zp.push_back(&z), zc.push_back(&z);
+        st.rerandomizer->encrypt_zero_asymmetric_batched(zp, cts[0]->parms_id(), st.prng.get());
+        std::vector<troy::Ciphertext*> dst(cts.begin() + i0, cts.begin() + i0 + m);
+        st.evaluator->add_inplace_batched(dst, zc);
+        st.prng->fill_uint64s(noise.reference());
+        for (size_t i = 0; i < m; i++) {
+            uint64_t* c0          = dst[i]->poly(0).raw_pointer();
+            const uint64_t* e     = noise.raw_pointer() + i * n;
+            if (device) {
+                size_t threads = n * L, block = troy::utils::KERNEL_THREAD_COUNT;
+                flood_kernel<<<(threads + block - 1) / block, block>>>(c0, e, moduli.raw_pointer(), n, L);
+            } else
+                for (size_t j = 0; j < n * L; j++) {
+                    const troy::Modulus& q = moduli[j / n];
+                    uint64_t v             = c0[j] + q.reduce(e[j % n]);
+                    c0[j]                  = v >= q.value() ? v - q.value() : v;
+                }
+        }
+    }
+    if (device)
+        troy::utils::stream_sync_concrete();
 }
 
 // A layer has ceil(ic/ci) * ceil(oc/co) weight plaintexts of a full polynomial each. The
@@ -109,6 +200,7 @@ void conv2d(IO::NetIO** ios, int party, const INT_TYPE* a, const INT_TYPE* b, IN
             size_t bs, size_t ic, size_t ih, size_t iw, size_t kh, size_t kw, size_t oc,
             size_t stride, size_t padding, bool mod_switch, int factor, bool is_ab) {
     auto start = measure::now();
+    exchange_public_keys(ios, party);
 
     // The HE routines below compute stride-1 convolutions; ConvLayout pads and splits strided ones.
     ConvLayout::strided_conv(a, b, c, bs, ic, ih, iw, kh, kw, oc, stride, padding, factor,
@@ -203,6 +295,7 @@ void conv2d_ab2(IO::NetIO** ios, int party, const INT_TYPE* x, const INT_TYPE* w
             linear::Cipher2d y_encrypted
                 = conv_by_output_chunks(helper, evaluator, encoder, x_encrypted, w, ic, oc, kh, kw);
             y_encrypted.sub_plain_inplace(evaluator, R_encoded);
+            rerandomize(y_encrypted);
             if (mod_switch)
                 y_encrypted.mod_switch_to_next_inplace(evaluator);
 
@@ -303,6 +396,7 @@ void conv2d_ab(IO::NetIO** ios, int party, const INT_TYPE* x, const INT_TYPE* w,
         linear::Cipher2d y_encrypted
             = conv_by_output_chunks(helper, evaluator, encoder, other_x_encrypted, w, ic, oc, kh, kw);
         y_encrypted.sub_plain_inplace(evaluator, R_encoded);
+        rerandomize(y_encrypted);
         if (mod_switch)
             y_encrypted.mod_switch_to_next_inplace(evaluator);
 
@@ -487,6 +581,7 @@ void conv2d_ab2_reverse(IO::NetIO** ios, int party, const INT_TYPE* x, const INT
 
             linear::Cipher2d y_encrypted = helper.conv2d_reverse(evaluator, x_encoded, w_encrypted);
             y_encrypted.sub_plain_inplace(evaluator, R_encoded);
+            rerandomize(y_encrypted);
             if (mod_switch)
                 y_encrypted.mod_switch_to_next_inplace(evaluator);
 
@@ -579,6 +674,7 @@ void conv2d_ab_reverse(IO::NetIO** ios, int party, const INT_TYPE* x, const INT_
 
             linear::Cipher2d y_encrypted = helper.conv2d_reverse(evaluator, x_encoded, w_encrypted);
             y_encrypted.sub_plain_inplace(evaluator, R_encoded);
+            rerandomize(y_encrypted);
             if (mod_switch)
                 y_encrypted.mod_switch_to_next_inplace(evaluator);
 
@@ -607,6 +703,7 @@ void conv2d_ab_reverse(IO::NetIO** ios, int party, const INT_TYPE* x, const INT_
 
             linear::Cipher2d y_encrypted = helper.conv2d_reverse(evaluator, x_encoded, w_encrypted);
             y_encrypted.sub_plain_inplace(evaluator, R_encoded);
+            rerandomize(y_encrypted);
             if (mod_switch)
                 y_encrypted.mod_switch_to_next_inplace(evaluator);
 
