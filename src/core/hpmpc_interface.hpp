@@ -105,6 +105,11 @@ void generateCOT(int party, const UINT_TYPE* a, const uint8_t* b, UINT_TYPE* c,
                  const unsigned& num_triples, const std::string& ip, int port, int threads,
                  int io_offset);
 
+// Conv triples on the CPU with the GPU path's packing (several images and output channels per ciphertext):
+// same interface and roles as generateConvTriplesCheetahWrapper (AB2: party 1 holds b = w, party 2 a = x).
+void generateConvTriplesPacked(Keys<IO::NetIO>& keys, const UINT_TYPE* a, const UINT_TYPE* b, UINT_TYPE* c,
+                               Utils::ConvParm parm, int party, int threads, Utils::PROTO proto, int factor = 1);
+
 void printTripleStats(int party, unsigned io_offset);
 void resetTripleStats();
 // Aggregated traffic (MiB) and time of one triple type ("CONV", "FC", ...) since the last reset

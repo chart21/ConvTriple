@@ -2,12 +2,13 @@
 // built with TRIPLE_GPU, GPU/troy): c1 + c2 must equal conv(x1 + x2, w1 + w2) exactly, and the traffic per
 // layer is reported from the weight holder's view.
 //
-// Usage: cheetah_conv_triple_test <party 1|2> <port> <ab 0|1> [suite] [rounds]
+// Usage: cheetah_conv_triple_test <party 1|2> <port> <ab 0|1> [suite] [rounds] [--packed]
 //   ab 0: AB2 (A_KNOWN=1): party 1 holds w, party 2 holds x;  ab 1: AB, both hold shares of x and w
 //   suite: small    - strided/padded shapes, weight chunks, batches beyond one GPU batch (default)
 //          cifar    - every conv of the CIFAR-10 ResNet50, batch 10
 //          stress   - the cifar shapes, `rounds` times in a shuffled order
 //          imagenet - the 53 convs of ResNet50-Cheetah on 224x224 inputs, batch 1
+//   --packed: generateConvTriplesPacked (the GPU path's packing on the CPU) instead of the wrapper
 #include "core/hpmpc_interface.hpp"
 
 #include <algorithm>
@@ -72,13 +73,15 @@ const std::vector<std::pair<Shape, int>> kImagenet = {
 } // namespace
 
 int main(int argc, char** argv) {
-    if (argc < 4) {
-        fprintf(stderr, "usage: %s <party 1|2> <port> <ab 0|1> [small|cifar|stress|imagenet] [rounds]\n", argv[0]);
+    std::vector<std::string> args(argv + 1, argv + argc);
+    bool packed = std::erase(args, "--packed") > 0;
+    if (args.size() < 3) {
+        fprintf(stderr, "usage: %s <party 1|2> <port> <ab 0|1> [small|cifar|stress|imagenet] [rounds] [--packed]\n", argv[0]);
         return 2;
     }
-    int party = atoi(argv[1]), port = atoi(argv[2]);
-    bool ab           = atoi(argv[3]);
-    std::string suite = argc > 4 ? argv[4] : "small";
+    int party = std::stoi(args[0]), port = std::stoi(args[1]);
+    bool ab           = std::stoi(args[2]);
+    std::string suite = args.size() > 3 ? args[3] : "small";
 
     std::vector<Shape> shapes;
     if (suite == "small") // strided/padded; 2 and 3 weight chunks; batches of 3, 20 and 17 images
@@ -90,7 +93,7 @@ int main(int argc, char** argv) {
     else if (suite == "stress") {
         std::vector<Shape> order = kCifar;
         std::mt19937 shared(99); // the same order in both processes
-        for (int r = 0, rounds = argc > 5 ? atoi(argv[5]) : 20; r < rounds; r++) {
+        for (int r = 0, rounds = args.size() > 4 ? std::stoi(args[4]) : 20; r < rounds; r++) {
             std::shuffle(order.begin(), order.end(), shared);
             shapes.insert(shapes.end(), order.begin(), order.end());
         }
@@ -102,8 +105,10 @@ int main(int argc, char** argv) {
         return 2;
     }
 
-    auto& keys = Iface::Keys<IO::NetIO>::instance(party, "127.0.0.1", port, 1, 1);
-    auto* io   = keys.get_ios(1)[0];
+    // threads for the HE work (both backends); the communication runs over one channel either way
+    const int threads = getenv("CONV_TEST_THREADS") ? atoi(getenv("CONV_TEST_THREADS")) : 1;
+    auto& keys = Iface::Keys<IO::NetIO>::instance(party, "127.0.0.1", port, threads, 1);
+    auto* io   = keys.get_ios(threads)[0];
     std::mt19937 rng(1234 + party);
     int failed = 0;
     double total_time = 0, total_sent = 0, total_recv = 0;
@@ -121,8 +126,13 @@ int main(int argc, char** argv) {
         double sent0, recv0, t0, sent1, recv1, t1;
         Iface::getTripleStat("CONV", sent0, recv0, t0);
         auto start = std::chrono::steady_clock::now();
-        Iface::generateConvTriplesCheetahWrapper(keys, hold_x ? x.data() : nullptr, hold_w ? w.data() : nullptr, c.data(),
-                                                 parm, party, 1, ab ? Utils::PROTO::AB : Utils::PROTO::AB2, 1, ab);
+        auto proto = ab ? Utils::PROTO::AB : Utils::PROTO::AB2;
+        if (packed)
+            Iface::generateConvTriplesPacked(keys, hold_x ? x.data() : nullptr, hold_w ? w.data() : nullptr, c.data(),
+                                             parm, party, threads, proto);
+        else
+            Iface::generateConvTriplesCheetahWrapper(keys, hold_x ? x.data() : nullptr, hold_w ? w.data() : nullptr,
+                                                     c.data(), parm, party, threads, proto, 1, ab);
         double t = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
         Iface::getTripleStat("CONV", sent1, recv1, t1);
         double sent = sent1 - sent0, recv = recv1 - recv0;

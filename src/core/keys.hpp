@@ -2,6 +2,7 @@
 #ifndef KEYS_HPP_
 #define KEYS_HPP_
 
+#include "core/conv_packed.hpp"
 #include "core/utils.hpp"
 #include "io/send.hpp"
 #include "ot/cheetah-ot_pack.h"
@@ -26,6 +27,7 @@ class Keys {
     const gemini::HomFCSS& get_fc() const { return _fc; }
     const gemini::HomBNSS& get_bn() const { return _bn; }
     const gemini::HomConv2DSS& get_conv() const { return _hom_conv; }
+    const PackedConv2D& get_packed_conv() const { return _packed_conv; }
     Channel** get_ios(unsigned threads) {
         connect(_party, _ip, _port, threads, _io_offset);
         return _ios;
@@ -42,6 +44,7 @@ class Keys {
     unsigned _io_offset = 0;
     gemini::HomFCSS _fc;
     gemini::HomConv2DSS _hom_conv;
+    PackedConv2D _packed_conv;
     gemini::HomBNSS _bn;
     Channel** _ios;
     unsigned _threads;
@@ -67,6 +70,7 @@ class Keys {
 
         _fc.setUp(ctx, skey, o_pkey);
         _hom_conv.setUp(ctx, skey, o_pkey);
+        _packed_conv.setUp(ctx, skey, o_pkey);
         _bn.setUp(PLAIN_MOD, ctx, skey, o_pkey);
         setupBn(_ios, ctx, party);
 

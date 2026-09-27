@@ -1,4 +1,5 @@
 #include "hpmpc_interface.hpp"
+#include "core/conv_layout.hpp"
 
 #include <algorithm>
 #include <seal/ciphertext.h>
@@ -1566,6 +1567,30 @@ void generateConvTriplesCheetah2(Keys<IO::NetIO>& keys, size_t total_batches,
     }
     Utils::log(Utils::Level::INFO, "P", party - 1, ", PID", keys.get_io_offset(), ": CONV triple   MB SENT PRE: ", data_sent, "   MB RECEIVED PRE: ", data_recv);
     accumulateTripleStat("CONV", data_sent, data_recv, time - time_ntt);
+}
+
+void generateConvTriplesPacked(Keys<IO::NetIO>& keys, const UINT_TYPE* a, const UINT_TYPE* b, UINT_TYPE* c,
+                               Utils::ConvParm parm, int party, int threads, Utils::PROTO proto, int factor) {
+    auto start = measure::now();
+    auto** ios = keys.get_ios(threads);
+    ConvLayout::strided_conv(a, b, c, parm.batchsize, parm.ic, parm.ih, parm.iw, parm.fh, parm.fw,
+                             parm.n_filters, parm.stride, parm.padding, factor,
+                             [&](const UINT_TYPE* x, const UINT_TYPE* w, UINT_TYPE* out, size_t bs,
+                                 size_t ic, size_t ih, size_t iw, size_t kh, size_t kw) {
+        keys.get_packed_conv().conv(ios, party, x, w, out, bs, ic, ih, iw, kh, kw, parm.n_filters,
+                                    proto == Utils::PROTO::AB, threads);
+    });
+    std::string unit;
+    double data_sent = 0, data_recv = 0;
+    for (int i = 0; i < threads; ++i) {
+        data_sent += Utils::to_MB(ios[i]->counter, unit);
+        data_recv += Utils::to_MB(ios[i]->recv_counter, unit);
+        ios[i]->counter      = 0;
+        ios[i]->recv_counter = 0;
+    }
+    Utils::log(Utils::Level::INFO, "P", party - 1, ", PID", keys.get_io_offset(),
+               ": CONV triple (packed)   MB SENT PRE: ", data_sent, "   MB RECEIVED PRE: ", data_recv);
+    accumulateTripleStat("CONV", data_sent, data_recv, Utils::to_sec(Utils::time_diff(start)));
 }
 
 void printTripleStats(int party, unsigned io_offset) {

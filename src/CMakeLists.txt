@@ -36,6 +36,7 @@ target_include_directories(gemini PUBLIC
 set(HE_LIB HE)
 if(TRIPLE_GPU)
     add_library(${HE_LIB} STATIC
+        core/conv_packed.cpp
         core/hpmpc_interface.cpp
         core/utils.cpp
         io/send.cpp
@@ -52,6 +53,7 @@ if(TRIPLE_GPU)
     endif()
 else()
     add_library(${HE_LIB} STATIC
+        core/conv_packed.cpp
         core/hpmpc_interface.cpp
         core/utils.cpp
         io/send.cpp
