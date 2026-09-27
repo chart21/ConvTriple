@@ -53,8 +53,8 @@ void conv2d(IO::NetIO** ios, int party, const INT_TYPE* a, const INT_TYPE* b, IN
 
     size_t ac_batch = bs / factor;
 
-    auto oh = dim(ih, kh, stride, padding);
-    auto ow = dim(iw, kw, stride, padding);
+    auto oh = dim(ih, kh, stride, 0); // ih, iw include the padding now
+    auto ow = dim(iw, kw, stride, 0);
 
     size_t i_size = ac_batch * ih * iw * ic;
     size_t w_size = ic * kh * kw * oc;
@@ -285,6 +285,9 @@ void conv2d_ab(IO::NetIO** ios, int party, const INT_TYPE* x, const INT_TYPE* w,
         }
 
         auto other_x_encrypted = linear::Cipher2d::load_new(received_x_serialized, he);
+        // conv(x_other + x_own, w_own): the own-share term x_own * w_own belongs to the triple too
+        other_x_encrypted.add_plain_inplace(
+            evaluator, helper.encode_inputs_ring2k(encoder, x + x_offset, std::nullopt, true));
 
         linear::Cipher2d y_encrypted = helper.conv2d(evaluator, other_x_encrypted, w_encoded, true);
         y_encrypted.sub_plain_inplace(evaluator, R_encoded);
@@ -307,7 +310,7 @@ void conv2d_ab(IO::NetIO** ios, int party, const INT_TYPE* x, const INT_TYPE* w,
         vector<INT_TYPE> y_decrypted
             = helper.decrypt_outputs_ring2k(encoder, decryptor, other_y_encrypted);
 
-        add_inplace(y_decrypted, R, PLAIN_MOD);
+        add_inplace(y_decrypted, R.data(), PLAIN_MOD);
 
         size = bs * apply_stride(c, y_decrypted.data(), stride, batch_size, ic, ih, iw, kh, kw, oc, cur);
         cur += batch_size;
@@ -349,11 +352,13 @@ void conv2d_ab(IO::NetIO** ios, int party, const INT_TYPE* x, const INT_TYPE* w,
 #endif
 }
 
+// The output masks R must be uniform over the ring and unpredictable: rand() was never seeded and never
+// exceeds 2^31, so every run used the same masks, with their top bit always 0.
 std::vector<INT_TYPE> random_polynomial(size_t size, uint64_t max_value) {
     std::vector<INT_TYPE> result(size);
-    for (size_t i = 0; i < size; i++) {
-        result[i] = rand() % max_value;
-    }
+    random_ring(result.data(), size);
+    if (max_value < (uint64_t(1) << (8 * sizeof(INT_TYPE))))
+        for (auto& v : result) v %= max_value;
     return result;
 }
 
@@ -412,8 +417,6 @@ size_t apply_stride(INT_TYPE* dest, const INT_TYPE* x, const size_t& stride, con
 }
 
 void add_inplace(std::vector<INT_TYPE>& a, const INT_TYPE* b, size_t t) {
-    assert(a.size() == b.size());
-
     for (size_t i = 0; i < a.size(); ++i) add_mod_inplace(a[i], b[i], t);
 }
 
@@ -591,7 +594,7 @@ void conv2d_ab_reverse(IO::NetIO** ios, int party, const INT_TYPE* x, const INT_
             vector<INT_TYPE> y_decrypted
                 = helper.decrypt_outputs_ring2k(encoder, decryptor, y_encrypted);
 
-            add_inplace(y_decrypted, R, PLAIN_MOD);
+            add_inplace(y_decrypted, R.data(), PLAIN_MOD);
 
             size = bs
                    * apply_stride(c, y_decrypted.data(), stride, batch_size, ic, ih, iw, kh, kw, oc,
@@ -618,7 +621,7 @@ void conv2d_ab_reverse(IO::NetIO** ios, int party, const INT_TYPE* x, const INT_
             vector<INT_TYPE> y_decrypted
                 = helper.decrypt_outputs_ring2k(encoder, decryptor, y_encrypted);
 
-            add_inplace(R, y_decrypted, PLAIN_MOD);
+            add_inplace(R, y_decrypted.data(), PLAIN_MOD);
 
             size = bs * apply_stride(c, R.data(), stride, batch_size, ic, ih, iw, kh, kw, oc, cur);
         }
@@ -646,7 +649,7 @@ void conv2d_ab_reverse(IO::NetIO** ios, int party, const INT_TYPE* x, const INT_
         add_inplace(w2, w, PLAIN_MOD); // Bß + B1
 
         vector<INT_TYPE> ideal
-            = ideal_conv(x2.data(), w2, PLAIN_MOD, bs, ic, ih, iw, kh, kw, oc, stride);
+            = ideal_conv(x2.data(), w2.data(), PLAIN_MOD, bs, ic, ih, iw, kh, kw, oc, stride);
         if (vector_equal(c2, ideal)) {
             std::cout << GREEN << "GPU-CONV: PASSED" << NC << "\n";
         } else {

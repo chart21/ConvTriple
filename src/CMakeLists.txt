@@ -40,6 +40,7 @@ if(TRIPLE_GPU)
         core/utils.cpp
         io/send.cpp
         troy/conv2d_gpu.cu
+        troy/random.cpp
     )
 
     target_link_libraries(${HE_LIB} PUBLIC Troy::troy CUDA::cudart CUDA::cufft)
