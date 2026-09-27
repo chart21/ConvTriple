@@ -73,6 +73,39 @@ HeState& he_state() {
     return *state;
 }
 
+// Polyphase split of a stride-s convolution into a stride-1 one over R*T phase channels
+// (R = min(s, kh), T = min(s, kw)): phase (r, t) of the input, x[c][s*u + r][s*v + t], becomes channel
+// (c*R + r)*T + t, and the taps w[o][c][s*a + r][s*b + t] form a ceil(k/s) kernel (zero past k). The
+// stride-1 convolution then yields exactly the strided outputs, instead of computing every output
+// position and discarding all but 1/s^2 of them. A 1x1 kernel keeps only phase (0, 0): plain subsampling.
+void polyphase_input(const INT_TYPE* x, INT_TYPE* dst, size_t bs, size_t ic, size_t ih, size_t iw,
+                     size_t s, size_t R, size_t T) {
+    size_t H = (ih + s - 1) / s, W = (iw + s - 1) / s;
+    std::fill(dst, dst + bs * ic * R * T * H * W, 0);
+    for (size_t b = 0; b < bs; b++)
+        for (size_t c = 0; c < ic; c++)
+            for (size_t r = 0; r < R; r++)
+                for (size_t t = 0; t < T; t++)
+                    for (size_t u = 0; u < H && s * u + r < ih; u++)
+                        for (size_t v = 0; v < W && s * v + t < iw; v++)
+                            dst[(((b * ic + c) * R + r) * T + t) * H * W + u * W + v]
+                                = x[((b * ic + c) * ih + s * u + r) * iw + s * v + t];
+}
+
+void polyphase_weights(const INT_TYPE* w, INT_TYPE* dst, size_t oc, size_t ic, size_t kh, size_t kw,
+                       size_t s, size_t R, size_t T) {
+    size_t KH = (kh + s - 1) / s, KW = (kw + s - 1) / s;
+    std::fill(dst, dst + oc * ic * R * T * KH * KW, 0);
+    for (size_t o = 0; o < oc; o++)
+        for (size_t c = 0; c < ic; c++)
+            for (size_t r = 0; r < R; r++)
+                for (size_t t = 0; t < T; t++)
+                    for (size_t a = 0; a < KH && s * a + r < kh; a++)
+                        for (size_t b = 0; b < KW && s * b + t < kw; b++)
+                            dst[(((o * ic + c) * R + r) * T + t) * KH * KW + a * KW + b]
+                                = w[((o * ic + c) * kh + s * a + r) * kw + s * b + t];
+}
+
 // A layer has ceil(ic/ci) * ceil(oc/co) weight plaintexts of a full polynomial each. The
 // communication-optimal tiling uses whole-image tiles, where ci = co = 1 on large images: ic * oc
 // plaintexts, more than a GPU holds for the wide ResNet layers. Encode and multiply them one
@@ -123,31 +156,62 @@ void conv2d(IO::NetIO** ios, int party, const INT_TYPE* a, const INT_TYPE* b, IN
 
     size_t ac_batch = bs / factor;
 
-    auto oh = dim(ih, kh, stride, 0); // ih, iw include the padding now
-    auto ow = dim(iw, kw, stride, 0);
+    // ih, iw include the padding now
+    size_t nh = (ih - kh) / stride + 1;
+    size_t nw = (iw - kw) / stride + 1;
 
     size_t i_size = ac_batch * ih * iw * ic;
     size_t w_size = ic * kh * kw * oc;
-    size_t c_size = ac_batch * oc * oh * ow;
+    size_t c_size = ac_batch * oc * nh * nw;
+
+    // The HE routines below compute stride-1 convolutions; a strided one is split into phases first.
+    size_t R = std::min(stride, kh), T = std::min(stride, kw);
+    size_t ic1 = stride > 1 ? ic * R * T : ic;
+    size_t ih1 = (ih + stride - 1) / stride, iw1 = (iw + stride - 1) / stride;
+    size_t kh1 = (kh + stride - 1) / stride, kw1 = (kw + stride - 1) / stride;
+    size_t oh1 = ih1 - kh1 + 1, ow1 = iw1 - kw1 + 1;
+    vector<INT_TYPE> x1, w1, c1;
 
     for (int i = 0; i < factor; ++i) {
+        const INT_TYPE* xi = ai ? ai + i_size * i : nullptr;
+        const INT_TYPE* wi = b ? b + w_size * i : nullptr;
+        INT_TYPE* ci       = c + c_size * i;
+        size_t cic = ic, cih = ih, ciw = iw, ckh = kh, ckw = kw;
+        INT_TYPE* cout = ci;
+        if (stride > 1) {
+            if (xi) {
+                x1.resize(ac_batch * ic1 * ih1 * iw1);
+                polyphase_input(xi, x1.data(), ac_batch, ic, ih, iw, stride, R, T);
+                xi = x1.data();
+            }
+            if (wi) {
+                w1.resize(oc * ic1 * kh1 * kw1);
+                polyphase_weights(wi, w1.data(), oc, ic, kh, kw, stride, R, T);
+                wi = w1.data();
+            }
+            c1.resize(ac_batch * oc * oh1 * ow1);
+            cic = ic1, cih = ih1, ciw = iw1, ckh = kh1, ckw = kw1;
+            cout = c1.data();
+        }
 #if REVERSE_GPU == 0
         if (is_ab) {
-            conv2d_ab(ios, party, ai + i_size * i, b + w_size * i, c + c_size * i, ac_batch, ic, ih,
-                      iw, kh, kw, oc, stride, mod_switch);
+            conv2d_ab(ios, party, xi, wi, cout, ac_batch, cic, cih, ciw, ckh, ckw, oc, 1, mod_switch);
         } else {
-            conv2d_ab2(ios, party, ai + i_size * i, b + w_size * i, c + c_size * i, ac_batch, ic, ih,
-                       iw, kh, kw, oc, stride, mod_switch);
+            conv2d_ab2(ios, party, xi, wi, cout, ac_batch, cic, cih, ciw, ckh, ckw, oc, 1, mod_switch);
         }
 #else
         if (is_ab) {
-            conv2d_ab_reverse(ios, party, ai + i_size * i, b + w_size * i, c + c_size * i, ac_batch,
-                              ic, ih, iw, kh, kw, oc, stride, mod_switch);
+            conv2d_ab_reverse(ios, party, xi, wi, cout, ac_batch, cic, cih, ciw, ckh, ckw, oc, 1,
+                              mod_switch);
         } else {
-            conv2d_ab2_reverse(ios, party, ai + i_size * i, b + w_size * i, c + c_size * i, ac_batch,
-                               ic, ih, iw, kh, kw, oc, stride, mod_switch);
+            conv2d_ab2_reverse(ios, party, xi, wi, cout, ac_batch, cic, cih, ciw, ckh, ckw, oc, 1,
+                               mod_switch);
         }
 #endif
+        if (stride > 1) // the phase split can leave one extra output row/column: crop to nh x nw
+            for (size_t n = 0; n < ac_batch * oc; n++)
+                for (size_t h = 0; h < nh; h++)
+                    std::copy_n(c1.data() + (n * oh1 + h) * ow1, nw, ci + (n * nh + h) * nw);
     }
 
     double time = std::chrono::duration<double, std::milli>(measure::now() - start).count();
