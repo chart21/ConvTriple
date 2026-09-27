@@ -1594,4 +1594,10 @@ void resetTripleStats() {
     g_triple_stats.clear();
 }
 
+void getTripleStat(const std::string& type, double& mb_sent, double& mb_recv, double& time_s) {
+    auto it = g_triple_stats.find(type);
+    TripleStatEntry e = it == g_triple_stats.end() ? TripleStatEntry{} : it->second;
+    mb_sent = e.mb_sent, mb_recv = e.mb_recv, time_s = e.time_s;
+}
+
 } // namespace Iface

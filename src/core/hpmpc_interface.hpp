@@ -107,6 +107,8 @@ void generateCOT(int party, const UINT_TYPE* a, const uint8_t* b, UINT_TYPE* c,
 
 void printTripleStats(int party, unsigned io_offset);
 void resetTripleStats();
+// Aggregated traffic (MiB) and time of one triple type ("CONV", "FC", ...) since the last reset
+void getTripleStat(const std::string& type, double& mb_sent, double& mb_recv, double& time_s);
 
 void tmp(int party, int threads);
 

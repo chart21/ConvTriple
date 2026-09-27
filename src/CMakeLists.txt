@@ -170,6 +170,17 @@ target_compile_options(
     "-march=native;-Wno-ignored-attributes;-Wno-ignored-qualifiers;-Wno-unused-parameter"
 )
 
+set(conv_triple_test cheetah_conv_triple_test)
+add_executable(${conv_triple_test} conv_triple_test.cpp)
+target_link_libraries(${conv_triple_test} PRIVATE ${HE_LIB})
+target_compile_definitions(${conv_triple_test} PUBLIC USE_CHEETAH=1)
+target_compile_options(
+    ${conv_triple_test} PRIVATE
+    "$<$<CONFIG:Debug>:-g3;-ggdb;-Og;-Wall;-Wextra>"
+    "$<$<CONFIG:Release>:-Wall;-Wextra>"
+    "-march=native;-Wno-ignored-attributes;-Wno-ignored-qualifiers;-Wno-unused-parameter"
+)
+
 file(GLOB_RECURSE SRC_FILES
     "${CMAKE_CURRENT_SOURCE_DIR}/*.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/*.hpp"
