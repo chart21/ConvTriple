@@ -687,7 +687,7 @@ class SilentOT : public sci::OT<SilentOT<IO>> {
   private:
     int64_t extensions_ = 0, rcot_ns_ = 0;
     void timed_rcot(block* data, int64_t n) {
-        const int64_t left = ferret->silent_ot_left();
+        const int64_t left = ferret->ot_limit - ferret->ot_used;  // silent_ot_left() is private
         if (n > left)
             extensions_ += 1 + (n - left) / std::max<int64_t>(1, ferret->ot_limit);
         const auto t0 = std::chrono::steady_clock::now();
