@@ -2,6 +2,7 @@
 #include <chrono>
 #include <memory>
 #include <sstream>
+#include <unordered_map>
 
 #include "constants.hpp"
 #include "core/conv_layout.hpp"
@@ -56,7 +57,61 @@ struct HeState {
     // generator is seeded with PRG_SEED, so both parties would draw the same re-randomization.
     std::unique_ptr<troy::Encryptor> rerandomizer;
     std::unique_ptr<troy::utils::RandomGenerator> prng;
+    // For NTTs of 1x1 weight polynomials through smaller NTTs (encode_weights_1x1): per prime, the
+    // exponent of the evaluation point psi^e of each NTT slot, and for each a = 1 .. log N - 1 the
+    // size-(N >> a) NTT tables (on the device) and the slot of each of their evaluation points
+    size_t n = 0;
+    std::vector<troy::Modulus> moduli;
+    std::vector<std::vector<uint64_t>> power;    // [prime][m] = psi^m, m < 2N
+    std::vector<std::vector<uint32_t>> exponent; // [prime][slot]
+    std::vector<troy::utils::Array<troy::utils::NTTTables>> small_tables;             // [a]
+    std::vector<std::vector<std::unordered_map<uint64_t, uint32_t>>> small_slot_of; // [a][prime]
 };
+
+// evaluation points of the NTT of X, reduced: slot j of an NTT evaluates at probe[j]
+std::vector<uint64_t> ntt_of_x(const std::vector<troy::Modulus>& moduli, size_t n,
+                               troy::utils::ConstSlice<troy::utils::NTTTables> tables) {
+    std::vector<uint64_t> probe(moduli.size() * n, 0);
+    for (size_t l = 0; l < moduli.size(); l++) probe[l * n + 1] = 1;
+    troy::utils::ntt_inplace_p(troy::utils::Slice<uint64_t>(probe.data(), probe.size(), false, nullptr), n, tables);
+    for (size_t l = 0; l < moduli.size(); l++)
+        for (size_t j = 0; j < n; j++) probe[l * n + j] %= moduli[l].value();
+    return probe;
+}
+
+void setup_small_ntts(HeState& st) {
+    auto cm = st.he->first_context_data().value()->parms().coeff_modulus();
+    size_t L = cm.size(), n = st.he->first_context_data().value()->parms().poly_modulus_degree();
+    int logn = __builtin_ctzll(n);
+    st.n     = n;
+    st.moduli.assign(cm.raw_pointer(), cm.raw_pointer() + L);
+    troy::utils::ConstSlice<troy::Modulus> moduli(st.moduli.data(), L, false, nullptr);
+    auto full  = troy::utils::NTTTables::create_ntt_tables(logn, moduli);
+    auto probe = ntt_of_x(st.moduli, n, full.const_reference());
+    st.power.assign(L, std::vector<uint64_t>(2 * n));
+    st.exponent.assign(L, std::vector<uint32_t>(n));
+    for (size_t l = 0; l < L; l++) {
+        uint64_t q = st.moduli[l].value(), psi = full[l].root();
+        std::unordered_map<uint64_t, uint32_t> exponent_of;
+        st.power[l][0] = 1;
+        for (size_t m = 1; m < 2 * n; m++) st.power[l][m] = uint64_t((unsigned __int128)st.power[l][m - 1] * psi % q);
+        for (size_t m = 0; m < 2 * n; m++) exponent_of[st.power[l][m]] = m;
+        for (size_t j = 0; j < n; j++) st.exponent[l][j] = exponent_of.at(probe[l * n + j]);
+    }
+    st.small_tables.resize(logn);
+    st.small_slot_of.assign(logn, std::vector<std::unordered_map<uint64_t, uint32_t>>(L));
+    for (int a = 1; a < logn; a++) {
+        auto tables = troy::utils::NTTTables::create_ntt_tables(logn - a, moduli);
+        auto points = ntt_of_x(st.moduli, n >> a, tables.const_reference());
+        for (size_t l = 0; l < L; l++)
+            for (size_t j = 0; j < (n >> a); j++) st.small_slot_of[a][l][points[l * (n >> a) + j]] = j;
+        if (troy::utils::device_count() > 0) {
+            for (size_t l = 0; l < L; l++) tables[l].to_device_inplace();
+            tables.to_device_inplace();
+        }
+        st.small_tables[a] = std::move(tables);
+    }
+}
 
 HeState& he_state() {
     // Never destroyed: device memory must not be released after the CUDA runtime has shut down.
@@ -65,6 +120,7 @@ HeState& he_state() {
         st->he      = setup();
         st->encoder = std::make_unique<troy::linear::PolynomialEncoderRing2k<INT_TYPE>>(st->he, BIT_LEN);
         st->first_parms_id = st->encoder->context()->first_context_data_pointer()->parms_id();
+        setup_small_ntts(*st);
         if (troy::utils::device_count() > 0) {
             st->he->to_device_inplace();
             st->encoder->to_device_inplace();
@@ -165,6 +221,140 @@ void rerandomize(troy::linear::Cipher2d& y) {
         troy::utils::stream_sync_concrete();
 }
 
+// spread[p][i] of weight plaintext p = (output group, input group) of a chunk that starts at output
+// channel o0, in the layout of Conv2dHelper::encode_weights: coefficient i lies in slot i / (hb*wb) of
+// ci*co slots (output channel slot / ci, reversed input channel slot % ci) and holds the flipped kernel
+// tap at position i % (hb*wb), or 0
+__global__ void spread_weights_kernel(INT_TYPE* spread, const INT_TYPE* w, size_t o0, size_t oc, size_t ic,
+                                      size_t kh, size_t kw, size_t hb, size_t wb, size_t ci, size_t co,
+                                      size_t in_groups, size_t count, size_t n) {
+    size_t idx = blockIdx.x * (size_t)blockDim.x + threadIdx.x;
+    if (idx >= count * n)
+        return;
+    size_t p = idx / n, i = idx % n, block = hb * wb;
+    size_t slot = i / block, pos = i % block, a = pos / wb, d = pos % wb;
+    INT_TYPE v = 0;
+    if (slot < ci * co && a < kh && d < kw) {
+        size_t o = o0 + p / in_groups * co + slot / ci, c = p % in_groups * ci + ci - 1 - slot % ci;
+        if (o < oc && c < ic)
+            v = w[((o * ic + c) * kh + kh - 1 - a) * kw + kw - 1 - d];
+    }
+    spread[idx] = v;
+}
+
+// small[p][l][s] = weight of slot s of 1x1 weight plaintext p, lifted to prime l (centered)
+__global__ void scatter_slots_kernel(uint64_t* small, const INT_TYPE* w, const troy::Modulus* moduli, size_t L,
+                                     size_t n_small, size_t o0, size_t oc, size_t ic, size_t ci, size_t co,
+                                     size_t in_groups, size_t count) {
+    size_t idx = blockIdx.x * (size_t)blockDim.x + threadIdx.x;
+    if (idx >= count * L * n_small)
+        return;
+    size_t p = idx / (L * n_small), l = idx / n_small % L, slot = idx % n_small;
+    uint64_t v = 0;
+    if (slot < ci * co) {
+        size_t o = o0 + p / in_groups * co + slot / ci, c = p % in_groups * ci + ci - 1 - slot % ci;
+        if (o < oc && c < ic) {
+            INT_TYPE u = w[o * ic + c];
+            v          = u >> (sizeof(INT_TYPE) * 8 - 1) ? moduli[l].value() - uint64_t(INT_TYPE(-u)) : u;
+        }
+    }
+    small[idx] = v;
+}
+
+// dst[p][l][j] = small[p][l][gather[l][j]], reduced
+__global__ void gather_slots_kernel(uint64_t* const* dst, const uint64_t* small, const uint32_t* gather,
+                                    const troy::Modulus* moduli, size_t L, size_t n, size_t n_small, size_t count) {
+    size_t idx = blockIdx.x * (size_t)blockDim.x + threadIdx.x;
+    if (idx >= count * L * n)
+        return;
+    size_t p = idx / (L * n), l = idx / n % L, j = idx % n;
+    dst[p][l * n + j] = moduli[l].reduce(small[(p * L + l) * n_small + gather[l * n + j]]);
+}
+
+// A 1x1 weight polynomial is V(X^B), one weight per slot of B = hb*wb coefficients. For B = 2^a m, m odd,
+// X^B maps the N evaluation points of the NTT onto the N >> a points of a size-(N >> a) negacyclic NTT:
+// NTT(W)[j] = NTT_small(V)[gather[j]], an NTT of size 64 (56x56 layers), 256 (28x28) or 1024 (14x14)
+// instead of 4096 per weight plaintext. Empty when that does not apply.
+std::optional<troy::linear::Plain2d> encode_weights_1x1(const troy::linear::Conv2dHelper& h, const INT_TYPE* w_dev,
+                                                        size_t o0, size_t oc_total) {
+    HeState& st = he_state();
+    size_t B = h.image_height_block * h.image_width_block, n = st.n, L = st.moduli.size();
+    int a = B ? __builtin_ctzll(B) : 0;
+    if (h.kernel_height != 1 || h.kernel_width != 1 || a == 0 || (n >> a) < 2 || a >= int(st.small_tables.size()))
+        return std::nullopt;
+    size_t n_small = n >> a, ci = h.input_channel_block, co = h.output_channel_block;
+    size_t in_groups = (h.input_channels + ci - 1) / ci, out_groups = (h.output_channels + co - 1) / co;
+    size_t count = in_groups * out_groups;
+    std::vector<uint32_t> gather(L * n);
+    for (size_t l = 0; l < L; l++)
+        for (size_t j = 0; j < n; j++)
+            gather[l * n + j] = st.small_slot_of[a][l].at(st.power[l][(st.exponent[l][j] * B) & (2 * n - 1)]);
+    auto gather_dev = troy::utils::Array<uint32_t>::create_uninitialized(gather.size(), true);
+    gather_dev.copy_from_slice(troy::utils::ConstSlice<uint32_t>(gather.data(), gather.size(), false, nullptr));
+    auto moduli = st.he->first_context_data().value()->parms().coeff_modulus();
+
+    auto small = troy::utils::Array<uint64_t>::create_uninitialized(count * L * n_small, true);
+    size_t block = troy::utils::KERNEL_THREAD_COUNT, threads = count * L * n_small;
+    scatter_slots_kernel<<<(threads + block - 1) / block, block>>>(
+        small.raw_pointer(), w_dev, moduli.raw_pointer(), L, n_small, o0, std::min(oc_total, o0 + h.output_channels),
+        h.input_channels, ci, co, in_groups, count);
+    troy::utils::ntt_inplace_ps(small.reference(), count, n_small, st.small_tables[a].const_reference());
+
+    std::vector<troy::Plaintext> plain(count);
+    std::vector<uint64_t*> dst(count);
+    for (size_t p = 0; p < count; p++) {
+        plain[p].to_device_inplace();
+        plain[p].resize_rns(*st.he, st.first_parms_id, false);
+        plain[p].is_ntt_form() = true;
+        dst[p]                 = plain[p].data().raw_pointer();
+    }
+    auto dst_dev = troy::utils::Array<uint64_t*>::create_uninitialized(count, true);
+    dst_dev.copy_from_slice(troy::utils::ConstSlice<uint64_t*>(dst.data(), count, false, nullptr));
+    threads = count * L * n;
+    gather_slots_kernel<<<(threads + block - 1) / block, block>>>(dst_dev.raw_pointer(), small.raw_pointer(),
+                                                                   gather_dev.raw_pointer(), moduli.raw_pointer(), L, n,
+                                                                   n_small, count);
+    troy::linear::Plain2d out;
+    for (size_t og = 0; og < out_groups; og++) {
+        out.data().emplace_back();
+        for (size_t g = 0; g < in_groups; g++) out.data().back().push_back(std::move(plain[og * in_groups + g]));
+    }
+    return out;
+}
+
+// The weight plaintexts of output channels [o0, o0 + h.output_channels), built on the device from the
+// layer's weights (w_dev): the host-side spreads were N words per plaintext, mostly zeros, all uploaded
+troy::linear::Plain2d encode_weights_on_device(const troy::linear::Conv2dHelper& h,
+                                                const troy::linear::PolynomialEncoderRing2k<INT_TYPE>& encoder,
+                                                const troy::Evaluator& evaluator, const INT_TYPE* w_dev,
+                                                size_t o0, size_t oc_total) {
+    if (auto small = encode_weights_1x1(h, w_dev, o0, oc_total))
+        return std::move(*small);
+    size_t n = h.slot_count, ci = h.input_channel_block, co = h.output_channel_block;
+    size_t in_groups = (h.input_channels + ci - 1) / ci, out_groups = (h.output_channels + co - 1) / co;
+    size_t count = in_groups * out_groups;
+    auto spread  = troy::utils::Array<INT_TYPE>::create_uninitialized(count * n, true);
+    size_t threads = count * n, block = troy::utils::KERNEL_THREAD_COUNT;
+    spread_weights_kernel<<<(threads + block - 1) / block, block>>>(
+        spread.raw_pointer(), w_dev, o0, std::min(oc_total, o0 + h.output_channels), h.input_channels,
+        h.kernel_height, h.kernel_width, h.image_height_block, h.image_width_block, ci, co, in_groups, count, n);
+    std::vector<troy::Plaintext> plain(count);
+    std::vector<troy::Plaintext*> ptrs;
+    troy::utils::ConstSliceVec<INT_TYPE> source;
+    for (size_t p = 0; p < count; p++) {
+        ptrs.push_back(&plain[p]);
+        source.push_back(spread.const_slice(p * n, (p + 1) * n));
+    }
+    encoder.centralize_slice_batched(source, std::nullopt, ptrs);
+    evaluator.transform_plain_to_ntt_inplace_batched(ptrs, ptrs[0]->parms_id());
+    troy::linear::Plain2d out;
+    for (size_t og = 0; og < out_groups; og++) {
+        out.data().emplace_back();
+        for (size_t g = 0; g < in_groups; g++) out.data().back().push_back(std::move(plain[og * in_groups + g]));
+    }
+    return out;
+}
+
 // A layer has ceil(ic/ci) * ceil(oc/co) weight plaintexts of a full polynomial each. The
 // communication-optimal tiling uses whole-image tiles, where ci = co = 1 on large images: ic * oc
 // plaintexts, more than a GPU holds for the wide ResNet layers. Encode and multiply them one
@@ -180,10 +370,18 @@ troy::linear::Cipher2d conv_by_output_chunks(const troy::linear::Conv2dHelper& h
     size_t in_groups = (ic + helper.input_channel_block - 1) / helper.input_channel_block;
     size_t chunk_oc  = std::max<size_t>(1, max_plaintexts / in_groups) * co;
     troy::linear::Cipher2d y;
+    bool device = encoder.on_device();
+    troy::utils::Array<INT_TYPE> w_dev;
+    if (device) {
+        w_dev = troy::utils::Array<INT_TYPE>::create_uninitialized(oc * ic * kh * kw, true);
+        w_dev.copy_from_slice(troy::utils::ConstSlice<INT_TYPE>(w, oc * ic * kh * kw, false, nullptr));
+    }
     for (size_t o0 = 0; o0 < oc; o0 += chunk_oc) {
         troy::linear::Conv2dHelper h = helper; // same blocks
         h.output_channels = std::min(oc - o0, chunk_oc);
-        auto yc = h.conv2d(evaluator, x, h.encode_weights_ring2k(encoder, w + o0 * ic * kh * kw, std::nullopt));
+        auto yc = h.conv2d(evaluator, x,
+                           device ? encode_weights_on_device(h, encoder, evaluator, w_dev.raw_pointer(), o0, oc)
+                                  : h.encode_weights_ring2k(encoder, w + o0 * ic * kh * kw, std::nullopt));
         if (o0 == 0) {
             y = std::move(yc);
             for (auto& row : y.data()) row.reserve((oc + co - 1) / co);
