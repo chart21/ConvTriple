@@ -1005,6 +1005,26 @@ void generateBNTriplesCheetah(Keys<IO::NetIO>& keys, const UINT_TYPE* a, const U
     auto** ios           = keys.get_ios(threads);
 
     size_t ac_batch_size = batch / factor;
+    // Slot-encoded BN (the layers where HomBNSS chooses it over one ciphertext per channel): all images at
+    // once, in full ciphertexts; the scales are the same for every image of a lane
+    const size_t hw = h * w, per_image = num_ele * hw;
+    if (((hw + POLY_MOD - 1) / POLY_MOD) * num_ele >= ((per_image + POLY_MOD - 1) / POLY_MOD) * 3) {
+        const size_t len = per_image * batch;
+        Tensor<uint64_t> X({static_cast<long>(len)}), S({static_cast<long>(len)}), C;
+        for (size_t bb = 0; bb < size_t(batch); ++bb)
+            for (size_t ch = 0; ch < num_ele; ++ch)
+                for (size_t p = 0; p < hw; ++p) {
+                    const size_t i = bb * per_image + ch * hw + p;
+                    X(i) = a != nullptr ? a[i] : 0;
+                    S(i) = b != nullptr ? b[ch + num_ele * (bb / ac_batch_size)] : 0;
+                }
+        auto code = BN::vector_product(ios, bn, party == emp::ALICE, X, S, C, meta.is_shared_input,
+                                       meta.target_base_mod, threads, proto);
+        if (code != Code::OK)
+            Utils::log(Utils::Level::ERROR, "BN triples failed: ", CodeMessage(code));
+        for (size_t i = 0; i < len; ++i) c[i] = C(i);
+        batch = 0; // done
+    }
     for (int cur_batch = 0; cur_batch < batch; ++cur_batch) {
         Tensor<uint64_t> A(meta.ishape);
         for (long i = 0; i < A.channels(); i++)

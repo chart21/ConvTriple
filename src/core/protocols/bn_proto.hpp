@@ -328,6 +328,44 @@ Result Server::Protocol1_alt(const gemini::HomBNSS::Meta& meta, Channel** server
     return measures;
 }
 
+namespace BN {
+
+// Elementwise products c = x * scale of flattened vectors (the slot-encoded "alt" BN), split among the
+// workers in whole ciphertexts of poly_degree() slots: splitting the elements themselves among the threads
+// had every thread encrypt its slice into ciphertexts of its own, a few percent full (a 64 x 8 x 8 image
+// took 32 x nCRT ciphertexts instead of nCRT). Worker w talks on ios[w].
+template <class Channel>
+Code vector_product(Channel** ios, const gemini::HomBNSS& bn, bool is_client, const Tensor<uint64_t>& x,
+                    const Tensor<uint64_t>& scales, Tensor<uint64_t>& c, bool is_shared_input, uint64_t base_mod,
+                    size_t threads, Utils::PROTO proto) {
+    const size_t len = x.NumElements(), slots = bn.poly_degree();
+    c.Reshape({static_cast<long>(len)});
+    auto func = [&](long wid, size_t start, size_t end) -> Code {
+        if (start >= end)
+            return Code::OK;
+        const size_t lo = start * slots, hi = std::min(end * slots, len);
+        gemini::HomBNSS::Meta tmp;
+        tmp.is_shared_input = is_shared_input;
+        tmp.target_base_mod = base_mod;
+        tmp.vec_shape       = {static_cast<long>(hi - lo)};
+        Tensor<uint64_t> tmp_x = Tensor<uint64_t>::Wrap(const_cast<uint64_t*>(x.data()) + lo, tmp.vec_shape);
+        Tensor<uint64_t> tmp_s = Tensor<uint64_t>::Wrap(const_cast<uint64_t*>(scales.data()) + lo, tmp.vec_shape);
+        Tensor<uint64_t> tmp_c = Tensor<uint64_t>::Wrap(c.data() + lo, tmp.vec_shape);
+        Result res;
+        if (is_client)
+            res = proto == Utils::PROTO::AB ? Client::Protocol1_alt(ios + wid, bn, tmp, tmp_x, tmp_s, tmp_c, 1)
+                                            : Client::Protocol2_alt(ios + wid, bn, tmp, tmp_x, tmp_s, tmp_c, 1);
+        else
+            res = proto == Utils::PROTO::AB ? Server::Protocol1_alt(tmp, ios + wid, bn, tmp_x, tmp_s, tmp_c, 1)
+                                            : Server::Protocol2_alt(tmp, ios + wid, bn, tmp_x, tmp_c, 1);
+        return res.ret;
+    };
+    gemini::ThreadPool tpool(threads);
+    return gemini::LaunchWorks(tpool, (len + slots - 1) / slots, func);
+}
+
+} // namespace BN
+
 namespace {
 
 void pack(const Tensor<uint64_t>& mat, const Tensor<uint64_t>& scales,
