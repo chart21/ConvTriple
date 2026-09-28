@@ -9,6 +9,7 @@
 //          stress   - the cifar shapes, `rounds` times in a shuffled order
 //          imagenet - the 53 convs of ResNet50-Cheetah on 224x224 inputs, batch 1
 //   --packed: generateConvTriplesPacked (the GPU path's packing on the CPU) instead of the wrapper
+//   env: CONV_TEST_THREADS (default 1), CONV_TEST_IP (party 1's address, default 127.0.0.1)
 #include "core/hpmpc_interface.hpp"
 
 #include <algorithm>
@@ -105,9 +106,11 @@ int main(int argc, char** argv) {
         return 2;
     }
 
-    // threads for the HE work (both backends); the communication runs over one channel either way
-    const int threads = getenv("CONV_TEST_THREADS") ? atoi(getenv("CONV_TEST_THREADS")) : 1;
-    auto& keys = Iface::Keys<IO::NetIO>::instance(party, "127.0.0.1", port, threads, 1);
+    // threads for the HE work (both backends); the communication runs over one channel either way.
+    // Party 2 connects to CONV_TEST_IP (party 1 listens), for runs on two hosts.
+    const int threads   = getenv("CONV_TEST_THREADS") ? atoi(getenv("CONV_TEST_THREADS")) : 1;
+    const char* peer_ip = getenv("CONV_TEST_IP") ? getenv("CONV_TEST_IP") : "127.0.0.1";
+    auto& keys = Iface::Keys<IO::NetIO>::instance(party, peer_ip, port, threads, 1);
     auto* io   = keys.get_ios(threads)[0];
     std::mt19937 rng(1234 + party);
     int failed = 0;
