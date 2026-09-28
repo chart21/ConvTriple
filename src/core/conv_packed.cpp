@@ -1,7 +1,11 @@
 #include "core/conv_packed.hpp"
 
 #include <algorithm>
+#include <chrono>
+#include <atomic>
 #include <climits>
+#include <map>
+#include <mutex>
 #include <cstring>
 #include <sstream>
 #include <string>
@@ -47,10 +51,28 @@ std::string recv(IO::NetIO** ios) {
     return s;
 }
 
+// f(0), ..., f(n - 1) on up to `threads` workers of a pool kept across calls (a layer makes several
+// calls, and a new pool per call started all its threads each time), handing out indices one at a time
+// (the work per index varies)
 void parallel(size_t threads, size_t n, const std::function<void(size_t)>& f) {
-    gemini::ThreadPool pool(std::max<size_t>(1, std::min(threads, n)));
-    gemini::LaunchWorks(pool, n, [&](long, size_t start, size_t end) {
-        for (size_t i = start; i < end; i++) f(i);
+    size_t k = std::min(threads, n);
+    if (k <= 1) {
+        for (size_t i = 0; i < n; i++) f(i);
+        return;
+    }
+    static std::mutex mutex;
+    static std::map<size_t, std::unique_ptr<gemini::ThreadPool>> pools;
+    gemini::ThreadPool* pool;
+    {
+        std::lock_guard<std::mutex> lock(mutex);
+        auto& p = pools[k];
+        if (!p)
+            p = std::make_unique<gemini::ThreadPool>(k);
+        pool = p.get();
+    }
+    std::atomic<size_t> next{0};
+    gemini::LaunchWorks(*pool, k, [&](long, size_t, size_t) {
+        for (size_t i; (i = next++) < n;) f(i);
         return Code::OK;
     });
 }
@@ -219,14 +241,13 @@ struct PackedConv2D::Ntt {
 
     uint64_t lift(uint64_t v, const Prime& p) const { return v >= threshold ? v + p.increment : v; }
 
-    // NTT of a weight polynomial into out (one N-block per prime). 1x1 weights go through the small NTT
+    // NTT of a weight polynomial modulo prime l into o. 1x1 weights go through the small NTT
     // (see one_by_one); a polynomial with few terms is evaluated from the power table, sum_k v_k psi^(e_j k)
     // accumulated in 128 bits; the rest through SEAL's NTT.
     void weight(const std::vector<std::pair<uint32_t, uint64_t>>& terms, size_t B, int a,
-                const std::vector<uint32_t>& gather, uint64_t* out) const {
-        for (size_t l = 0; l < primes.size(); l++) {
+                const std::vector<uint32_t>& gather, size_t l, uint64_t* o) const {
+        {
             const Prime& p = primes[l];
-            uint64_t* o    = out + l * N;
             if (a > 0) {
                 thread_local std::vector<uint64_t> v;
                 v.assign(N >> a, 0);
@@ -329,45 +350,78 @@ void PackedConv2D::evaluate(const Tiling& t, const std::string& in, const Word* 
     // products are summed in 128 bits, reduced once at the end instead of after every product.
     std::vector<seal::Ciphertext> y(t.tiles * t.out_groups);
     const Ntt& ntt = *ntt_;
-    const size_t L = ntt.primes.size(), stride = L * t.N, B = t.h * t.w;
+    const size_t L = ntt.primes.size(), B = t.h * t.w;
     std::vector<uint32_t> gather;
     const int a = t.kh == 1 && t.kw == 1 ? ntt.one_by_one(B, gather) : 0;
-    parallel(threads, t.out_groups, [&](size_t o) {
+    // Tasks of kBlock output groups and one prime: each input slice is read once for kBlock output
+    // groups (the inputs of a layer did not stay in cache, and every output group read all of them), and
+    // the accumulators of the block (kBlock * tiles * 2 * N * 16 bytes), its weights and the slice being
+    // read fit in a core's L2. The inverse NTT follows with the masking below.
+    constexpr size_t kBlock = 2;
+    const size_t blocks = (t.out_groups + kBlock - 1) / kBlock;
+    parallel(threads, y.size(), [&](size_t k) {
+        y[k].resize(*context_, context_->first_parms_id(), 2);
+        y[k].is_ntt_form() = true;
+    });
+    parallel(threads, blocks * L, [&](size_t task) {
         using u128 = unsigned __int128;
-        std::vector<u128> acc(t.tiles * 2 * stride, 0);
-        std::vector<uint64_t> wn(stride);
-        std::vector<std::pair<uint32_t, uint64_t>> terms;
-        auto reduce = [&](size_t i, size_t l) {
-            return seal::util::barrett_reduce_128(reinterpret_cast<const uint64_t*>(&acc[i]), ntt.primes[l].q);
-        };
+        const size_t N = t.N, l = task % L, o0 = task / L * kBlock, nb = std::min(kBlock, t.out_groups - o0);
+        const seal::Modulus& q = ntt.primes[l].q;
+        thread_local std::vector<u128> acc;
+        thread_local std::vector<uint64_t> wn;
+        thread_local std::vector<std::pair<uint32_t, uint64_t>> terms;
+        acc.assign(nb * t.tiles * 2 * N, 0);
+        wn.resize(nb * N);
+        auto reduce = [&](size_t i) { return seal::util::barrett_reduce_128(reinterpret_cast<const uint64_t*>(&acc[i]), q); };
         for (size_t g = 0, pending = 0; g < t.in_groups; g++) {
-            t.weight_terms(w, o, g, terms);
-            if (terms.empty())
+            size_t used = 0; // bit ob: output group o0 + ob has weights in input group g
+            for (size_t ob = 0; ob < nb; ob++) {
+                t.weight_terms(w, o0 + ob, g, terms);
+                if (terms.empty())
+                    continue;
+                ntt.weight(terms, B, a, gather, l, wn.data() + ob * N);
+                used |= size_t(1) << ob;
+            }
+            if (!used)
                 continue;
-            ntt.weight(terms, B, a, gather, wn.data());
             for (size_t tile = 0; tile < t.tiles; tile++) {
                 const seal::Ciphertext& ct = x[tile * t.in_groups + g];
-                const uint64_t *a0 = ct.data(0), *a1 = ct.data(1);
-                u128 *s0 = acc.data() + tile * 2 * stride, *s1 = s0 + stride;
-                for (size_t i = 0; i < stride; i++) {
-                    u128 v = wn[i];
-                    s0[i] += a0[i] * v;
-                    s1[i] += a1[i] * v;
-                }
+                const uint64_t *a0 = ct.data(0) + l * N, *a1 = ct.data(1) + l * N;
+                if (nb == 2 && used == 3) {
+                    u128 *s0 = acc.data() + tile * 2 * N, *s1 = s0 + N;
+                    u128 *r0 = acc.data() + (t.tiles + tile) * 2 * N, *r1 = r0 + N;
+                    const uint64_t *w0 = wn.data(), *w1 = wn.data() + N;
+                    for (size_t i = 0; i < N; i++) {
+                        u128 x0 = a0[i], x1 = a1[i];
+                        s0[i] += x0 * w0[i];
+                        s1[i] += x1 * w0[i];
+                        r0[i] += x0 * w1[i];
+                        r1[i] += x1 * w1[i];
+                    }
+                } else
+                    for (size_t ob = 0; ob < nb; ob++) {
+                        if (!(used >> ob & 1))
+                            continue;
+                        u128 *s0 = acc.data() + (ob * t.tiles + tile) * 2 * N, *s1 = s0 + N;
+                        const uint64_t* wv = wn.data() + ob * N;
+                        for (size_t i = 0; i < N; i++) {
+                            u128 v = wv[i];
+                            s0[i] += a0[i] * v;
+                            s1[i] += a1[i] * v;
+                        }
+                    }
             }
             if (++pending == ntt.fold) {
-                for (size_t i = 0; i < acc.size(); i++) acc[i] = reduce(i, i % stride / t.N);
+                for (size_t i = 0; i < acc.size(); i++) acc[i] = reduce(i);
                 pending = 0;
             }
         }
-        for (size_t tile = 0; tile < t.tiles; tile++) {
-            seal::Ciphertext& ct = y[tile * t.out_groups + o];
-            ct.resize(*context_, context_->first_parms_id(), 2);
-            ct.is_ntt_form() = true;
-            for (size_t p = 0; p < 2; p++)
-                for (size_t i = 0; i < stride; i++) ct.data(p)[i] = reduce((tile * 2 + p) * stride + i, i / t.N);
-            evaluator_->transform_from_ntt_inplace(ct);
-        }
+        for (size_t ob = 0; ob < nb; ob++)
+            for (size_t tile = 0; tile < t.tiles; tile++) {
+                seal::Ciphertext& ct = y[tile * t.out_groups + o0 + ob];
+                for (size_t p = 0; p < 2; p++)
+                    for (size_t i = 0; i < N; i++) ct.data(p)[l * N + i] = reduce(((ob * t.tiles + tile) * 2 + p) * N + i);
+            }
     });
 
     // Mask with a random polynomial (its output coefficients are this party's share), flood, truncate
@@ -375,6 +429,7 @@ void PackedConv2D::evaluate(const Tiling& t, const std::string& in, const Word* 
     std::vector<std::string> parts(y.size());
     const uint64_t t_mask = context_->first_context_data()->parms().plain_modulus().value() - 1;
     parallel(threads, y.size(), [&](size_t k) {
+        evaluator_->transform_from_ntt_inplace(y[k]);
         auto prng = std::make_shared<AesPrng>();
         gemini::flood_ciphertext(y[k], prng, *context_, *other_pk_, *evaluator_);
         seal::Plaintext mask(t.N);
