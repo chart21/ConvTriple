@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <climits>
+#include <cstring>
 #include <sstream>
 #include <string>
 #include <unordered_map>
@@ -9,6 +10,7 @@
 
 #include "gemini/cheetah/hom_conv2d_ss.h"
 #include "gemini/core/util/ThreadPool.h"
+#include "emp-tool/utils/prg.h"
 
 namespace gemini { // output post-processing of HomConv2DSS (hom_conv2d_ss.cc)
 void flood_ciphertext(seal::Ciphertext& ct, std::shared_ptr<seal::UniformRandomGenerator> prng,
@@ -50,6 +52,36 @@ void parallel(size_t threads, size_t n, const std::function<void(size_t)>& f) {
     gemini::LaunchWorks(pool, n, [&](long, size_t start, size_t end) {
         for (size_t i = start; i < end; i++) f(i);
         return Code::OK;
+    });
+}
+
+// SEAL generator on AES-128 in counter mode (emp's PRG, AES-NI, seeded from the OS): the flooding
+// noise, the output masks and the zero encryptions draw several words per output coefficient, which
+// made SEAL's Blake2 generator a visible cost. Output only, never stored in a seeded ciphertext.
+class AesPrng final : public seal::UniformRandomGenerator {
+  public:
+    AesPrng() : seal::UniformRandomGenerator(seal::prng_seed_type{}) {}
+
+  protected:
+    seal::prng_type type() const noexcept override { return seal::prng_type::unknown; }
+    void refill_buffer() override { prg_.random_data(buffer_begin_, int(buffer_size_)); }
+
+  private:
+    emp::PRG prg_;
+};
+
+// Serialized SEAL objects back to back: each starts with a header that holds its size, so they can be
+// located first and then loaded in parallel
+template <class T>
+void load_all(const seal::SEALContext& context, const std::string& in, std::vector<T>& out, size_t threads) {
+    std::vector<size_t> offset(out.size() + 1, 0);
+    for (size_t i = 0; i < out.size(); i++) {
+        seal::Serialization::SEALHeader header;
+        std::memcpy(&header, in.data() + offset[i], sizeof(header));
+        offset[i + 1] = offset[i] + header.size;
+    }
+    parallel(threads, out.size(), [&](size_t i) {
+        out[i].load(context, reinterpret_cast<const seal::seal_byte*>(in.data()) + offset[i], offset[i + 1] - offset[i]);
     });
 }
 
@@ -282,8 +314,7 @@ void PackedConv2D::encrypt(const Tiling& t, const Word* x, std::string& out, siz
 void PackedConv2D::evaluate(const Tiling& t, const std::string& in, const Word* x_own, const Word* w,
                             Word* r, std::string& out, size_t threads) const {
     std::vector<seal::Ciphertext> x(t.tiles * t.in_groups);
-    std::stringstream ss(in);
-    for (auto& ct : x) ct.load(*context_, ss);
+    load_all(*context_, in, x, threads);
     parallel(threads, x.size(), [&](size_t k) {
         if (x_own) { // conv(x_other + x_own, w): the own-share term belongs to the triple too
             seal::Plaintext pt;
@@ -344,7 +375,7 @@ void PackedConv2D::evaluate(const Tiling& t, const std::string& in, const Word* 
     std::vector<std::string> parts(y.size());
     const uint64_t t_mask = context_->first_context_data()->parms().plain_modulus().value() - 1;
     parallel(threads, y.size(), [&](size_t k) {
-        auto prng = seal::UniformRandomGeneratorFactory::DefaultFactory()->create();
+        auto prng = std::make_shared<AesPrng>();
         gemini::flood_ciphertext(y[k], prng, *context_, *other_pk_, *evaluator_);
         seal::Plaintext mask(t.N);
         prng->generate(t.N * sizeof(uint64_t), reinterpret_cast<seal::seal_byte*>(mask.data()));
@@ -363,8 +394,7 @@ void PackedConv2D::evaluate(const Tiling& t, const std::string& in, const Word* 
 void PackedConv2D::decrypt(const Tiling& t, const std::string& in, Word* c, bool accumulate,
                            size_t threads) const {
     std::vector<seal::Ciphertext> y(t.tiles * t.out_groups);
-    std::stringstream ss(in);
-    for (auto& ct : y) ct.load(*context_, ss);
+    load_all(*context_, in, y, threads);
     parallel(threads, y.size(), [&](size_t k) {
         seal::Plaintext pt;
         decryptor_->decrypt(y[k], pt);
