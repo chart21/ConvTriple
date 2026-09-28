@@ -4,6 +4,10 @@
 
 #include "gemini/core/prg_party.h"
 #include "core/conv_packed.hpp"
+
+#ifndef TRIPLE_OT_GROUP
+#define TRIPLE_OT_GROUP 0 // channels (and ferret threads) per OT pack, 0: from the first demand
+#endif
 #include "core/utils.hpp"
 #include "io/send.hpp"
 #include "ot/cheetah-ot_pack.h"
@@ -34,6 +38,39 @@ class Keys {
         return _ios;
     }
     const sci::OTPack<Channel>* get_otpack(int idx) const { return _ot_packs[idx]; }
+    // The OT packs: one per TRIPLE_OT_GROUP channels, whose ferret instances extend on that many
+    // threads and channels. An OT consumer runs one worker per pack, on the pack's first channel.
+    int ot_workers() const { return int(_ot_packs.size()); }
+
+    // The OT packs, made at the first request. Every ferret instance extends ~10^7 COTs at once
+    // (the first time in its setup), so one pack per channel made 2 * threads extensions, several
+    // times what a small network consumes: take as many packs as `cots` (per direction, spread
+    // evenly) need for one extension each, and give each pack's ferret the other threads.
+    void ensure_ot(uint64_t cots) {
+        if (!_ot_packs.empty())
+            return;
+        auto start = measure::now();
+        unsigned group = TRIPLE_OT_GROUP;
+        if (group == 0) {
+            const double per_ext = 0.8 * double(cheetah::ferret_param().n); // headroom for COT / MUX
+            group = _threads;
+            while (group > 1 && double(cots) > per_ext * double(_threads / group)) group /= 2;
+        }
+        _ot_group = std::max(1u, std::min(group, _threads));
+        _ot_packs.resize(_threads / _ot_group);
+        auto init_ot = [&](int, size_t start, size_t end) -> Code {
+            for (size_t i = start; i < end; ++i) {
+                int cur_party = i & 1 ? (3 - _party) : _party;
+                _ot_packs[i]  = new sci::OTPack<Channel>(_ios + i * _ot_group, int(_ot_group), cur_party, true, false);
+            }
+            return Code::OK;
+        };
+        gemini::ThreadPool tpool(_ot_packs.size());
+        gemini::LaunchWorks(tpool, _ot_packs.size(), init_ot);
+        Utils::log(Utils::Level::INFO, "P", _party - 1, ", PID", _io_offset, ": OT packs   s PRE: ",
+                   Utils::to_sec(Utils::time_diff(start)), " (packs: ", _ot_packs.size(), ", ferret threads: ", _ot_group, ")");
+    }
+    Channel* ot_io(int idx) const { return _ios[size_t(idx) * _ot_group]; }
     unsigned get_io_offset() const { return _io_offset; }
 
     void disconnect();
@@ -49,6 +86,7 @@ class Keys {
     gemini::HomBNSS _bn;
     Channel** _ios;
     unsigned _threads;
+    unsigned _ot_group = 1;
     std::vector<sci::OTPack<Channel>*> _ot_packs;
     bool _connected = false;
 
@@ -76,17 +114,6 @@ class Keys {
         _bn.setUp(PLAIN_MOD, ctx, skey, o_pkey);
         setupBn(_ios, ctx, party);
 
-        _ot_packs.resize(threads);
-        auto init_ot = [&](int wid, size_t start, size_t end) -> Code {
-            for (size_t i = start; i < end; ++i) {
-                int cur_party = wid & 1 ? (3 - party) : party;
-                _ot_packs[i]  = new sci::OTPack<Channel>(_ios + wid, 1, cur_party, true, false);
-            }
-            return Code::OK;
-        };
-
-        gemini::ThreadPool tpool(threads);
-        gemini::LaunchWorks(tpool, threads, init_ot);
         _connected = true;
 
         auto time = Utils::to_sec(Utils::time_diff(start));
@@ -103,10 +130,8 @@ class Keys {
     }
 
     ~Keys() noexcept {
-        for (unsigned i = 0; i < _threads; ++i) {
-            delete _ot_packs[i];
-            delete _ios[i];
-        }
+        for (auto* pack : _ot_packs) delete pack;
+        for (unsigned i = 0; i < _threads; ++i) delete _ios[i];
         delete[] _ios;
     }
 

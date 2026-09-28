@@ -39,13 +39,13 @@ class OTPack {
 
         auto post_fix = std::to_string(ios[0]->port);
 
-        silent_ot = new cheetah::SilentOT<T>(party, 1, ios, false, true,
+        silent_ot = new cheetah::SilentOT<T>(party, threads, ios, false, true,
                                              party == emp::ALICE
                                                  ? PRE_OT_DATA_REG_SEND_FILE_ALICE + post_fix
                                                  : PRE_OT_DATA_REG_RECV_FILE_BOB + post_fix);
 
         silent_ot_reversed = new cheetah::SilentOT<T>(
-            3 - party, 1, ios, false, true,
+            3 - party, threads, ios, false, true,
             party == emp::ALICE ? PRE_OT_DATA_REG_RECV_FILE_ALICE + post_fix
                                 : PRE_OT_DATA_REG_SEND_FILE_BOB + post_fix);
 

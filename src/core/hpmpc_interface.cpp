@@ -93,6 +93,8 @@ void generateBoolCOTMultTriplesCheetah(uint8_t a[], uint8_t b[], uint8_t c[],
     auto start = measure::now();
 
     auto** ios = keys.get_ios(threads);
+    keys.ensure_ot(num_triples);
+    const int ot_threads = keys.ot_workers(); // one worker per OT pack
 
     auto func = [&](int wid, int start, int end) -> Code {
         if (start >= end)
@@ -102,12 +104,12 @@ void generateBoolCOTMultTriplesCheetah(uint8_t a[], uint8_t b[], uint8_t c[],
         // auto start_setup = measure::now();
 
         // sci::OTPack<IO::NetIO> pack(ios + wid, 1, cur_party, true, false);
-        TripleGenerator<IO::NetIO> triple_gen(cur_party, ios[wid], keys.get_otpack(wid), false);
+        TripleGenerator<IO::NetIO> triple_gen(cur_party, keys.ot_io(wid), keys.get_otpack(wid), false);
 
         // setup += Utils::time_diff(start_setup);
 
         for (int total = start; total < end;) {
-            int current = std::min(end - total, static_cast<int>(MAX_BOOL / threads / 8));
+            int current = std::min(end - total, static_cast<int>(MAX_BOOL / ot_threads / 8));
             switch (cur_party) {
             case emp::ALICE:
                 cot_multiply_shares(emp::ALICE, triple_gen.otpack, a + total, b + total, c + total, current * 8);
@@ -121,7 +123,7 @@ void generateBoolCOTMultTriplesCheetah(uint8_t a[], uint8_t b[], uint8_t c[],
         return Code::OK;
     };
 
-    gemini::ThreadPool tpool(threads);
+    gemini::ThreadPool tpool(ot_threads);
     gemini::LaunchWorks(tpool, num_bytes, func);
 
     Utils::log(Utils::Level::INFO, "P", party - 1, ", PID", io_offset,
@@ -154,6 +156,8 @@ void generateRandomMultiplicationsCheetah(uint8_t a[], uint8_t b[], uint64_t num
 
     auto start = measure::now();
     auto** ios = keys.get_ios(threads);
+    keys.ensure_ot(num_muls);
+    const int ot_threads = keys.ot_workers(); // one worker per OT pack
 
 
     auto func = [&](int wid, int start, int end) -> Code {
@@ -182,7 +186,7 @@ void generateRandomMultiplicationsCheetah(uint8_t a[], uint8_t b[], uint64_t num
         return Code::OK;
     };
 
-    gemini::ThreadPool tpool(threads);
+    gemini::ThreadPool tpool(ot_threads);
     gemini::LaunchWorks(tpool, num_bytes, func);
 
     Utils::log(Utils::Level::INFO, "P", party - 1, ", PID", io_offset,
@@ -212,6 +216,8 @@ void generateBoolTriplesCheetah(uint8_t a[], uint8_t b[], uint8_t c[],
     auto start = measure::now();
 
     auto** ios = keys.get_ios(threads);
+    keys.ensure_ot(num_triples);
+    const int ot_threads = keys.ot_workers(); // one worker per OT pack
 
     auto func = [&](int wid, int start, int end) -> Code {
         if (start >= end)
@@ -221,12 +227,12 @@ void generateBoolTriplesCheetah(uint8_t a[], uint8_t b[], uint8_t c[],
         // auto start_setup = measure::now();
 
         // sci::OTPack<IO::NetIO> pack(ios + wid, 1, cur_party, true, false);
-        TripleGenerator<IO::NetIO> triple_gen(cur_party, ios[wid], keys.get_otpack(wid), false);
+        TripleGenerator<IO::NetIO> triple_gen(cur_party, keys.ot_io(wid), keys.get_otpack(wid), false);
 
         // setup += Utils::time_diff(start_setup);
 
         for (int total = start; total < end;) {
-            int current = std::min(end - total, static_cast<int>(MAX_BOOL / threads));
+            int current = std::min(end - total, static_cast<int>(MAX_BOOL / ot_threads));
             switch (cur_party) {
             case emp::ALICE:
                 Server::triple_gen(triple_gen, a + total, b + total, c + total, current, true,
@@ -242,7 +248,7 @@ void generateBoolTriplesCheetah(uint8_t a[], uint8_t b[], uint8_t c[],
         return Code::OK;
     };
 
-    gemini::ThreadPool tpool(threads);
+    gemini::ThreadPool tpool(ot_threads);
     gemini::LaunchWorks(tpool, num_bytes, func);
 
     Utils::log(Utils::Level::INFO, "P", party - 1, ", PID", io_offset,
@@ -276,6 +282,8 @@ void generateBool3TupleCheetah(Beaver3Tuples tuples, uint64_t num_tuples, const 
     auto start = measure::now();
 
     auto** ios = keys.get_ios(threads);
+    keys.ensure_ot(2 * uint64_t(num_tuples));
+    const int ot_threads = keys.ot_workers(); // one worker per OT pack
 
     auto func = [&](int wid, int start, int end) -> Code {
         if (start >= end)
@@ -285,10 +293,10 @@ void generateBool3TupleCheetah(Beaver3Tuples tuples, uint64_t num_tuples, const 
         // is pinned to the REAL party instead (mode 1: P0 holds full b; mode 2: P1 holds full c).
         int cur_party = wid & 1 ? OTHER_PARTY(party) : party;
         const int local_mode = !party_local_bc ? 0 : (party == emp::ALICE ? 1 : 2);
-        TripleGenerator<IO::NetIO> triple_gen(cur_party, ios[wid], keys.get_otpack(wid), false);
+        TripleGenerator<IO::NetIO> triple_gen(cur_party, keys.ot_io(wid), keys.get_otpack(wid), false);
 
         for (int total = start; total < end;) {
-            int current = std::min(end - total, static_cast<int>(MAX_BOOL / threads / 8));
+            int current = std::min(end - total, static_cast<int>(MAX_BOOL / ot_threads / 8));
             Beaver3Tuples sub{
                 tuples.a + total, tuples.b + total, tuples.c + total,
                 tuples.ab + total, tuples.ac + total, tuples.bc + total,
@@ -307,7 +315,7 @@ void generateBool3TupleCheetah(Beaver3Tuples tuples, uint64_t num_tuples, const 
         return Code::OK;
     };
 
-    gemini::ThreadPool tpool(threads);
+    gemini::ThreadPool tpool(ot_threads);
     gemini::LaunchWorks(tpool, num_bytes, func);
 
     Utils::log(Utils::Level::INFO, "P", party - 1, ", PID", io_offset,
@@ -334,16 +342,18 @@ void generateBool4TupleCheetah(Beaver4Tuples tuples, uint64_t num_tuples, const 
     auto start = measure::now();
 
     auto** ios = keys.get_ios(threads);
+    keys.ensure_ot(3 * uint64_t(num_tuples));
+    const int ot_threads = keys.ot_workers(); // one worker per OT pack
 
     auto func = [&](int wid, int start, int end) -> Code {
         if (start >= end)
             return Code::OK;
 
         int cur_party = wid & 1 ? OTHER_PARTY(party) : party;
-        TripleGenerator<IO::NetIO> triple_gen(cur_party, ios[wid], keys.get_otpack(wid), false);
+        TripleGenerator<IO::NetIO> triple_gen(cur_party, keys.ot_io(wid), keys.get_otpack(wid), false);
 
         for (int total = start; total < end;) {
-            int current = std::min(end - total, static_cast<int>(MAX_BOOL / threads / 8));
+            int current = std::min(end - total, static_cast<int>(MAX_BOOL / ot_threads / 8));
             Beaver4Tuples sub{
                 tuples.a + total, tuples.b + total, tuples.c + total, tuples.d + total,
                 tuples.ab + total, tuples.ac + total, tuples.ad + total,
@@ -364,7 +374,7 @@ void generateBool4TupleCheetah(Beaver4Tuples tuples, uint64_t num_tuples, const 
         return Code::OK;
     };
 
-    gemini::ThreadPool tpool(threads);
+    gemini::ThreadPool tpool(ot_threads);
     gemini::LaunchWorks(tpool, num_bytes, func);
 
     Utils::log(Utils::Level::INFO, "P", party - 1, ", PID", io_offset,
@@ -1143,6 +1153,8 @@ void do_multiplex(int num_input, const UINT_TYPE* x32, const uint8_t* sel_packed
     auto start = measure::now();
 
     auto** ios = keys.get_ios(threads);
+    keys.ensure_ot(uint64_t(num_input));
+    const int ot_threads = keys.ot_workers(); // one worker per OT pack
 
     uint8_t* sel = new uint8_t[num_input];
     uint64_t* x  = new uint64_t[num_input];
@@ -1172,7 +1184,7 @@ void do_multiplex(int num_input, const UINT_TYPE* x32, const uint8_t* sel_packed
         return Code::OK;
     };
 
-    gemini::ThreadPool tpool(threads); // one OT pack and channel per worker, as for the bool triples
+    gemini::ThreadPool tpool(ot_threads); // one OT pack and channel per worker, as for the bool triples
     gemini::LaunchWorks(tpool, num_input, func);
 
     Utils::log(Utils::Level::INFO, "P", party - 1, ", PID", io_offset,
@@ -1245,6 +1257,8 @@ void generateOT(int party, const std::string& ip, int port, int threads, int io_
     auto start = measure::now();
 
     auto** ios = keys.get_ios(threads);
+    keys.ensure_ot(uint64_t(num_triples));
+    const int ot_threads = keys.ot_workers(); // one worker per OT pack
 
     auto func = [&](int wid, size_t start, size_t end) -> Code {
         if (start >= end)
@@ -1280,7 +1294,7 @@ void generateOT(int party, const std::string& ip, int port, int threads, int io_
         return Code::OK;
     };
 
-    gemini::ThreadPool tpool(threads);
+    gemini::ThreadPool tpool(ot_threads);
     gemini::LaunchWorks(tpool, num_triples, func);
 
     delete[] a;
@@ -1311,6 +1325,8 @@ void generateCOT(int party, const UINT_TYPE* a, const uint8_t* b, UINT_TYPE* c,
     auto start = measure::now();
 
     auto** ios = keys.get_ios(threads);
+    keys.ensure_ot(uint64_t(num_triples));
+    const int ot_threads = keys.ot_workers(); // one worker per OT pack
 
     auto func = [&](int wid, size_t start, size_t end) -> Code {
         if (start >= end)
@@ -1342,7 +1358,7 @@ void generateCOT(int party, const UINT_TYPE* a, const uint8_t* b, UINT_TYPE* c,
         return Code::OK;
     };
 
-    gemini::ThreadPool tpool(threads); // one OT pack and channel per worker
+    gemini::ThreadPool tpool(ot_threads); // one OT pack and channel per worker
     gemini::LaunchWorks(tpool, num_triples, func);
 
     Utils::log(Utils::Level::INFO, "P", party - 1, ", PID", io_offset,
