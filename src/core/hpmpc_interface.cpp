@@ -1114,7 +1114,7 @@ void do_multiplex(int num_input, const UINT_TYPE* x32, const uint8_t* sel_packed
 
     auto start = measure::now();
 
-    auto** ios = keys.get_ios(1);
+    auto** ios = keys.get_ios(threads);
 
     uint8_t* sel = new uint8_t[num_input];
     uint64_t* x  = new uint64_t[num_input];
@@ -1144,7 +1144,7 @@ void do_multiplex(int num_input, const UINT_TYPE* x32, const uint8_t* sel_packed
         return Code::OK;
     };
 
-    gemini::ThreadPool tpool(1);
+    gemini::ThreadPool tpool(threads); // one OT pack and channel per worker, as for the bool triples
     gemini::LaunchWorks(tpool, num_input, func);
 
     Utils::log(Utils::Level::INFO, "P", party - 1, ", PID", io_offset,
@@ -1282,7 +1282,7 @@ void generateCOT(int party, const UINT_TYPE* a, const uint8_t* b, UINT_TYPE* c,
 
     auto start = measure::now();
 
-    auto** ios = keys.get_ios(1);
+    auto** ios = keys.get_ios(threads);
 
     auto func = [&](int wid, size_t start, size_t end) -> Code {
         if (start >= end)
@@ -1290,10 +1290,13 @@ void generateCOT(int party, const UINT_TYPE* a, const uint8_t* b, UINT_TYPE* c,
 
         size_t n = end - start;
         auto* ot = keys.get_otpack(wid);
+        // the OT packs of odd workers are set up with the parties swapped (see Keys): there ALICE's
+        // sending instance, paired with BOB's receiving one, is silent_ot_reversed
+        auto* silent = wid & 1 ? ot->silent_ot_reversed : ot->silent_ot;
 
         switch (party) {
         case emp::ALICE: {
-            ot->silent_ot->send_cot(c + start, a + start, n, 32);
+            silent->send_cot(c + start, a + start, n, 32);
             for (size_t i = 0; i < n; ++i) {
                 c[i + start] = -c[i + start] & moduloMask;
             }
@@ -1303,7 +1306,7 @@ void generateCOT(int party, const UINT_TYPE* a, const uint8_t* b, UINT_TYPE* c,
             uint8_t* sel = new uint8_t[n];
             for (size_t i = 0; i < n; ++i) sel[i] = get_nth(b, start + i);
 
-            ot->silent_ot->recv_cot(c + start, (bool*)sel, n, 32);
+            silent->recv_cot(c + start, (bool*)sel, n, 32);
             delete[] sel;
             break;
         }
@@ -1311,7 +1314,7 @@ void generateCOT(int party, const UINT_TYPE* a, const uint8_t* b, UINT_TYPE* c,
         return Code::OK;
     };
 
-    gemini::ThreadPool tpool(1);
+    gemini::ThreadPool tpool(threads); // one OT pack and channel per worker
     gemini::LaunchWorks(tpool, num_triples, func);
 
     Utils::log(Utils::Level::INFO, "P", party - 1, ", PID", io_offset,
