@@ -179,7 +179,9 @@ struct PackedConv2D::Tiling {
                             = x[((bb * ic + c) * H + r) * W + s];
     }
 
-    // nonzero coefficients (index, value) of weight polynomial (og, g)
+    // coefficients (index, value) of weight polynomial (og, g) that hold a weight. Zero weights are kept:
+    // the work must not depend on the weights' values (with the weights known in preprocessing, skipping
+    // zeros would leak their number through the response time, and zero dummy weights would look fast).
     void weight_terms(const Word* wt, size_t og, size_t g, std::vector<std::pair<uint32_t, uint64_t>>& terms) const {
         terms.clear();
         size_t lo = og * co, uo = std::min(lo + co, oc), lc = g * ci, uc = std::min(lc + ci, ic);
@@ -187,8 +189,8 @@ struct PackedConv2D::Tiling {
             for (size_t c = lc; c < uc; c++)
                 for (size_t a = 0; a < kh; a++)
                     for (size_t d = 0; d < kw; d++)
-                        if (Word v = wt[((o * ic + c) * kh + kh - 1 - a) * kw + kw - 1 - d])
-                            terms.emplace_back(((o - lo) * ci + ci - 1 - (c - lc)) * h * w + a * w + d, v);
+                        terms.emplace_back(((o - lo) * ci + ci - 1 - (c - lc)) * h * w + a * w + d,
+                                           wt[((o * ic + c) * kh + kh - 1 - a) * kw + kw - 1 - d]);
     }
 
     // visit(output index in the NCHW result, coefficient index) for output ciphertext (t, og)
