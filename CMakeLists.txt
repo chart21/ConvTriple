@@ -7,7 +7,7 @@ set(CMAKE_CXX_STANDARD_REQUIRED 20)
 option(USE_APPROX_RESHARE "Enable APPROX RESHARE" OFF)
 option(TRIPLE_VERIFY "Enable verification" ON)
 option(TRIPLE_COLOR "Enable colored output" ON)
-option(TRIPLE_ZERO "Enable computation with ZERO" OFF)
+option(TRIPLE_ZERO "Process all-zero weight blocks like any other (OFF: skip them, reject all-zero filters)" ON)
 option(TRIPLE_GPU "Enable GPU support" OFF)
 option(TRIPLE_GPU_REVERSE "GPU uses reverse AB2" OFF)
 

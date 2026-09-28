@@ -58,7 +58,9 @@ cmake --build build -j
 CMake Options:
 - `TRIPLE_VERIFY` (BOOL): If enabled - Verify correctness of the triples. (For testing only)
 - `TRIPLE_COLOR` (BOOL): If enabled - Use ANSI color codes for colored logs.
-- `TRIPLE_ZERO` (BOOL): If enabled - Allow tensors to be zero (can be insecure).
+- `TRIPLE_ZERO` (BOOL, default ON): Cheetah's conv and FC process all-zero weight blocks like any other.
+  With OFF they skip them and reject all-zero filters: the work, and whether a layer runs at all,
+  then depend on the weights' values (e.g. zero dummy weights run faster than real ones).
 - `TRIPLE_GPU` (BOOL): If enabled - Use [Troy-Nova](https://github.com/lightbulb128/troy-nova) for Convolutions.
 - `TRIPLE_GPU_REVERSE` (BOOL): If enabled - Encrypt filters instead of images (requires `TRIPLE_GPU=ON`).
 - `TRIPLE_SEED` (NUM): Set the seed (-1: no seed).
