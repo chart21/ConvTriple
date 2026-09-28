@@ -94,13 +94,14 @@ Client:
 Conv triple test (both parties on one machine; checks c1 + c2 against a plain convolution and reports the
 traffic per layer):
 ```sh
-./build/bin/cheetah_conv_triple_test 1 <PORT> <AB> <SUITE> [ROUNDS] [--packed] &
-./build/bin/cheetah_conv_triple_test 2 <PORT> <AB> <SUITE> [ROUNDS] [--packed]
+./build/bin/cheetah_conv_triple_test 1 <PORT> <AB> <SUITE> [ROUNDS] [--packed|--pipelined] &
+./build/bin/cheetah_conv_triple_test 2 <PORT> <AB> <SUITE> [ROUNDS] [--packed|--pipelined]
 ```
 - `<AB>`: `0` for AB2 (party 1 holds the weights, party 2 the input), `1` for AB (both hold shares)
 - `<SUITE>`: `small`, `cifar` (CIFAR-10 ResNet50, batch 10), `stress` (`cifar` shapes `ROUNDS` times, shuffled)
   or `imagenet` (the 53 convolutions of ResNet50 on 224x224 inputs)
 - `--packed`: use `generateConvTriplesPacked`, see below; `CONV_TEST_THREADS` sets the threads
+- `--pipelined`: all convolutions of the suite in one `generateConvTriplesPackedBatch` call (total time only)
 
 
 # Protocols
@@ -115,6 +116,10 @@ Currently supported:
       images and output channels, where `HomConv2DSS` spends one output ciphertext per output channel, which
       cuts the traffic of layers with small feature maps (ResNet50 on ImageNet, AB2: 1002 -> 588 MiB).
       Outputs are masked, noise-flooded and truncated like `HomConv2DSS`'s.
+    - `generateConvTriplesPackedBatch`: the same for all convolutions of a network in one call, pipelined
+      across them: while one party evaluates a layer, the other encrypts the next ones and decrypts the
+      previous ones, instead of both waiting at every layer (ResNet50 on ImageNet, 32 threads, two hosts:
+      AB2 2.6 -> 2.0 s, AB 3.9 -> 2.0 s).
 - 2D-BatchNorm triples via HE
 
 ## Protocol 1

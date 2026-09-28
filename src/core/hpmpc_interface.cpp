@@ -1596,6 +1596,48 @@ void generateConvTriplesPacked(Keys<IO::NetIO>& keys, const UINT_TYPE* a, const 
     accumulateTripleStat("CONV", data_sent, data_recv, Utils::to_sec(Utils::time_diff(start)));
 }
 
+void generateConvTriplesPackedBatch(Keys<IO::NetIO>& keys, const std::vector<Utils::ConvParm>& parms,
+                                    UINT_TYPE** a, UINT_TYPE** b, UINT_TYPE* c, int party, int threads,
+                                    Utils::PROTO proto) {
+    std::vector<size_t> batch(parms.size()), offset(parms.size() + 1, 0);
+    for (size_t i = 0; i < parms.size(); i++) {
+        const auto& p = parms[i];
+        size_t nh = (p.ih + 2 * p.padding - p.fh) / p.stride + 1, nw = (p.iw + 2 * p.padding - p.fw) / p.stride + 1;
+        batch[i]      = p.batchsize;
+        offset[i + 1] = offset[i] + p.batchsize * p.n_filters * nh * nw;
+    }
+    if (threads < 4) { // the pipeline takes 4 channels
+        for (size_t i = 0; i < parms.size(); i++)
+            generateConvTriplesPacked(keys, a ? a[i] : nullptr, b ? b[i] : nullptr, c + offset[i], parms[i], party, threads,
+                                      proto);
+        return;
+    }
+    auto start = measure::now();
+    auto** ios = keys.get_ios(threads);
+    keys.get_packed_conv().conv_pipelined(
+        ios, party, batch,
+        [&](size_t i) {
+            const auto& p = parms[i];
+            auto r = std::make_shared<ConvLayout::Reduced<UINT_TYPE>>(a ? a[i] : nullptr, b ? b[i] : nullptr, c + offset[i],
+                                                                      p.batchsize, p.ic, p.ih, p.iw, p.fh, p.fw,
+                                                                      p.n_filters, p.stride, p.padding);
+            return PackedConv2D::Job{r->x, r->w, r->c, r->bs, r->ic, r->ih, r->iw, r->kh, r->kw, r->oc,
+                                     [r] { r->finish(); }};
+        },
+        proto == Utils::PROTO::AB, threads);
+    std::string unit;
+    double data_sent = 0, data_recv = 0;
+    for (int i = 0; i < threads; ++i) {
+        data_sent += Utils::to_MB(ios[i]->counter, unit);
+        data_recv += Utils::to_MB(ios[i]->recv_counter, unit);
+        ios[i]->counter      = 0;
+        ios[i]->recv_counter = 0;
+    }
+    Utils::log(Utils::Level::INFO, "P", party - 1, ", PID", keys.get_io_offset(), ": CONV triples (packed, ",
+               parms.size(), " layers pipelined)   MB SENT PRE: ", data_sent, "   MB RECEIVED PRE: ", data_recv);
+    accumulateTripleStat("CONV", data_sent, data_recv, Utils::to_sec(Utils::time_diff(start)));
+}
+
 void printTripleStats(int party, unsigned io_offset) {
     if (g_triple_stats.empty())
         return;

@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <cstddef>
+#include <tuple>
 #include <vector>
 
 #include "constants.hpp"
@@ -47,54 +48,84 @@ void polyphase_weights(const T* w, T* dst, size_t oc, size_t ic, size_t kh, size
                                 = w[((o * ic + c) * kh + s * a + r) * kw + s * b + t];
 }
 
+// A padded, strided convolution of bs images reduced to a stride-1, unpadded one: x, w and c are the
+// reduced convolution's operands (x or w null when not given; c its output buffer), finish() moves its
+// result into the caller's output c (bs x oc x nh x nw).
+template <class T>
+struct Reduced {
+    const T* x = nullptr;
+    const T* w = nullptr;
+    T* c       = nullptr;
+    size_t bs, ic, ih, iw, kh, kw, oc;
+
+    Reduced(const T* x_, const T* w_, T* out, size_t bs_, size_t ic_, size_t ih_, size_t iw_, size_t kh_,
+            size_t kw_, size_t oc_, size_t stride, size_t padding)
+        : bs(bs_), oc(oc_), out_(out) {
+        if (padding) {
+            auto dim = Utils::pad_zero(x_, padded_, ic_, ih_, iw_, padding, bs_);
+            ih_      = std::get<0>(dim);
+            iw_      = std::get<1>(dim);
+            if (x_)
+                x_ = padded_.data();
+        }
+        nh_ = (ih_ - kh_) / stride + 1, nw_ = (iw_ - kw_) / stride + 1;
+        if (stride == 1) {
+            x = x_, w = w_, c = out;
+            ic = ic_, ih = ih_, iw = iw_, kh = kh_, kw = kw_;
+            return;
+        }
+        size_t R = std::min(stride, kh_), T_ = std::min(stride, kw_);
+        ic = ic_ * R * T_, ih = (ih_ + stride - 1) / stride, iw = (iw_ + stride - 1) / stride;
+        kh = (kh_ + stride - 1) / stride, kw = (kw_ + stride - 1) / stride;
+        if (x_) {
+            x1_.resize(bs * ic * ih * iw);
+            polyphase_input(x_, x1_.data(), bs, ic_, ih_, iw_, stride, R, T_);
+            x = x1_.data();
+        }
+        if (w_) {
+            w1_.resize(oc * ic * kh * kw);
+            polyphase_weights(w_, w1_.data(), oc, ic_, kh_, kw_, stride, R, T_);
+            w = w1_.data();
+        }
+        padded_ = {};
+        c1_.resize(bs * oc * (ih - kh + 1) * (iw - kw + 1));
+        c = c1_.data();
+    }
+
+    Reduced(const Reduced&)            = delete; // x, w and c may point into the object
+    Reduced& operator=(const Reduced&) = delete;
+
+    void finish() {
+        if (c == out_)
+            return;
+        // the phase split can leave one extra output row/column: crop to nh x nw
+        size_t oh1 = ih - kh + 1, ow1 = iw - kw + 1;
+        for (size_t n = 0; n < bs * oc; n++)
+            for (size_t h = 0; h < nh_; h++)
+                std::copy_n(c1_.data() + (n * oh1 + h) * ow1, nw_, out_ + (n * nh_ + h) * nw_);
+    }
+
+  private:
+    T* out_;
+    size_t nh_, nw_;
+    std::vector<T> padded_, x1_, w1_, c1_;
+};
+
 // Shares of conv(x, w) for `factor` lanes of bs/factor images each (lane i at x + i*|x|, w + i*|w|,
 // c + i*|c|), strided and zero-padded. run(x, w, c, bs, ic, ih, iw, kh, kw) must compute the stride-1,
 // unpadded convolution of one lane into c (bs x oc x (ih-kh+1) x (iw-kw+1)); x or w may be null.
 template <class T, class Run>
 void strided_conv(const T* x, const T* w, T* c, size_t bs, size_t ic, size_t ih, size_t iw, size_t kh,
                   size_t kw, size_t oc, size_t stride, size_t padding, int factor, Run&& run) {
-    std::vector<T> padded;
-    if (padding) {
-        auto dim = Utils::pad_zero(x, padded, ic, ih, iw, padding, bs);
-        ih       = std::get<0>(dim);
-        iw       = std::get<1>(dim);
-        if (x)
-            x = padded.data();
-    }
     size_t batch = bs / factor;
-    size_t nh = (ih - kh) / stride + 1, nw = (iw - kw) / stride + 1;
-    size_t x_size = batch * ic * ih * iw, w_size = oc * ic * kh * kw, c_size = batch * oc * nh * nw;
-
-    size_t R = std::min(stride, kh), T_ = std::min(stride, kw);
-    size_t ic1 = ic * R * T_, ih1 = (ih + stride - 1) / stride, iw1 = (iw + stride - 1) / stride;
-    size_t kh1 = (kh + stride - 1) / stride, kw1 = (kw + stride - 1) / stride;
-    size_t oh1 = ih1 - kh1 + 1, ow1 = iw1 - kw1 + 1;
-    std::vector<T> x1, w1, c1;
-
+    size_t ph = ih + 2 * padding, pw = iw + 2 * padding;
+    size_t x_size = batch * ic * ih * iw, w_size = oc * ic * kh * kw;
+    size_t c_size = batch * oc * ((ph - kh) / stride + 1) * ((pw - kw) / stride + 1);
     for (int i = 0; i < factor; ++i) {
-        const T* xi = x ? x + x_size * i : nullptr;
-        const T* wi = w ? w + w_size * i : nullptr;
-        T* ci       = c + c_size * i;
-        if (stride == 1) {
-            run(xi, wi, ci, batch, ic, ih, iw, kh, kw);
-            continue;
-        }
-        if (xi) {
-            x1.resize(batch * ic1 * ih1 * iw1);
-            polyphase_input(xi, x1.data(), batch, ic, ih, iw, stride, R, T_);
-            xi = x1.data();
-        }
-        if (wi) {
-            w1.resize(oc * ic1 * kh1 * kw1);
-            polyphase_weights(wi, w1.data(), oc, ic, kh, kw, stride, R, T_);
-            wi = w1.data();
-        }
-        c1.resize(batch * oc * oh1 * ow1);
-        run(xi, wi, c1.data(), batch, ic1, ih1, iw1, kh1, kw1);
-        // the phase split can leave one extra output row/column: crop to nh x nw
-        for (size_t n = 0; n < batch * oc; n++)
-            for (size_t h = 0; h < nh; h++)
-                std::copy_n(c1.data() + (n * oh1 + h) * ow1, nw, ci + (n * nh + h) * nw);
+        Reduced<T> r(x ? x + x_size * i : nullptr, w ? w + w_size * i : nullptr, c + c_size * i, batch, ic, ih, iw,
+                     kh, kw, oc, stride, padding);
+        run(r.x, r.w, r.c, r.bs, r.ic, r.ih, r.iw, r.kh, r.kw);
+        r.finish();
     }
 }
 

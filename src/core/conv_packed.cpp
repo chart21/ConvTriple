@@ -4,11 +4,14 @@
 #include <chrono>
 #include <atomic>
 #include <climits>
+#include <condition_variable>
+#include <deque>
 #include <map>
 #include <mutex>
 #include <cstring>
 #include <sstream>
 #include <string>
+#include <thread>
 #include <unordered_map>
 #include <vector>
 
@@ -106,6 +109,31 @@ void load_all(const seal::SEALContext& context, const std::string& in, std::vect
         out[i].load(context, reinterpret_cast<const seal::seal_byte*>(in.data()) + offset[i], offset[i + 1] - offset[i]);
     });
 }
+
+// FIFO between the stages of conv_pipelined
+template <class T>
+class Pipe {
+  public:
+    void push(T v) {
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            queue_.push_back(std::move(v));
+        }
+        cv_.notify_one();
+    }
+    T pop() {
+        std::unique_lock<std::mutex> lock(mutex_);
+        cv_.wait(lock, [&] { return !queue_.empty(); });
+        T v = std::move(queue_.front());
+        queue_.pop_front();
+        return v;
+    }
+
+  private:
+    std::mutex mutex_;
+    std::condition_variable cv_;
+    std::deque<T> queue_;
+};
 
 std::string concat(const std::vector<std::string>& parts) {
     size_t n = 0;
@@ -491,6 +519,99 @@ void PackedConv2D::conv(IO::NetIO** ios, int party, const Word* x, const Word* w
                 theirs = recv(ios), send(ios, y);
             decrypt(t, theirs, cc, true, threads);
         }
+    }
+}
+
+void PackedConv2D::conv_pipelined(IO::NetIO** ios, int party, const std::vector<size_t>& batch,
+                                  const std::function<Job(size_t)>& prepare, bool is_ab, size_t threads) const {
+    if (batch.empty())
+        return;
+    // chunks of at most kMaxBatch images of a convolution, as in conv()
+    struct Chunk {
+        std::shared_ptr<Job> job;
+        std::shared_ptr<const Tiling> t;
+        const Word* x;
+        Word* c;
+        bool last;
+    };
+    size_t total = 0;
+    for (size_t b : batch) total += ceil_div(b, kMaxBatch);
+    auto first = std::make_shared<Job>(prepare(0));
+    // f(chunk) for all chunks in order, preparing each convolution when its first chunk is reached
+    auto chunks = [&](auto&& f) {
+        for (size_t i = 0; i < batch.size(); i++) {
+            auto job  = i == 0 ? first : std::make_shared<Job>(prepare(i));
+            size_t oh = job->ih - job->kh + 1, ow = job->iw - job->kw + 1;
+            for (size_t cur = 0; cur < job->bs; cur += kMaxBatch) {
+                auto t = std::make_shared<const Tiling>(std::min(kMaxBatch, job->bs - cur), job->ic, job->oc, job->ih,
+                                                        job->iw, job->kh, job->kw, POLY_MOD);
+                f(Chunk{job, t, job->x ? job->x + cur * job->ic * job->ih * job->iw : nullptr,
+                        job->c + cur * job->oc * oh * ow, cur + kMaxBatch >= job->bs});
+            }
+        }
+    };
+    auto finish = [](const Chunk& ch) {
+        if (ch.last && ch.job->finish)
+            ch.job->finish();
+    };
+    // each channel carries the messages of one stage in one direction
+    IO::NetIO** enc_out = ios + (party == 1 ? 0 : 1);
+    IO::NetIO** enc_in  = ios + (party == 1 ? 1 : 0);
+    IO::NetIO** res_out = ios + (party == 1 ? 2 : 3);
+    IO::NetIO** res_in  = ios + (party == 1 ? 3 : 2);
+    Pipe<Chunk> to_evaluate, to_decrypt;
+    Pipe<std::string> inbox;
+    auto encrypt_all = [&](Pipe<Chunk>& next) {
+        chunks([&](Chunk ch) {
+            std::string s;
+            encrypt(*ch.t, ch.x, s, threads);
+            send(enc_out, s);
+            next.push(std::move(ch));
+        });
+    };
+    auto receive_all = [&] {
+        for (size_t k = 0; k < total; k++) inbox.push(recv(enc_in));
+    };
+
+    if (!is_ab && !first->w) { // AB2 input holder: encrypts ahead, decrypts behind
+        std::thread enc(encrypt_all, std::ref(to_decrypt));
+        for (size_t k = 0; k < total; k++) {
+            Chunk ch = to_decrypt.pop();
+            decrypt(*ch.t, recv(res_in), ch.c, false, threads);
+            finish(ch);
+        }
+        enc.join();
+    } else if (!is_ab) { // AB2 weight holder: evaluates as the encryptions arrive
+        std::thread rx(receive_all);
+        chunks([&](Chunk ch) {
+            std::string y;
+            evaluate(*ch.t, inbox.pop(), ch.x, ch.job->w, ch.c, y, threads);
+            send(res_out, y);
+            finish(ch);
+        });
+        rx.join();
+    } else { // AB: both roles, c = r_own + (conv(x, w_other) - r_other)
+        std::thread enc(encrypt_all, std::ref(to_evaluate));
+        std::thread rx(receive_all);
+        std::thread ev([&] {
+            for (size_t k = 0; k < total; k++) {
+                Chunk ch = to_evaluate.pop();
+                std::string y;
+                evaluate(*ch.t, inbox.pop(), ch.x, ch.job->w, ch.c, y, threads);
+                // before sending: the other party reads y only once its own evaluation of this chunk is
+                // sent, so both sends would block on full socket buffers if decrypting waited for them
+                to_decrypt.push(std::move(ch));
+                send(res_out, y);
+            }
+        });
+        for (size_t k = 0; k < total; k++) {
+            Chunk ch = to_decrypt.pop();
+            decrypt(*ch.t, recv(res_in), ch.c, true, threads);
+            finish(ch);
+        }
+        enc.join();
+        rx.join();
+        ev.join();
     }
 }
 

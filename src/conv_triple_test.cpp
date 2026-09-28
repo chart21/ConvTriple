@@ -2,13 +2,14 @@
 // built with TRIPLE_GPU, GPU/troy): c1 + c2 must equal conv(x1 + x2, w1 + w2) exactly, and the traffic per
 // layer is reported from the weight holder's view.
 //
-// Usage: cheetah_conv_triple_test <party 1|2> <port> <ab 0|1> [suite] [rounds] [--packed]
+// Usage: cheetah_conv_triple_test <party 1|2> <port> <ab 0|1> [suite] [rounds] [--packed|--pipelined]
 //   ab 0: AB2 (A_KNOWN=1): party 1 holds w, party 2 holds x;  ab 1: AB, both hold shares of x and w
 //   suite: small    - strided/padded shapes, weight chunks, batches beyond one GPU batch (default)
 //          cifar    - every conv of the CIFAR-10 ResNet50, batch 10
 //          stress   - the cifar shapes, `rounds` times in a shuffled order
 //          imagenet - the 53 convs of ResNet50-Cheetah on 224x224 inputs, batch 1
 //   --packed: generateConvTriplesPacked (the GPU path's packing on the CPU) instead of the wrapper
+//   --pipelined: all convs of the suite in one generateConvTriplesPackedBatch (per-layer times not available)
 //   env: CONV_TEST_THREADS (default 1), CONV_TEST_IP (party 1's address, default 127.0.0.1)
 #include "core/hpmpc_interface.hpp"
 
@@ -75,9 +76,10 @@ const std::vector<std::pair<Shape, int>> kImagenet = {
 
 int main(int argc, char** argv) {
     std::vector<std::string> args(argv + 1, argv + argc);
-    bool packed = std::erase(args, "--packed") > 0;
+    bool packed    = std::erase(args, "--packed") > 0;
+    bool pipelined = std::erase(args, "--pipelined") > 0;
     if (args.size() < 3) {
-        fprintf(stderr, "usage: %s <party 1|2> <port> <ab 0|1> [small|cifar|stress|imagenet] [rounds] [--packed]\n", argv[0]);
+        fprintf(stderr, "usage: %s <party 1|2> <port> <ab 0|1> [small|cifar|stress|imagenet] [rounds] [--packed|--pipelined]\n", argv[0]);
         return 2;
     }
     int party = std::stoi(args[0]), port = std::stoi(args[1]);
@@ -116,12 +118,71 @@ int main(int argc, char** argv) {
     int failed = 0;
     double total_time = 0, total_sent = 0, total_recv = 0;
     std::map<std::string, std::array<double, 4>> groups; // shape -> count, sent, recv, time
+    auto proto = ab ? Utils::PROTO::AB : Utils::PROTO::AB2;
+    bool hold_x = ab || party == 2, hold_w = ab || party == 1;
+
+    // party 2 hands its shares to party 1, which reconstructs and compares; returns the wrong outputs
+    auto check = [&](const Shape& sh, const std::vector<U>& x, const std::vector<U>& w, const U* c, size_t c_size) {
+        size_t bad = 0;
+        if (party == 2) {
+            io->send_data(x.data(), x.size() * 4);
+            io->send_data(w.data(), w.size() * 4);
+            io->send_data(c, c_size * 4);
+            io->flush();
+        } else {
+            std::vector<U> x2(x.size()), w2(w.size()), c2(c_size);
+            io->recv_data(x2.data(), x2.size() * 4);
+            io->recv_data(w2.data(), w2.size() * 4);
+            io->recv_data(c2.data(), c2.size() * 4);
+            for (size_t i = 0; i < x.size(); i++) x2[i] += x[i];
+            for (size_t i = 0; i < w.size(); i++) w2[i] += w[i];
+            auto y = ideal(x2, w2, sh);
+            for (size_t i = 0; i < c_size; i++) bad += (U)(c[i] + c2[i]) != y[i];
+        }
+        io->counter = io->recv_counter = 0; // keep the check out of the traffic
+        return bad;
+    };
+
+    if (pipelined) {
+        std::vector<std::vector<U>> xs, ws;
+        std::vector<U*> xp, wp;
+        std::vector<Utils::ConvParm> parms;
+        std::vector<size_t> offset{0};
+        for (auto& sh : shapes) { // the same inputs as layer by layer
+            int n = (sh.h + 2 * sh.p - sh.k) / sh.s + 1;
+            xs.emplace_back((size_t)sh.bs * sh.ic * sh.h * sh.h);
+            ws.emplace_back((size_t)sh.oc * sh.ic * sh.k * sh.k);
+            for (auto& v : xs.back()) v = hold_x ? rng() : 0;
+            for (auto& v : ws.back()) v = hold_w ? rng() : 0;
+            xp.push_back(xs.back().data()), wp.push_back(ws.back().data());
+            parms.push_back({sh.bs, sh.ic, sh.h, sh.h, sh.ic, sh.k, sh.k, sh.oc, sh.s, sh.p});
+            offset.push_back(offset.back() + (size_t)sh.bs * sh.oc * n * n);
+        }
+        std::vector<U> c(offset.back());
+        double sent0, recv0, t0, sent1, recv1, t1;
+        Iface::getTripleStat("CONV", sent0, recv0, t0);
+        auto start = std::chrono::steady_clock::now();
+        Iface::generateConvTriplesPackedBatch(keys, parms, hold_x ? xp.data() : nullptr, hold_w ? wp.data() : nullptr,
+                                              c.data(), party, threads, proto);
+        total_time = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
+        Iface::getTripleStat("CONV", sent1, recv1, t1);
+        total_sent = sent1 - sent0, total_recv = recv1 - recv0;
+        for (size_t i = 0; i < shapes.size(); i++)
+            if (check(shapes[i], xs[i], ws[i], c.data() + offset[i], offset[i + 1] - offset[i])) {
+                failed++;
+                if (party == 1)
+                    printf("conv %zu (ic=%d h=%d k=%d s=%d) FAILED\n", i, shapes[i].ic, shapes[i].h, shapes[i].k, shapes[i].s);
+            }
+        if (party == 1)
+            printf("%zu convs, %d failed: total %.3f s, sent %.2f MiB, recv %.2f MiB (%.2f MiB both ways)\n",
+                   shapes.size(), failed, total_time, total_sent, total_recv, total_sent + total_recv);
+        return failed;
+    }
 
     for (auto& sh : shapes) {
         int n = (sh.h + 2 * sh.p - sh.k) / sh.s + 1;
         std::vector<U> x((size_t)sh.bs * sh.ic * sh.h * sh.h), w((size_t)sh.oc * sh.ic * sh.k * sh.k),
             c((size_t)sh.bs * sh.oc * n * n);
-        bool hold_x = ab || party == 2, hold_w = ab || party == 1;
         for (auto& v : x) v = hold_x ? rng() : 0;
         for (auto& v : w) v = hold_w ? rng() : 0;
 
@@ -129,7 +190,6 @@ int main(int argc, char** argv) {
         double sent0, recv0, t0, sent1, recv1, t1;
         Iface::getTripleStat("CONV", sent0, recv0, t0);
         auto start = std::chrono::steady_clock::now();
-        auto proto = ab ? Utils::PROTO::AB : Utils::PROTO::AB2;
         if (packed)
             Iface::generateConvTriplesPacked(keys, hold_x ? x.data() : nullptr, hold_w ? w.data() : nullptr, c.data(),
                                              parm, party, threads, proto);
@@ -141,25 +201,8 @@ int main(int argc, char** argv) {
         double sent = sent1 - sent0, recv = recv1 - recv0;
         total_time += t, total_sent += sent, total_recv += recv;
 
-        // party 2 hands its shares to party 1, which reconstructs and compares
-        size_t bad = 0;
-        if (party == 2) {
-            io->send_data(x.data(), x.size() * 4);
-            io->send_data(w.data(), w.size() * 4);
-            io->send_data(c.data(), c.size() * 4);
-            io->flush();
-        } else {
-            std::vector<U> x2(x.size()), w2(w.size()), c2(c.size());
-            io->recv_data(x2.data(), x2.size() * 4);
-            io->recv_data(w2.data(), w2.size() * 4);
-            io->recv_data(c2.data(), c2.size() * 4);
-            for (size_t i = 0; i < x.size(); i++) x2[i] += x[i];
-            for (size_t i = 0; i < w.size(); i++) w2[i] += w[i];
-            auto y = ideal(x2, w2, sh);
-            for (size_t i = 0; i < c.size(); i++) bad += (U)(c[i] + c2[i]) != y[i];
-            if (bad) failed++;
-        }
-        io->counter = io->recv_counter = 0; // keep the check out of the next layer's traffic
+        size_t bad = check(sh, x, w, c.data(), c.size());
+        failed += bad > 0;
 
         char name[96];
         snprintf(name, sizeof name, "ic=%d h=%d k=%d s=%d p=%d oc=%d bs=%d", sh.ic, sh.h, sh.k, sh.s, sh.p, sh.oc, sh.bs);

@@ -110,6 +110,13 @@ void generateCOT(int party, const UINT_TYPE* a, const uint8_t* b, UINT_TYPE* c,
 void generateConvTriplesPacked(Keys<IO::NetIO>& keys, const UINT_TYPE* a, const UINT_TYPE* b, UINT_TYPE* c,
                                Utils::ConvParm parm, int party, int threads, Utils::PROTO proto, int factor = 1);
 
+// generateConvTriplesPacked for all convolutions of a network, pipelined across them
+// (PackedConv2D::conv_pipelined): a[i] and b[i] are the operands of convolution i (a or b null when not
+// held), c their outputs back to back. One lane (factor 1); layer by layer below 4 threads.
+void generateConvTriplesPackedBatch(Keys<IO::NetIO>& keys, const std::vector<Utils::ConvParm>& parms,
+                                    UINT_TYPE** a, UINT_TYPE** b, UINT_TYPE* c, int party, int threads,
+                                    Utils::PROTO proto);
+
 void printTripleStats(int party, unsigned io_offset);
 void resetTripleStats();
 // Aggregated traffic (MiB) and time of one triple type ("CONV", "FC", ...) since the last reset

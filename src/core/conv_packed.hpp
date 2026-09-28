@@ -8,8 +8,10 @@
 // and stripped of unused coefficients like HomConv2DSS's.
 
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <type_traits>
+#include <vector>
 
 #include <seal/seal.h>
 
@@ -30,6 +32,21 @@ class PackedConv2D {
     // AB: both parties hold shares of x and w and play both roles.
     void conv(IO::NetIO** ios, int party, const Word* x, const Word* w, Word* c, size_t bs, size_t ic,
               size_t ih, size_t iw, size_t kh, size_t kw, size_t oc, bool is_ab, size_t threads) const;
+
+    // One convolution of conv_pipelined, with conv()'s operands; finish() runs once its shares are in c
+    struct Job {
+        const Word* x = nullptr;
+        const Word* w = nullptr;
+        Word* c       = nullptr;
+        size_t bs, ic, ih, iw, kh, kw, oc;
+        std::function<void()> finish;
+    };
+    // conv() of several convolutions, pipelined across them: the parties encrypt the next convolutions
+    // and decrypt the previous ones while the evaluator works on the current one, instead of waiting for
+    // each other at every layer. prepare(i) gives convolution i (called once, in order), batch[i] its
+    // number of images. Takes 2 channels (AB2) or 4 (AB).
+    void conv_pipelined(IO::NetIO** ios, int party, const std::vector<size_t>& batch,
+                        const std::function<Job(size_t)>& prepare, bool is_ab, size_t threads) const;
 
   private:
     struct Tiling;
