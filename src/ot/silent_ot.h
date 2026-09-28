@@ -11,11 +11,55 @@
 #include <stdexcept>
 #include <vector>
 
+#include "io/net_io_channel.hpp"
 #include "ot/mitccrh.h"
 #include "ot/ot-utils.h"
 #include "ot/ot.h"
 
+// emp-ot's LPN step (LpnF2::task) with the same outputs: the AES of the next groups of 4 outputs is
+// computed ahead and their rows of the table are prefetched. With one ferret instance per thread the
+// tables of all instances do not fit the caches, and the 40 random reads of one group alone kept the core
+// waiting on memory (LPN step of 32 instances at once on an EPYC 7543, b13: 0.34 -> 0.28 s).
+template <>
+inline void LpnF2<IO::NetIO, 10>::task(block* nn, const block* kk, int64_t start, int64_t end) {
+    constexpr int d = 10, ahead = 4;
+    PRP prp(seed);
+    const int64_t groups = end - 4 > start ? (end - 4 - start + 3) / 4 : 0; // task's groups of 4: j < end - 4
+    alignas(16) block ring[ahead + 1][d];
+    auto prepare = [&](int64_t g) { // __compute4's AES for group g, and a prefetch of its 40 rows
+        block* t = ring[g % (ahead + 1)];
+        for (int m = 0; m < d; ++m) t[m] = makeBlock(start + 4 * g, m);
+        AES_ecb_encrypt_blks(t, d, &prp.aes);
+        const uint32_t* r = reinterpret_cast<const uint32_t*>(t);
+        for (int i = 0; i < 4 * d; ++i) {
+            uint32_t index = r[i] & uint32_t(mask);
+            index -= index >= uint32_t(k) ? uint32_t(k) : 0;
+            _mm_prefetch(reinterpret_cast<const char*>(kk + index), _MM_HINT_T0);
+        }
+    };
+    for (int64_t g = 0; g < std::min<int64_t>(ahead, groups); ++g) prepare(g);
+    for (int64_t g = 0; g < groups; ++g) {
+        if (g + ahead < groups)
+            prepare(g + ahead);
+        const uint32_t* r = reinterpret_cast<const uint32_t*>(ring[g % (ahead + 1)]);
+        for (int m = 0; m < 4; ++m) {
+            block acc = nn[start + 4 * g + m];
+            for (int i = 0; i < d; ++i) {
+                uint32_t index = r[m * d + i] & uint32_t(mask);
+                index -= index >= uint32_t(k) ? uint32_t(k) : 0;
+                acc = acc ^ kk[index];
+            }
+            nn[start + 4 * g + m] = acc;
+        }
+    }
+    for (int64_t j = start + 4 * groups; j < end; ++j) __compute1(nn, kk, j, &prp);
+}
+
 namespace cheetah {
+
+// Ferret's LPN parameters, emp-ot's ferret_b11 / b12 / b13 (CMake TRIPLE_FERRET, default b12): a smaller LPN
+// table against more GGM trees. Defined once in the HE library, so every user of this header agrees.
+const PrimalLPNParameter& ferret_param();
 
 template <typename IO>
 class SilentOT : public sci::OT<SilentOT<IO>> {
@@ -32,7 +76,7 @@ class SilentOT : public sci::OT<SilentOT<IO>> {
     SilentOT(int party, int threads, IO** ios, bool malicious = false, bool run_setup = true,
              std::string pre_file = "", bool warm_up = true)
         : threads(threads), ios(ios) {
-        ferret = new FerretCOT<IO>(party, threads, ios, malicious, run_setup, ferret_b13, pre_file);
+        ferret = new FerretCOT<IO>(party, threads, ios, malicious, run_setup, ferret_param(), pre_file);
 
 #if PRG_SEED != -1
         seed = _mm_set1_epi32(PRG_SEED + ios[0]->port);

@@ -61,6 +61,10 @@ CMake Options:
 - `TRIPLE_ZERO` (BOOL, default ON): Cheetah's conv and FC process all-zero weight blocks like any other.
   With OFF they skip them and reject all-zero filters: the work, and whether a layer runs at all,
   then depend on the weights' values (e.g. zero dummy weights run faster than real ones).
+- `TRIPLE_FERRET` (b11, b12, b13; default b12): ferret's LPN parameters for the silent OTs (emp-ot's
+  `ferret_b1x`, same security level): a smaller LPN table against more GGM trees. With 32 ferret instances
+  at once, b12's 3.8 MB table stays in the caches where b13's 7.2 MB did not: key setup 1.30 -> 1.13 s on two
+  EPYC 7543 hosts, for 52.7 instead of 46.2 MB of setup traffic per direction.
 - `TRIPLE_GPU` (BOOL): If enabled - Use [Troy-Nova](https://github.com/lightbulb128/troy-nova) for Convolutions.
 - `TRIPLE_GPU_REVERSE` (BOOL): If enabled - Encrypt filters instead of images (requires `TRIPLE_GPU=ON`).
 - `TRIPLE_SEED` (NUM): Set the seed (-1: no seed).
@@ -114,8 +118,10 @@ Currently supported:
       with `TRIPLE_GPU`
     - `generateConvTriplesPacked`: the `Conv2dHelper` layout on the CPU with SEAL. A ciphertext holds several
       images and output channels, where `HomConv2DSS` spends one output ciphertext per output channel, which
-      cuts the traffic of layers with small feature maps (ResNet50 on ImageNet, AB2: 1002 -> 588 MiB).
-      Outputs are masked, noise-flooded and truncated like `HomConv2DSS`'s.
+      cuts the traffic of layers with small feature maps. Outputs are masked, noise-flooded and truncated like
+      `HomConv2DSS`'s. On the wire, an input ciphertext is a seed and c0 at the primes' widths, an output
+      ciphertext only the bits decryption uses (46 of c1, 34 of each used c0 coefficient), and the layout is
+      chosen for the fewest bytes (ResNet50 on ImageNet, AB2: Cheetah 1002 MiB, packed 479 MiB).
     - `generateConvTriplesPackedBatch`: the same for all convolutions of a network in one call, pipelined
       across them: while one party evaluates a layer, the other encrypts the next ones and decrypts the
       previous ones, instead of both waiting at every layer (ResNet50 on ImageNet, 32 threads, two hosts:

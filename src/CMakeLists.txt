@@ -91,6 +91,7 @@ endif()
 
 target_compile_definitions(${HE_LIB} PRIVATE LOGLEVEL=${TRIPLE_LOG_LEVEL} PRG_SEED=${TRIPLE_SEED})
 target_compile_definitions(${HE_LIB} PUBLIC TRIPLE_BITLEN=${TRIPLE_BITLEN})
+target_compile_definitions(${HE_LIB} PRIVATE TRIPLE_FERRET=ferret_${TRIPLE_FERRET})
 
 ################################################################################
 ## Server / Client executables

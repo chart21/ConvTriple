@@ -13,6 +13,14 @@
 #include "protocols/conv_proto.hpp"
 #include "protocols/fc_proto.hpp"
 #include "protocols/multiplexer.hpp"
+
+#ifndef TRIPLE_FERRET
+#define TRIPLE_FERRET ferret_b12
+#endif
+
+namespace cheetah {
+const PrimalLPNParameter& ferret_param() { return TRIPLE_FERRET; }
+} // namespace cheetah
 #include "protocols/ot_proto.hpp"
 
 #include "ot/bit-triple-generator.h"

@@ -8,6 +8,7 @@ option(USE_APPROX_RESHARE "Enable APPROX RESHARE" OFF)
 option(TRIPLE_VERIFY "Enable verification" ON)
 option(TRIPLE_COLOR "Enable colored output" ON)
 option(TRIPLE_ZERO "Process all-zero weight blocks like any other (OFF: skip them, reject all-zero filters)" ON)
+set(TRIPLE_FERRET "b12" CACHE STRING "Ferret LPN parameters of the silent OT: b11, b12 or b13 (emp-ot)")
 option(TRIPLE_GPU "Enable GPU support" OFF)
 option(TRIPLE_GPU_REVERSE "GPU uses reverse AB2" OFF)
 
