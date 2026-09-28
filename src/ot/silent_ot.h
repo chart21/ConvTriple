@@ -27,6 +27,7 @@ class SilentOT : public sci::OT<SilentOT<IO>> {
 
   public:
     FerretCOT<IO>* ferret;
+    static constexpr int64_t rot_chunk = 4096; // OTs per chunk of send/recv_rot_bits (64 KiB of COTs)
 
     SilentOT(int party, int threads, IO** ios, bool malicious = false, bool run_setup = true,
              std::string pre_file = "", bool warm_up = true)
@@ -404,6 +405,61 @@ class SilentOT : public sci::OT<SilentOT<IO>> {
             std::memcpy(pad, data + i, std::min(ot_bsize, length - i) * sizeof(block));
             ferret->mitccrh.template hash<ot_bsize, 1>(pad);
             std::memcpy(data + i, pad, std::min(ot_bsize, length - i) * sizeof(block));
+        }
+    }
+
+    // Random OTs with 1-bit messages, packed 8 per byte (bit j of byte i belongs to OT 8i + j; length a
+    // multiple of 8). The COTs are taken from ferret, hashed and reduced to bits in cache-sized chunks,
+    // where send_ot_rm_rc<T> stores two 16-byte blocks and a T per OT and makes several passes over them.
+    void send_rot_bits(uint8_t* m0, uint8_t* m1, int64_t length) {
+        block s;
+        ferret->prg.random_block(&s, 1);
+        ferret->io->send_block(&s, 1);
+        ferret->mitccrh.setS(s);
+        ferret->io->flush();
+        std::vector<block> buf(std::min<int64_t>(rot_chunk, length));
+        block pad[2 * ot_bsize];
+        for (int64_t i0 = 0; i0 < length; i0 += rot_chunk) {
+            int64_t n = std::min<int64_t>(rot_chunk, length - i0);
+            ferret->rcot(buf.data(), n);
+            for (int64_t i = 0; i < n; i += ot_bsize) {
+                for (int j = 0; j < ot_bsize; j++) {
+                    pad[2 * j]     = buf[i + j];
+                    pad[2 * j + 1] = buf[i + j] ^ ferret->Delta;
+                }
+                ferret->mitccrh.template hash<ot_bsize, 2>(pad);
+                uint8_t b0 = 0, b1 = 0;
+                for (int j = 0; j < ot_bsize; j++) {
+                    b0 |= uint8_t(_mm_cvtsi128_si64(pad[2 * j]) & 1) << j;
+                    b1 |= uint8_t(_mm_cvtsi128_si64(pad[2 * j + 1]) & 1) << j;
+                }
+                m0[(i0 + i) / 8] = b0;
+                m1[(i0 + i) / 8] = b1;
+            }
+        }
+    }
+
+    // receiver side of send_rot_bits: random choice bits c and the chosen message bits mc
+    void recv_rot_bits(uint8_t* mc, uint8_t* c, int64_t length) {
+        block s;
+        ferret->io->recv_block(&s, 1);
+        ferret->mitccrh.setS(s);
+        std::vector<block> buf(std::min<int64_t>(rot_chunk, length));
+        block pad[ot_bsize];
+        for (int64_t i0 = 0; i0 < length; i0 += rot_chunk) {
+            int64_t n = std::min<int64_t>(rot_chunk, length - i0);
+            ferret->rcot(buf.data(), n);
+            for (int64_t i = 0; i < n; i += ot_bsize) {
+                uint8_t bc = 0, bm = 0;
+                for (int j = 0; j < ot_bsize; j++) {
+                    pad[j] = buf[i + j];
+                    bc |= uint8_t(_mm_cvtsi128_si64(pad[j]) & 1) << j;
+                }
+                ferret->mitccrh.template hash<ot_bsize, 1>(pad);
+                for (int j = 0; j < ot_bsize; j++) bm |= uint8_t(_mm_cvtsi128_si64(pad[j]) & 1) << j;
+                c[(i0 + i) / 8]  = bc;
+                mc[(i0 + i) / 8] = bm;
+            }
         }
     }
 

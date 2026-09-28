@@ -394,6 +394,39 @@ class TripleGenerator {
             break;
         }
         case _2ROT: {
+            if (packed) { // bit-packed: 64 triples per word
+                size_t nb = num_triples / 8;
+                std::vector<uint8_t> u(nb), v(nb);
+                switch (party) {
+                case emp::ALICE:
+                    otpack->silent_ot_reversed->recv_rot_bits(u.data(), ai, num_triples);
+                    otpack->silent_ot->send_rot_bits(v.data(), bi, num_triples);
+                    io->flush();
+                    break;
+                case emp::BOB:
+                    otpack->silent_ot_reversed->send_rot_bits(v.data(), bi, num_triples);
+                    io->flush();
+                    otpack->silent_ot->recv_rot_bits(u.data(), ai, num_triples);
+                    break;
+                }
+                // b = m0 ^ m1, c = (a & b) ^ u ^ v, as below
+                size_t nw = nb / 8;
+                auto* a64 = reinterpret_cast<uint64_t*>(ai);
+                auto* b64 = reinterpret_cast<uint64_t*>(bi);
+                auto* c64 = reinterpret_cast<uint64_t*>(ci);
+                auto* u64 = reinterpret_cast<const uint64_t*>(u.data());
+                auto* v64 = reinterpret_cast<const uint64_t*>(v.data());
+                for (size_t i = 0; i < nw; i++) {
+                    uint64_t bw = b64[i] ^ v64[i];
+                    b64[i]      = bw;
+                    c64[i]      = (a64[i] & bw) ^ u64[i] ^ v64[i];
+                }
+                for (size_t i = nw * 8; i < nb; i++) {
+                    bi[i] ^= v[i];
+                    ci[i] = (ai[i] & bi[i]) ^ u[i] ^ v[i];
+                }
+                break;
+            }
             // #if USE_CHEETAH
             uint8_t *a, *b, *c;
             if (packed) {
