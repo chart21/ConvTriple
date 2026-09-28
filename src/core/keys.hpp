@@ -41,6 +41,9 @@ class Keys {
     // The OT packs: one per TRIPLE_OT_GROUP channels, whose ferret instances extend on that many
     // threads and channels. An OT consumer runs one worker per pack, on the pack's first channel.
     int ot_workers() const { return int(_ot_packs.size()); }
+    // per OT consumer call: the seed stream of worker wid's PRGs (emp::DetSeedScope) for reproducible runs
+    uint64_t next_ot_call() { return _ot_calls++; }
+    static uint64_t ot_seed_tag(uint64_t call, int wid) { return gemini::party_seed64(0x07c0 + call, uint64_t(wid)); }
 
     // The OT packs, made at the first request. Every ferret instance extends ~10^7 COTs at once
     // (the first time in its setup), so one pack per channel made 2 * threads extensions, several
@@ -61,6 +64,7 @@ class Keys {
         auto init_ot = [&](int, size_t start, size_t end) -> Code {
             for (size_t i = start; i < end; ++i) {
                 int cur_party = i & 1 ? (3 - _party) : _party;
+                emp::DetSeedScope det(gemini::party_seed64(0x07ac5, i), gemini::kSeeded);  // reproducible OT (PRG_SEED)
                 _ot_packs[i]  = new sci::OTPack<Channel>(_ios + i * _ot_group, int(_ot_group), cur_party, true, false);
             }
             return Code::OK;
@@ -68,7 +72,8 @@ class Keys {
         gemini::ThreadPool tpool(_ot_packs.size());
         gemini::LaunchWorks(tpool, _ot_packs.size(), init_ot);
         Utils::log(Utils::Level::INFO, "P", _party - 1, ", PID", _io_offset, ": OT packs   s PRE: ",
-                   Utils::to_sec(Utils::time_diff(start)), " (packs: ", _ot_packs.size(), ", ferret threads: ", _ot_group, ")");
+                   Utils::to_sec(Utils::time_diff(start)), " (packs: ", _ot_packs.size(), ", ferret threads: ", _ot_group,
+                   ", unseeded PRGs: ", emp::det_seed_misses().load(), ")");
     }
     Channel* ot_io(int idx) const { return _ios[size_t(idx) * _ot_group]; }
     unsigned get_io_offset() const { return _io_offset; }
@@ -87,6 +92,7 @@ class Keys {
     Channel** _ios;
     unsigned _threads;
     unsigned _ot_group = 1;
+    uint64_t _ot_calls = 0;
     std::vector<sci::OTPack<Channel>*> _ot_packs;
     bool _connected = false;
 
@@ -251,6 +257,9 @@ void Keys<Channel>::connect(int party, const std::string& ip, int port, int thre
 
 template <class Channel>
 void Keys<Channel>::disconnect() {
+    if (gemini::kSeeded && emp::det_seed_misses().load())
+        Utils::log(Utils::Level::INFO, "P", _party - 1, ", PID", _io_offset, ": PRGs seeded outside a DetSeedScope: ",
+                   emp::det_seed_misses().load(), " (the OT outputs may differ between runs)");
     if (!_connected)
         return;
     for (unsigned i = 0; i < _threads; ++i) {

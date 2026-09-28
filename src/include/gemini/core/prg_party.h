@@ -12,6 +12,8 @@
 // reproducible: every stream is addressed by a tag that does not depend on thread scheduling.
 namespace gemini {
 
+constexpr bool kSeeded = PRG_SEED != -1;  // reproducible runs (emp::DetSeedScope)
+
 inline int& prg_party() { // emp::ALICE = 1, emp::BOB = 2
     static int party = 1;
     return party;

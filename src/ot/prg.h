@@ -28,6 +28,7 @@ Modified by Deevashwer Rathee
 #ifndef PRG_H__
 #define PRG_H__
 
+#include "emp-tool/utils/prg.h"  // emp::DetSeedScope
 #include "ot/aes-ni.h"
 #include "ot/aes.h"
 #include "ot/block.h"
@@ -55,6 +56,14 @@ class PRG128 {
             reseed(seed, id);
         } else {
             block128 v;
+            // reproducible runs: see emp::DetSeedScope (include/emp-tool/utils/prg.h)
+            if (emp::det_seed().on) {
+                emp::PRG det;
+                det.random_block((emp::block*)&v, 1);
+                reseed(&v);
+                return;
+            }
+            emp::det_seed_misses()++;
 #ifdef EMP_USE_RANDOM_DEVICE
             int* data = (int*)(&v);
             std::random_device rand_div;
@@ -195,6 +204,13 @@ class PRG256 {
             reseed(seed, id);
         } else {
             alignas(32) block256 v;
+            if (emp::det_seed().on) {
+                emp::PRG det;
+                det.random_block((emp::block*)&v, 2);
+                reseed(&v);
+                return;
+            }
+            emp::det_seed_misses()++;
 #ifdef EMP_USE_RANDOM_DEVICE
             int* data = (int*)(&v);
             std::random_device rand_div;

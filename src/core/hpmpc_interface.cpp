@@ -95,8 +95,10 @@ void generateBoolCOTMultTriplesCheetah(uint8_t a[], uint8_t b[], uint8_t c[],
     auto** ios = keys.get_ios(threads);
     keys.ensure_ot(num_triples);
     const int ot_threads = keys.ot_workers(); // one worker per OT pack
+    const uint64_t ot_call = keys.next_ot_call();
 
     auto func = [&](int wid, int start, int end) -> Code {
+        emp::DetSeedScope det_scope(Keys<IO::NetIO>::ot_seed_tag(ot_call, wid), gemini::kSeeded);  // reproducible OT
         if (start >= end)
             return Code::OK;
 
@@ -158,9 +160,11 @@ void generateRandomMultiplicationsCheetah(uint8_t a[], uint8_t b[], uint64_t num
     auto** ios = keys.get_ios(threads);
     keys.ensure_ot(num_muls);
     const int ot_threads = keys.ot_workers(); // one worker per OT pack
+    const uint64_t ot_call = keys.next_ot_call();
 
 
     auto func = [&](int wid, int start, int end) -> Code {
+        emp::DetSeedScope det_scope(Keys<IO::NetIO>::ot_seed_tag(ot_call, wid), gemini::kSeeded);  // reproducible OT
         if (start >= end)
             return Code::OK;
 
@@ -218,8 +222,10 @@ void generateBoolTriplesCheetah(uint8_t a[], uint8_t b[], uint8_t c[],
     auto** ios = keys.get_ios(threads);
     keys.ensure_ot(num_triples);
     const int ot_threads = keys.ot_workers(); // one worker per OT pack
+    const uint64_t ot_call = keys.next_ot_call();
 
     auto func = [&](int wid, int start, int end) -> Code {
+        emp::DetSeedScope det_scope(Keys<IO::NetIO>::ot_seed_tag(ot_call, wid), gemini::kSeeded);  // reproducible OT
         if (start >= end)
             return Code::OK;
 
@@ -284,8 +290,10 @@ void generateBool3TupleCheetah(Beaver3Tuples tuples, uint64_t num_tuples, const 
     auto** ios = keys.get_ios(threads);
     keys.ensure_ot(2 * uint64_t(num_tuples));
     const int ot_threads = keys.ot_workers(); // one worker per OT pack
+    const uint64_t ot_call = keys.next_ot_call();
 
     auto func = [&](int wid, int start, int end) -> Code {
+        emp::DetSeedScope det_scope(Keys<IO::NetIO>::ot_seed_tag(ot_call, wid), gemini::kSeeded);  // reproducible OT
         if (start >= end)
             return Code::OK;
 
@@ -344,8 +352,10 @@ void generateBool4TupleCheetah(Beaver4Tuples tuples, uint64_t num_tuples, const 
     auto** ios = keys.get_ios(threads);
     keys.ensure_ot(3 * uint64_t(num_tuples));
     const int ot_threads = keys.ot_workers(); // one worker per OT pack
+    const uint64_t ot_call = keys.next_ot_call();
 
     auto func = [&](int wid, int start, int end) -> Code {
+        emp::DetSeedScope det_scope(Keys<IO::NetIO>::ot_seed_tag(ot_call, wid), gemini::kSeeded);  // reproducible OT
         if (start >= end)
             return Code::OK;
 
@@ -1155,12 +1165,14 @@ void do_multiplex(int num_input, const UINT_TYPE* x32, const uint8_t* sel_packed
     auto** ios = keys.get_ios(threads);
     keys.ensure_ot(uint64_t(num_input));
     const int ot_threads = keys.ot_workers(); // one worker per OT pack
+    const uint64_t ot_call = keys.next_ot_call();
 
     uint8_t* sel = new uint8_t[num_input];
     uint64_t* x  = new uint64_t[num_input];
     uint64_t* y  = new uint64_t[num_input];
 
     auto func = [&](int wid, size_t start, size_t end) -> Code {
+        emp::DetSeedScope det_scope(Keys<IO::NetIO>::ot_seed_tag(ot_call, wid), gemini::kSeeded);  // reproducible OT
         if (start >= end)
             return Code::OK;
 
@@ -1259,8 +1271,10 @@ void generateOT(int party, const std::string& ip, int port, int threads, int io_
     auto** ios = keys.get_ios(threads);
     keys.ensure_ot(uint64_t(num_triples));
     const int ot_threads = keys.ot_workers(); // one worker per OT pack
+    const uint64_t ot_call = keys.next_ot_call();
 
     auto func = [&](int wid, size_t start, size_t end) -> Code {
+        emp::DetSeedScope det_scope(Keys<IO::NetIO>::ot_seed_tag(ot_call, wid), gemini::kSeeded);  // reproducible OT
         if (start >= end)
             return Code::OK;
 
@@ -1327,8 +1341,10 @@ void generateCOT(int party, const UINT_TYPE* a, const uint8_t* b, UINT_TYPE* c,
     auto** ios = keys.get_ios(threads);
     keys.ensure_ot(uint64_t(num_triples));
     const int ot_threads = keys.ot_workers(); // one worker per OT pack
+    const uint64_t ot_call = keys.next_ot_call();
 
     auto func = [&](int wid, size_t start, size_t end) -> Code {
+        emp::DetSeedScope det_scope(Keys<IO::NetIO>::ot_seed_tag(ot_call, wid), gemini::kSeeded);  // reproducible OT
         if (start >= end)
             return Code::OK;
 
