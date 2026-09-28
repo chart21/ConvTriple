@@ -134,10 +134,11 @@ class NetIO : public IOChannel<NetIO> {
                 usleep(1000);
             }
         }
-        char* wan_opt = getenv("CHEETAH_WAN_OPT");
-        if (wan_opt && std::string(wan_opt) == "1") {
-            set_nodelay();
-        }
+        // Always without Nagle: the stream is buffered and flushed explicitly, so Nagle only delays the
+        // small flushes (the 16-byte hash seeds of the random OTs, the corrections of the COT multiply)
+        // behind the peer's delayed ACK - 40 ms stalls that made every cot_multiply_shares call take
+        // ~170 ms with one ferret thread per OT pack. (Previously only with CHEETAH_WAN_OPT=1.)
+        set_nodelay();
         stream = fdopen(consocket, "wb+");
         buffer = new char[NETWORK_BUFFER_SIZE];
         memset(buffer, 0, NETWORK_BUFFER_SIZE);
