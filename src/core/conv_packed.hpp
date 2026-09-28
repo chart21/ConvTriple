@@ -33,6 +33,7 @@ class PackedConv2D {
 
   private:
     struct Tiling;
+    struct Ntt; // the primes' NTT tables, for NTTs of weight polynomials outside SEAL
 
     void encrypt(const Tiling& t, const Word* x, std::string& out, size_t threads) const;
     void evaluate(const Tiling& t, const std::string& in, const Word* x_own, const Word* w, Word* r,
@@ -44,6 +45,7 @@ class PackedConv2D {
     std::shared_ptr<seal::Evaluator> evaluator_;
     std::shared_ptr<seal::Decryptor> decryptor_;
     std::shared_ptr<seal::PublicKey> other_pk_;
+    std::shared_ptr<const Ntt> ntt_;
 };
 
 } // namespace Iface
