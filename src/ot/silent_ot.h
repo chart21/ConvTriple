@@ -9,6 +9,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <stdexcept>
 #include <vector>
 
@@ -412,7 +413,7 @@ class SilentOT : public sci::OT<SilentOT<IO>> {
 
     // random message, random choice
     void send_ot_rm_rc(block* data0, block* data1, int64_t length) {
-        ferret->rcot(data0, length);
+        timed_rcot(data0, length);
 
         block s;
         ferret->prg.random_block(&s, 1);
@@ -436,7 +437,7 @@ class SilentOT : public sci::OT<SilentOT<IO>> {
 
     // random message, random choice
     void recv_ot_rm_rc(block* data, bool* r, int64_t length) {
-        ferret->rcot(data, length);
+        timed_rcot(data, length);
         for (int64_t i = 0; i < length; i++) {
             r[i] = getLSB(data[i]);
         }
@@ -466,7 +467,7 @@ class SilentOT : public sci::OT<SilentOT<IO>> {
         block pad[2 * ot_bsize];
         for (int64_t i0 = 0; i0 < length; i0 += rot_chunk) {
             int64_t n = std::min<int64_t>(rot_chunk, length - i0);
-            ferret->rcot(buf.data(), n);
+            timed_rcot(buf.data(), n);
             for (int64_t i = 0; i < n; i += ot_bsize) {
                 for (int j = 0; j < ot_bsize; j++) {
                     pad[2 * j]     = buf[i + j];
@@ -493,7 +494,7 @@ class SilentOT : public sci::OT<SilentOT<IO>> {
         block pad[ot_bsize];
         for (int64_t i0 = 0; i0 < length; i0 += rot_chunk) {
             int64_t n = std::min<int64_t>(rot_chunk, length - i0);
-            ferret->rcot(buf.data(), n);
+            timed_rcot(buf.data(), n);
             for (int64_t i = 0; i < n; i += ot_bsize) {
                 uint8_t bc = 0, bm = 0;
                 for (int j = 0; j < ot_bsize; j++) {
@@ -678,6 +679,23 @@ class SilentOT : public sci::OT<SilentOT<IO>> {
     }
 
     int64_t get_rcot_count() const { return count_rcot_.load(); }
+
+    // ferret extensions triggered by the COT requests of this instance, and the time spent in them
+    int64_t extensions() const { return extensions_; }
+    double rcot_seconds() const { return rcot_ns_ * 1e-9; }
+
+  private:
+    int64_t extensions_ = 0, rcot_ns_ = 0;
+    void timed_rcot(block* data, int64_t n) {
+        const int64_t left = ferret->silent_ot_left();
+        if (n > left)
+            extensions_ += 1 + (n - left) / std::max<int64_t>(1, ferret->ot_limit);
+        const auto t0 = std::chrono::steady_clock::now();
+        ferret->rcot(data, n);
+        rcot_ns_ += std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count();
+    }
+
+  public:
 };
 
 template <typename IO>

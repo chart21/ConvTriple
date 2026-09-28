@@ -63,6 +63,8 @@ class Keys {
         auto start = measure::now();
         cots = std::max(cots, ot_demand_hint());
         unsigned group = TRIPLE_OT_GROUP;
+        if (const char* e = std::getenv("CHEETAH_OT_GROUP"))  // experiments: channels per pack
+            group = unsigned(std::max(1, std::atoi(e)));
         if (group == 0) {
             const double per_ext = 0.8 * double(cheetah::ferret_param().n); // headroom for COT / MUX
             group = _threads;
@@ -266,6 +268,17 @@ void Keys<Channel>::connect(int party, const std::string& ip, int port, int thre
 
 template <class Channel>
 void Keys<Channel>::disconnect() {
+    if (!_ot_packs.empty()) {
+        int64_t ext = 0, cots = 0;
+        double sec = 0;
+        for (auto* pack : _ot_packs)
+            for (auto* ot : {pack->silent_ot, pack->silent_ot_reversed}) {
+                ext += ot->extensions(), sec += ot->rcot_seconds(), cots += ot->get_rcot_count();
+            }
+        Utils::log(Utils::Level::INFO, "P", _party - 1, ", PID", _io_offset, ": OT packs: ", _ot_packs.size(),
+                   " x ", _ot_group, " threads, ferret extensions after setup: ", ext, ", time in rcot (sum over packs): ",
+                   sec, " s");
+    }
     if (gemini::kSeeded && emp::det_seed_misses().load())
         Utils::log(Utils::Level::INFO, "P", _party - 1, ", PID", _io_offset, ": PRGs seeded outside a DetSeedScope: ",
                    emp::det_seed_misses().load(), " (the OT outputs may differ between runs)");

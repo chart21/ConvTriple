@@ -69,82 +69,68 @@ inline void pack_bool(uint8_t* bytes, size_t num_bits) {
 }
 
 /// Compute shares for c = a * b using correlated oblivious transfer
+/// (a, b, c bit-packed; num_shares a multiple of 8). The random OTs come bit-packed from
+/// send_rot_bits / recv_rot_bits - the same bits as send_ot_rm_rc<T> / recv_ot_rm_rc<T> with l = 1,
+/// without two 16-byte blocks per OT and the byte-to-bit repacking.
 template <typename IO>
 void cot_multiply_shares(int party, const sci::OTPack<IO>* otpack, uint8_t* a, uint8_t* b, uint8_t* c, size_t num_shares) {
-    size_t num_bytes = (num_shares + 7) / 8;
-    auto r0 = std::make_unique<uint8_t[]>(num_shares),
-        r1 = std::make_unique<uint8_t[]>(num_shares),
-        s = std::make_unique<uint8_t[]>(num_shares),
-        rs = std::make_unique<uint8_t[]>(num_shares),
-        my_choice_corrections = std::make_unique<uint8_t[]>(num_bytes),
-        my_masked_value = std::make_unique<uint8_t[]>(num_bytes),
-        their_choice_corrections = std::make_unique<uint8_t[]>(num_bytes),
-        their_masked_value = std::make_unique<uint8_t[]>(num_bytes);
+    const size_t num_bytes = (num_shares + 7) / 8;
+    std::vector<uint8_t> r0(num_bytes), r1(num_bytes), s(num_bytes), rs(num_bytes),
+        my_choice_corrections(num_bytes), my_masked_value(num_bytes), their_choice_corrections(num_bytes),
+        their_masked_value(num_bytes);
 
     switch (party) {
         case emp::ALICE: {
-            otpack->silent_ot_reversed->template recv_ot_rm_rc<uint8_t>(rs.get(), reinterpret_cast<bool*>(s.get()), num_shares, 1);
+            otpack->silent_ot_reversed->recv_rot_bits(rs.data(), s.data(), int64_t(num_shares));
             otpack->io->flush();
-            otpack->silent_ot->template send_ot_rm_rc<uint8_t>(r0.get(), r1.get(), num_shares, 1);
+            otpack->silent_ot->send_rot_bits(r0.data(), r1.data(), int64_t(num_shares));
             break;
         }
         case emp::BOB: {
-            otpack->silent_ot_reversed->template send_ot_rm_rc<uint8_t>(r0.get(), r1.get(), num_shares, 1);
+            otpack->silent_ot_reversed->send_rot_bits(r0.data(), r1.data(), int64_t(num_shares));
             otpack->io->flush();
-            otpack->silent_ot->recv_ot_rm_rc(rs.get(), reinterpret_cast<bool*>(s.get()), num_shares, 1);
+            otpack->silent_ot->recv_rot_bits(rs.data(), s.data(), int64_t(num_shares));
             break;
         }
     }
     otpack->io->flush();
-
-    pack_bool(s.get(), num_shares);
-    pack_bool(rs.get(), num_shares);
-    pack_bool(r0.get(), num_shares);
-    pack_bool(r1.get(), num_shares);
 
     for (size_t i = 0; i < num_bytes; ++i) my_choice_corrections[i] = s[i] ^ a[i];
     for (size_t i = 0; i < num_bytes; ++i) my_masked_value[i] = b[i] ^ r0[i] ^ r1[i];
 
     switch (party) {
         case emp::ALICE: {
-            otpack->io->send_data(my_choice_corrections.get(), num_bytes);
-            otpack->io->send_data(my_masked_value.get(), num_bytes);
-            otpack->io->recv_data(their_choice_corrections.get(), num_bytes);
-            otpack->io->recv_data(their_masked_value.get(), num_bytes);
+            otpack->io->send_data(my_choice_corrections.data(), num_bytes);
+            otpack->io->send_data(my_masked_value.data(), num_bytes);
+            otpack->io->recv_data(their_choice_corrections.data(), num_bytes);
+            otpack->io->recv_data(their_masked_value.data(), num_bytes);
             break;
         }
         case emp::BOB: {
-            otpack->io->recv_data(their_choice_corrections.get(), num_bytes);
-            otpack->io->recv_data(their_masked_value.get(), num_bytes);
-            otpack->io->send_data(my_choice_corrections.get(), num_bytes);
-            otpack->io->send_data(my_masked_value.get(), num_bytes);
+            otpack->io->recv_data(their_choice_corrections.data(), num_bytes);
+            otpack->io->recv_data(their_masked_value.data(), num_bytes);
+            otpack->io->send_data(my_choice_corrections.data(), num_bytes);
+            otpack->io->send_data(my_masked_value.data(), num_bytes);
             break;
         }
     }
     otpack->io->flush();
 
     for (size_t i = 0; i < num_bytes; ++i) {
-        // choice ? `rs` ^ (`r0` ^ `r1` ^ message) : `rs`
-        uint8_t rcv_mul = rs[i] ^ (a[i] & their_masked_value[i]);
-        // their `s` == real choice ? `r0` : `r1`
-        // correction is `true` means that their random `s` != real choice
-        uint8_t snd_mul = (~their_choice_corrections[i] & r0[i]) ^ (their_choice_corrections[i] & r1[i]);
-
-        // For one OT direction, let x be the receiver's input bit and y be the
-        // sender's input bit. The receiver has random choice s and selected OT
-        // mask rs; the sender has random masks r0 and r1.
+        // For one OT direction, let x be the receiver's input bit and y be the sender's input bit. The
+        // receiver has random choice s and selected OT mask rs; the sender has random masks r0 and r1.
         //
         // Receiver -> Sender: e = s ^ x
         // Sender -> Receiver: m = y ^ r0 ^ r1
         // Receiver output:    rs ^ (x & m)
         // Sender output:      e ? r1 : r0
         //
-        // The matching receiver/sender outputs, held by opposite parties, share
-        // the cross term x & y: when x is 0 their masks match and cancel; when
-        // x is 1 the receiver also XORs in m and the sender uses the other mask,
-        // leaving y. This party's local rcv_mul and snd_mul come from opposite
-        // OT directions, so c[i] also XORs in the local product a[i] & b[i].
-
+        // The matching receiver/sender outputs, held by opposite parties, share the cross term x & y:
+        // when x is 0 their masks match and cancel; when x is 1 the receiver also XORs in m and the
+        // sender uses the other mask, leaving y. This party's local rcv_mul and snd_mul come from
+        // opposite OT directions, so c[i] also XORs in the local product a[i] & b[i].
+        const uint8_t rcv_mul = rs[i] ^ (a[i] & their_masked_value[i]);
+        const uint8_t snd_mul = (~their_choice_corrections[i] & r0[i]) ^ (their_choice_corrections[i] & r1[i]);
         c[i] = (a[i] & b[i]) ^ rcv_mul ^ snd_mul;
     }
 }
