@@ -14,6 +14,14 @@
 
 namespace Iface {
 
+// Total OT demand (COTs per direction) of the whole preprocessing, set by the caller before the first
+// generation: the OT packs are sized once, at the first request, which is not always the largest one
+// (PPA4's Beaver tuples, the multiplexer and COT triples come after the boolean triples).
+inline uint64_t& ot_demand_hint() {
+    static uint64_t h = 0;
+    return h;
+}
+
 // not thread safe
 template <class Channel>
 class Keys {
@@ -53,6 +61,7 @@ class Keys {
         if (!_ot_packs.empty())
             return;
         auto start = measure::now();
+        cots = std::max(cots, ot_demand_hint());
         unsigned group = TRIPLE_OT_GROUP;
         if (group == 0) {
             const double per_ext = 0.8 * double(cheetah::ferret_param().n); // headroom for COT / MUX
