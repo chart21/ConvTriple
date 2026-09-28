@@ -1,6 +1,7 @@
 #ifndef ELEM_HPP_
 #define ELEM_HPP_
 
+#include "gemini/core/prg_party.h"
 #include <algorithm>
 #include <vector>
 
@@ -311,6 +312,13 @@ void elemwise_product_ab2(seal::SEALContext* context, IO::NetIO* io, seal::Encry
         }
 
         sci::PRG128 prg;
+#if PRG_SEED != -1
+        {
+            uint64_t seed[2];
+            gemini::party_seed(io->port, (uint64_t(3) << 32) | gemini::next_call(io->port), seed);
+            prg.reseed(seed);
+        }
+#endif
         vector<Plaintext> enc_noise(num_ct);
         // vector<vector<uint64_t>> secret_share(num_ct, vector<uint64_t>(slot_count, 0));
         vector<uint64_t> secret_share(num_ct * slot_count, 0);
@@ -382,6 +390,13 @@ void elemwise_product_ab(seal::SEALContext* context, IO::NetIO* io, seal::Encryp
         vector<Serializable<Ciphertext>> A1_ct(num_ct, encryptor->encrypt_zero());
 
         sci::PRG128 prg;
+#if PRG_SEED != -1
+        {
+            uint64_t seed[2];
+            gemini::party_seed(io->port, (uint64_t(3) << 32) | gemini::next_call(io->port), seed);
+            prg.reseed(seed);
+        }
+#endif
         vector<uint64_t> secret_share(num_ct * slot_count, 0);
         vector<Plaintext> enc_noise(num_ct);
         for (int i = 0; i < num_ct; i++) {
@@ -477,6 +492,13 @@ void elemwise_product_ab(seal::SEALContext* context, IO::NetIO* io, seal::Encryp
         vector<Serializable<Ciphertext>> A1_ct(num_ct, encryptor->encrypt_zero());
 
         sci::PRG128 prg;
+#if PRG_SEED != -1
+        {
+            uint64_t seed[2];
+            gemini::party_seed(io->port, (uint64_t(3) << 32) | gemini::next_call(io->port), seed);
+            prg.reseed(seed);
+        }
+#endif
         vector<uint64_t> secret_share(num_ct * slot_count, 0);
         vector<Plaintext> enc_noise(num_ct);
         for (int i = 0; i < num_ct; i++) {

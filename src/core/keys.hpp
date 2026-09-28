@@ -2,6 +2,7 @@
 #ifndef KEYS_HPP_
 #define KEYS_HPP_
 
+#include "gemini/core/prg_party.h"
 #include "core/conv_packed.hpp"
 #include "core/utils.hpp"
 #include "io/send.hpp"
@@ -53,6 +54,7 @@ class Keys {
 
     Keys(int party, const std::string& ip, unsigned port, unsigned threads, unsigned io_offset)
         : _threads(threads) {
+        gemini::prg_party() = party;
         auto start       = measure::now();
         const char* addr = ip.c_str();
         if (party == emp::ALICE)
@@ -169,7 +171,7 @@ void Keys<Channel>::setupBn(Channel** ios, const seal::SEALContext& ctx, const i
     seal_parms.set_coeff_modulus(CoeffModulus::Create(N, cipher_moduli_bits));
 
 #if PRG_SEED != -1
-    seal::prng_seed_type seed = {PRG_SEED};
+    seal::prng_seed_type seed = {gemini::party_seed64()};
     seal_parms.set_random_generator(std::make_shared<seal::Blake2xbPRNGFactory>(seed));
 #endif
 

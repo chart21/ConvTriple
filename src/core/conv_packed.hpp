@@ -50,6 +50,8 @@ class PackedConv2D {
                         const std::function<Job(size_t)>& prepare, bool is_ab, size_t threads) const;
 
   private:
+    // calls of encrypt and evaluate so far (each runs on one thread): the streams of a seeded run
+    mutable uint64_t enc_calls_ = 0, eval_calls_ = 0;
     struct Tiling;
     struct Ntt;  // the primes' NTT tables, for NTTs of weight polynomials outside SEAL
     struct Wire; // bit widths and sizes of the ciphertexts on the wire

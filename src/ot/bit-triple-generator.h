@@ -23,6 +23,7 @@ SOFTWARE.
 #ifndef TRIPLE_GENERATOR_H__
 #define TRIPLE_GENERATOR_H__
 // #include "OT/emp-ot.h"
+#include "gemini/core/prg_party.h"
 #include "ot/cheetah-ot_pack.h"
 #include "ot/ot.h"
 
@@ -119,7 +120,7 @@ class TripleGenerator {
         this->otpack = otpack;
         this->prg    = new sci::PRG128;
 #if PRG_SEED != -1
-        seed = _mm256_set1_epi32(PRG_SEED + io->port);
+        seed = _mm256_set1_epi64x(int64_t(gemini::party_seed64(io->port)));
         prg->reseed(&seed);
 #endif
 

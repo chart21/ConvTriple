@@ -1,3 +1,4 @@
+#include "gemini/core/prg_party.h"
 #include <fstream>
 
 #include "utils.hpp"
@@ -33,7 +34,7 @@ seal::SEALContext Utils::init_he_context() {
     params.set_plain_modulus(PLAIN_MOD);
 
 #if PRG_SEED != -1
-    seal::prng_seed_type seed = {PRG_SEED};
+    seal::prng_seed_type seed = {gemini::party_seed64()};
     params.set_random_generator(std::make_shared<seal::Blake2xbPRNGFactory>(seed));
 #endif
 

@@ -1,6 +1,7 @@
 #ifndef OT_PROTO_HPP_
 #define OT_PROTO_HPP_
 
+#include "gemini/core/prg_party.h"
 #include <algorithm>
 #include <initializer_list>
 #include <iostream>
@@ -290,8 +291,13 @@ void Server::tuple3_gen(TripleGenerator<Channel>& generator, Beaver3Tuples data,
     const size_t num_bytes = (num_tuples + 7) / 8;
 
     sci::PRG128 prg;
+#if PRG_SEED != -1
+    uint64_t seed[2];
+    gemini::party_seed(generator.io->port, (uint64_t(2) << 32) | gemini::next_call(generator.io->port), seed);
+#else
     std::random_device r;
     const uint64_t seed[2] = {r(), r()};
+#endif
     prg.reseed(seed);
 
     if (party_local_mode != 0) {
@@ -411,8 +417,13 @@ void Client::tuple3_gen(TripleGenerator<Channel>& generator, Beaver3Tuples data,
     const size_t num_bytes = (num_tuples + 7) / 8;
 
     sci::PRG128 prg;
+#if PRG_SEED != -1
+    uint64_t seed[2];
+    gemini::party_seed(generator.io->port, (uint64_t(2) << 32) | gemini::next_call(generator.io->port), seed);
+#else
     std::random_device r;
     const uint64_t seed[2] = {r(), r()};
+#endif
     prg.reseed(seed);
 
     if (party_local_mode != 0) {

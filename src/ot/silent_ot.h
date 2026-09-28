@@ -2,6 +2,7 @@
 #ifndef CHEETAH_SILENT_OT_H
 #define CHEETAH_SILENT_OT_H
 
+#include "gemini/core/prg_party.h"
 #include <emp-ot/cot.h>
 #include <emp-ot/ferret/ferret_cot.h>
 #include <math.h>
@@ -79,7 +80,7 @@ class SilentOT : public sci::OT<SilentOT<IO>> {
         ferret = new FerretCOT<IO>(party, threads, ios, malicious, run_setup, ferret_param(), pre_file);
 
 #if PRG_SEED != -1
-        seed = _mm_set1_epi32(PRG_SEED + ios[0]->port);
+        seed = _mm_set1_epi64x(int64_t(gemini::party_seed64(ios[0]->port, 1)));
         ferret->prg.reseed(&seed);
 #endif
         if (warm_up) {

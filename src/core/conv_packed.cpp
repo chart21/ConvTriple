@@ -1,3 +1,4 @@
+#include "gemini/core/prg_party.h"
 #include "core/conv_packed.hpp"
 
 #include <algorithm>
@@ -90,6 +91,8 @@ void parallel(size_t threads, size_t n, const std::function<void(size_t)>& f) {
 class AesPrng final : public seal::UniformRandomGenerator {
   public:
     AesPrng() : seal::UniformRandomGenerator(seal::prng_seed_type{}) {}
+    // the stream (a, b) of this party (seeded runs: PRG_SEED != -1)
+    AesPrng(uint64_t a, uint64_t b) : seal::UniformRandomGenerator(seal::prng_seed_type{}), prg_(&block_of(a, b)) {}
     // the same stream on both parties, for the public polynomial of a seeded ciphertext
     explicit AesPrng(const emp::block& seed) : seal::UniformRandomGenerator(seal::prng_seed_type{}), prg_(&seed) {}
 
@@ -98,8 +101,24 @@ class AesPrng final : public seal::UniformRandomGenerator {
     void refill_buffer() override { prg_.random_data(buffer_begin_, int(buffer_size_)); }
 
   private:
+    static const emp::block& block_of(uint64_t a, uint64_t b) {
+        thread_local emp::block seed;
+        uint64_t s[2];
+        gemini::party_seed(a, b, s);
+        seed = emp::makeBlock(s[1], s[0]);
+        return seed;
+    }
     emp::PRG prg_;
 };
+
+// a fresh generator for task k of the n-th call of a stage (random seeds when PRG_SEED == -1)
+std::shared_ptr<AesPrng> task_prng(uint64_t stage, uint64_t call, uint64_t k) {
+#if PRG_SEED != -1
+    return std::make_shared<AesPrng>((stage << 56) | call, k);
+#else
+    return std::make_shared<AesPrng>();
+#endif
+}
 
 // FIFO between the stages of conv_pipelined
 template <class T>
@@ -408,17 +427,17 @@ void PackedConv2D::encrypt(const Tiling& t, const Word* x, std::string& out, siz
     const auto& q    = cd.parms().coeff_modulus();
     const size_t N = wire.N, L = q.size();
     out.assign(t.tiles * t.in_groups * wire.in_bytes, '\0');
+    const uint64_t call = enc_calls_++;
     parallel(threads, t.tiles * t.in_groups, [&](size_t k) {
         seal::Plaintext pt;
         t.input_poly(x, k / t.in_groups, k % t.in_groups, pt);
         // c0 = -a*s + e + Delta*m with a uniform from a fresh public seed and e from a secret generator
-        thread_local emp::PRG seeds;
         emp::block seed;
-        seeds.random_block(&seed, 1);
+        task_prng(1, call, k)->generate(sizeof(seed), reinterpret_cast<seal::seal_byte*>(&seed));
         thread_local std::vector<uint64_t> c0, e;
         c0.resize(L * N), e.resize(L * N);
         seal::util::sample_poly_uniform(std::make_shared<AesPrng>(seed), cd.parms(), c0.data());
-        seal::util::SEAL_NOISE_SAMPLER(std::make_shared<AesPrng>(), cd.parms(), e.data());
+        seal::util::SEAL_NOISE_SAMPLER(task_prng(2, call, k), cd.parms(), e.data());
         for (size_t l = 0; l < L; l++) {
             uint64_t* c = c0.data() + l * N;
             seal::util::dyadic_product_coeffmod(c, sk_->data().data() + l * N, N, q[l], c);
@@ -548,12 +567,13 @@ void PackedConv2D::evaluate(const Tiling& t, const std::string& in, const Word* 
 
     // Mask with a random polynomial (its output coefficients are this party's share), flood, truncate
     // and drop the coefficients the other party does not need
+    const uint64_t call = eval_calls_++;
     const uint64_t t_mask = context_->first_context_data()->parms().plain_modulus().value() - 1;
     const size_t out_bytes = wire.out_bytes(t.required.size());
     out.assign(y.size() * out_bytes, '\0');
     parallel(threads, y.size(), [&](size_t k) {
         evaluator_->transform_from_ntt_inplace(y[k]);
-        auto prng = std::make_shared<AesPrng>();
+        auto prng = task_prng(3, call, k);
         gemini::flood_ciphertext(y[k], prng, *context_, *other_pk_, *evaluator_);
         seal::Plaintext mask(t.N);
         prng->generate(t.N * sizeof(uint64_t), reinterpret_cast<seal::seal_byte*>(mask.data()));

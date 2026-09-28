@@ -1,4 +1,5 @@
 //  Authors: Wen-jie Lu on 2021/9/15.
+#include "gemini/core/prg_party.h"
 #include "gemini/cheetah/hom_bn_ss.h"
 
 #include <seal/seal.h>
@@ -140,7 +141,7 @@ Code HomBNSS::setUp(uint64_t target_base_mod, const std::vector<seal::SEALContex
     crt_parms.set_coeff_modulus(primes);
 
 #if PRG_SEED != -1
-    seal::prng_seed_type seed = {PRG_SEED};
+    seal::prng_seed_type seed = {gemini::party_seed64()};
     crt_parms.set_random_generator(std::make_shared<seal::Blake2xbPRNGFactory>(seed));
 #endif
     // crt_parms.set_use_special_modulus(false);
