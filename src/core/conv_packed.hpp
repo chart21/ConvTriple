@@ -4,8 +4,9 @@
 // Conv triples on the CPU (SEAL) with the packing of the GPU path (troy's Conv2dHelper): an input
 // ciphertext holds a tile of several images and input channels, and one weight polynomial folds several
 // output channels into the product, so small feature maps no longer cost one output ciphertext per
-// output channel as in Cheetah's HomConv2DSS. Output ciphertexts are masked, noise-flooded, truncated
-// and stripped of unused coefficients like HomConv2DSS's.
+// output channel as in Cheetah's HomConv2DSS. Output ciphertexts are masked, noise-flooded and truncated
+// like HomConv2DSS's. On the wire, both directions carry exactly the bits decryption needs: an input
+// ciphertext is a seed and c0, an output ciphertext the kept high bits of c1 and of its used c0 coefficients.
 
 #include <cstdint>
 #include <functional>
@@ -50,7 +51,8 @@ class PackedConv2D {
 
   private:
     struct Tiling;
-    struct Ntt; // the primes' NTT tables, for NTTs of weight polynomials outside SEAL
+    struct Ntt;  // the primes' NTT tables, for NTTs of weight polynomials outside SEAL
+    struct Wire; // bit widths and sizes of the ciphertexts on the wire
 
     void encrypt(const Tiling& t, const Word* x, std::string& out, size_t threads) const;
     void evaluate(const Tiling& t, const std::string& in, const Word* x_own, const Word* w, Word* r,
@@ -62,7 +64,9 @@ class PackedConv2D {
     std::shared_ptr<seal::Evaluator> evaluator_;
     std::shared_ptr<seal::Decryptor> decryptor_;
     std::shared_ptr<seal::PublicKey> other_pk_;
+    std::shared_ptr<const seal::SecretKey> sk_;
     std::shared_ptr<const Ntt> ntt_;
+    std::shared_ptr<const Wire> wire_;
 };
 
 } // namespace Iface

@@ -4,18 +4,22 @@
 #include <chrono>
 #include <atomic>
 #include <climits>
+#include <cmath>
 #include <condition_variable>
 #include <deque>
 #include <map>
 #include <mutex>
 #include <cstring>
-#include <sstream>
+#include <stdexcept>
 #include <string>
 #include <thread>
 #include <unordered_map>
 #include <vector>
 
 #include "gemini/cheetah/hom_conv2d_ss.h"
+#include "seal/util/polyarithsmallmod.h"
+#include "seal/util/rlwe.h"
+#include "seal/util/scalingvariant.h"
 #include "gemini/core/util/ThreadPool.h"
 #include "emp-tool/utils/prg.h"
 
@@ -86,6 +90,8 @@ void parallel(size_t threads, size_t n, const std::function<void(size_t)>& f) {
 class AesPrng final : public seal::UniformRandomGenerator {
   public:
     AesPrng() : seal::UniformRandomGenerator(seal::prng_seed_type{}) {}
+    // the same stream on both parties, for the public polynomial of a seeded ciphertext
+    explicit AesPrng(const emp::block& seed) : seal::UniformRandomGenerator(seal::prng_seed_type{}), prg_(&seed) {}
 
   protected:
     seal::prng_type type() const noexcept override { return seal::prng_type::unknown; }
@@ -94,21 +100,6 @@ class AesPrng final : public seal::UniformRandomGenerator {
   private:
     emp::PRG prg_;
 };
-
-// Serialized SEAL objects back to back: each starts with a header that holds its size, so they can be
-// located first and then loaded in parallel
-template <class T>
-void load_all(const seal::SEALContext& context, const std::string& in, std::vector<T>& out, size_t threads) {
-    std::vector<size_t> offset(out.size() + 1, 0);
-    for (size_t i = 0; i < out.size(); i++) {
-        seal::Serialization::SEALHeader header;
-        std::memcpy(&header, in.data() + offset[i], sizeof(header));
-        offset[i + 1] = offset[i] + header.size;
-    }
-    parallel(threads, out.size(), [&](size_t i) {
-        out[i].load(context, reinterpret_cast<const seal::seal_byte*>(in.data()) + offset[i], offset[i + 1] - offset[i]);
-    });
-}
 
 // FIFO between the stages of conv_pipelined
 template <class T>
@@ -135,16 +126,50 @@ class Pipe {
     std::deque<T> queue_;
 };
 
-std::string concat(const std::vector<std::string>& parts) {
-    size_t n = 0;
-    for (auto& p : parts) n += p.size();
-    std::string s;
-    s.reserve(n);
-    for (auto& p : parts) s += p;
-    return s;
+// n values below 2^bits as a little-endian bit stream of ceil(n * bits / 8) bytes
+size_t packed_size(size_t n, int bits) { return (n * bits + 7) / 8; }
+
+void pack_bits(const uint64_t* v, size_t n, int bits, uint8_t* dst) {
+    unsigned __int128 acc = 0;
+    int have = 0;
+    for (size_t i = 0; i < n; i++) {
+        acc |= static_cast<unsigned __int128>(v[i]) << have;
+        for (have += bits; have >= 64; have -= 64, acc >>= 64, dst += 8) std::memcpy(dst, &acc, 8);
+    }
+    for (; have > 0; have -= 8, acc >>= 8) *dst++ = uint8_t(acc);
+}
+
+void unpack_bits(const uint8_t* src, size_t n, int bits, uint64_t* v) {
+    const uint64_t mask = bits == 64 ? ~uint64_t(0) : (uint64_t(1) << bits) - 1;
+    const uint8_t* end  = src + packed_size(n, bits);
+    unsigned __int128 acc = 0;
+    int have = 0;
+    for (size_t i = 0; i < n; i++) {
+        while (have < bits) {
+            uint64_t word = 0;
+            size_t take   = std::min<size_t>(8, end - src);
+            std::memcpy(&word, src, take);
+            acc |= static_cast<unsigned __int128>(word) << have;
+            src += take, have += 8 * int(take);
+        }
+        v[i] = uint64_t(acc) & mask;
+        acc >>= bits, have -= bits;
+    }
 }
 
 } // namespace
+
+// Ciphertexts on the wire. An input ciphertext (c0, c1) at both primes has c1 = a expanded from a public
+// 16-byte seed (a is uniform, taken as its NTT form), so only the seed and c0 travel, at the primes'
+// widths. An output ciphertext is truncated for decryption like HomConv2DSS's (one prime; c0 keeps its high
+// `c0_bits`, c1 its high `c1_bits`), and only the kept bits of c1 and of c0's used coefficients travel.
+struct PackedConv2D::Wire {
+    size_t N;
+    std::vector<int> q_bits; // widths of the primes of an input ciphertext
+    size_t in_bytes;         // one input ciphertext
+    int c0_shift, c0_bits, c1_shift, c1_bits;
+    size_t out_bytes(size_t used) const { return packed_size(used, c0_bits) + packed_size(N, c1_bits); }
+};
 
 // The block layout of troy's Conv2dHelper for a stride-1 convolution of bs H x W images. A polynomial
 // has b images x ci input channels x co output-channel slots of h x w tiles: an input tile at
@@ -156,9 +181,10 @@ struct PackedConv2D::Tiling {
     size_t sh, sw, tiles, in_groups, out_groups, yh, yw, oh, ow;
     std::vector<size_t> required; // output coefficients of one ciphertext, (image, filter, i, j)-major
 
-    Tiling(size_t bs, size_t ic, size_t oc, size_t H, size_t W, size_t kh, size_t kw, size_t N)
-        : bs(bs), ic(ic), oc(oc), H(H), W(W), kh(kh), kw(kw), N(N) {
-        // Conv2dHelper::determine_block, EncryptLeft: fewest input plus output ciphertexts
+    Tiling(size_t bs, size_t ic, size_t oc, size_t H, size_t W, size_t kh, size_t kw, const Wire& wire)
+        : bs(bs), ic(ic), oc(oc), H(H), W(W), kh(kh), kw(kw), N(wire.N) {
+        // Conv2dHelper::determine_block's search, for the fewest bytes on the wire: an input ciphertext
+        // costs about twice an output one, so the layout leans towards fewer inputs
         size_t best = SIZE_MAX;
         for (size_t b_ = bs; b_ >= 1; b_--)
             for (size_t h_ = std::min(H, N / b_); h_ >= kh; h_--)
@@ -169,7 +195,8 @@ struct PackedConv2D::Tiling {
                             continue;
                         size_t spatial = ceil_div(bs, b_) * ceil_div(H - kh + 1, h_ - kh + 1)
                                          * ceil_div(W - kw + 1, w_ - kw + 1);
-                        size_t cost = spatial * (ceil_div(ic, ci_) + ceil_div(oc, co_));
+                        size_t used = b_ * co_ * (h_ - kh + 1) * (w_ - kw + 1);
+                        size_t cost = spatial * (ceil_div(ic, ci_) * wire.in_bytes + ceil_div(oc, co_) * wire.out_bytes(used));
                         if (cost < best)
                             best = cost, b = b_, h = h_, w = w_, ci = ci_, co = co_;
                     }
@@ -312,6 +339,31 @@ void PackedConv2D::setUp(const seal::SEALContext& context, const seal::SecretKey
     evaluator_ = std::make_shared<seal::Evaluator>(*context_);
     decryptor_ = std::make_shared<seal::Decryptor>(*context_, sk);
     other_pk_  = std::move(other_pk);
+    sk_        = std::make_shared<seal::SecretKey>(sk);
+
+    // truncate_for_decryption's widths (hom_conv2d_ss.cc): c0 drops n_delta_bits - 1 low bits (one more
+    // when t is not a power of two), c1 n_delta_bits - n_var_bits
+    auto wire = std::make_shared<Wire>();
+    {
+        const auto& first = context_->first_context_data()->parms();
+        const auto& last  = context_->last_context_data()->parms();
+        wire->N           = first.poly_modulus_degree();
+        wire->in_bytes    = sizeof(emp::block);
+        for (const auto& q : first.coeff_modulus()) {
+            wire->q_bits.push_back(q.bit_count());
+            wire->in_bytes += packed_size(wire->N, q.bit_count());
+        }
+        const int q_bits       = last.coeff_modulus()[0].bit_count();
+        const uint64_t t       = last.plain_modulus().value();
+        const int n_delta_bits = q_bits - last.plain_modulus().bit_count();
+        const int one_more_bit = (t & (t - 1)) == 0 ? 0 : 1;
+        const int n_var_bits   = int(std::log2(12. * double(wire->N) * std::sqrt(1 / 18.)));
+        wire->c0_shift         = std::clamp(n_delta_bits - 1 - one_more_bit, 0, 63);
+        wire->c1_shift         = std::clamp(n_delta_bits - n_var_bits, 0, 63);
+        wire->c0_bits          = q_bits - wire->c0_shift;
+        wire->c1_bits          = q_bits - wire->c1_shift;
+    }
+    wire_ = wire;
 
     auto cd        = context_->first_context_data();
     auto ntt       = std::make_shared<Ntt>();
@@ -351,28 +403,68 @@ void PackedConv2D::setUp(const seal::SEALContext& context, const seal::SecretKey
 }
 
 void PackedConv2D::encrypt(const Tiling& t, const Word* x, std::string& out, size_t threads) const {
-    std::vector<std::string> parts(t.tiles * t.in_groups);
-    parallel(threads, parts.size(), [&](size_t k) {
+    const Wire& wire = *wire_;
+    const auto& cd   = *context_->first_context_data();
+    const auto& q    = cd.parms().coeff_modulus();
+    const size_t N = wire.N, L = q.size();
+    out.assign(t.tiles * t.in_groups * wire.in_bytes, '\0');
+    parallel(threads, t.tiles * t.in_groups, [&](size_t k) {
         seal::Plaintext pt;
         t.input_poly(x, k / t.in_groups, k % t.in_groups, pt);
-        std::stringstream ss;
-        encryptor_->encrypt_symmetric(pt).save(ss); // seeded: half a ciphertext on the wire
-        parts[k] = ss.str();
+        // c0 = -a*s + e + Delta*m with a uniform from a fresh public seed and e from a secret generator
+        thread_local emp::PRG seeds;
+        emp::block seed;
+        seeds.random_block(&seed, 1);
+        thread_local std::vector<uint64_t> c0, e;
+        c0.resize(L * N), e.resize(L * N);
+        seal::util::sample_poly_uniform(std::make_shared<AesPrng>(seed), cd.parms(), c0.data());
+        seal::util::SEAL_NOISE_SAMPLER(std::make_shared<AesPrng>(), cd.parms(), e.data());
+        for (size_t l = 0; l < L; l++) {
+            uint64_t* c = c0.data() + l * N;
+            seal::util::dyadic_product_coeffmod(c, sk_->data().data() + l * N, N, q[l], c);
+            seal::util::negate_poly_coeffmod(c, N, q[l], c);
+            seal::util::inverse_ntt_negacyclic_harvey(c, cd.small_ntt_tables()[l]);
+            seal::util::add_poly_coeffmod(c, e.data() + l * N, N, q[l], c);
+        }
+        seal::util::multiply_add_plain_with_scaling_variant(pt, cd, seal::util::RNSIter(c0.data(), N));
+        auto* dst = reinterpret_cast<uint8_t*>(out.data()) + k * wire.in_bytes;
+        std::memcpy(dst, &seed, sizeof(seed));
+        dst += sizeof(seed);
+        for (size_t l = 0; l < L; l++) {
+            pack_bits(c0.data() + l * N, N, wire.q_bits[l], dst);
+            dst += packed_size(N, wire.q_bits[l]);
+        }
     });
-    out = concat(parts);
 }
 
 void PackedConv2D::evaluate(const Tiling& t, const std::string& in, const Word* x_own, const Word* w,
                             Word* r, std::string& out, size_t threads) const {
+    const Wire& wire = *wire_;
     std::vector<seal::Ciphertext> x(t.tiles * t.in_groups);
-    load_all(*context_, in, x, threads);
+    if (in.size() != x.size() * wire.in_bytes)
+        throw std::runtime_error("PackedConv2D: unexpected size of the encrypted input");
     parallel(threads, x.size(), [&](size_t k) {
+        // c0 as sent, c1 = a straight in NTT form from the seed
+        const auto& cd  = *context_->first_context_data();
+        const size_t N = wire.N, L = cd.parms().coeff_modulus().size();
+        const auto* src = reinterpret_cast<const uint8_t*>(in.data()) + k * wire.in_bytes;
+        emp::block seed;
+        std::memcpy(&seed, src, sizeof(seed));
+        src += sizeof(seed);
+        x[k].resize(*context_, context_->first_parms_id(), 2);
+        uint64_t* c0 = x[k].data(0);
+        for (size_t l = 0; l < L; l++) {
+            unpack_bits(src, N, wire.q_bits[l], c0 + l * N);
+            src += packed_size(N, wire.q_bits[l]);
+        }
         if (x_own) { // conv(x_other + x_own, w): the own-share term belongs to the triple too
             seal::Plaintext pt;
             t.input_poly(x_own, k / t.in_groups, k % t.in_groups, pt);
-            evaluator_->add_plain_inplace(x[k], pt);
+            seal::util::multiply_add_plain_with_scaling_variant(pt, cd, seal::util::RNSIter(c0, N));
         }
-        evaluator_->transform_to_ntt_inplace(x[k]);
+        for (size_t l = 0; l < L; l++) seal::util::ntt_negacyclic_harvey(c0 + l * N, cd.small_ntt_tables()[l]);
+        seal::util::sample_poly_uniform(std::make_shared<AesPrng>(seed), cd.parms(), x[k].data(1));
+        x[k].is_ntt_form() = true;
     });
 
     // y[t][o] = sum_g x[t][g] * w[o][g], per output group: its weight polynomials are NTT-transformed
@@ -456,8 +548,9 @@ void PackedConv2D::evaluate(const Tiling& t, const std::string& in, const Word* 
 
     // Mask with a random polynomial (its output coefficients are this party's share), flood, truncate
     // and drop the coefficients the other party does not need
-    std::vector<std::string> parts(y.size());
     const uint64_t t_mask = context_->first_context_data()->parms().plain_modulus().value() - 1;
+    const size_t out_bytes = wire.out_bytes(t.required.size());
+    out.assign(y.size() * out_bytes, '\0');
     parallel(threads, y.size(), [&](size_t k) {
         evaluator_->transform_from_ntt_inplace(y[k]);
         auto prng = std::make_shared<AesPrng>();
@@ -468,24 +561,51 @@ void PackedConv2D::evaluate(const Tiling& t, const std::string& in, const Word* 
         evaluator_->sub_plain_inplace(y[k], mask);
         t.outputs(k / t.out_groups, k % t.out_groups, [&](size_t out, size_t coeff) { r[out] = Word(mask[coeff]); });
         gemini::truncate_for_decryption(y[k], *evaluator_, *context_);
-        gemini::remove_unused_coeffs(y[k], *evaluator_, t.required);
-        std::stringstream os;
-        y[k].save(os);
-        parts[k] = os.str();
+        // the kept high bits of c0's used coefficients, then of c1
+        thread_local std::vector<uint64_t> v;
+        v.resize(std::max(t.required.size(), t.N));
+        const uint64_t *c0 = y[k].data(0), *c1 = y[k].data(1);
+        uint64_t low = 0;
+        for (size_t j = 0; j < t.required.size(); j++) {
+            low |= c0[t.required[j]] & ((uint64_t(1) << wire.c0_shift) - 1);
+            v[j] = c0[t.required[j]] >> wire.c0_shift;
+        }
+        auto* dst = reinterpret_cast<uint8_t*>(out.data()) + k * out_bytes;
+        pack_bits(v.data(), t.required.size(), wire.c0_bits, dst);
+        dst += packed_size(t.required.size(), wire.c0_bits);
+        for (size_t i = 0; i < t.N; i++) {
+            low |= c1[i] & ((uint64_t(1) << wire.c1_shift) - 1);
+            v[i] = c1[i] >> wire.c1_shift;
+        }
+        pack_bits(v.data(), t.N, wire.c1_bits, dst);
+        if (low || y[k].coeff_modulus_size() != 1)
+            throw std::runtime_error("PackedConv2D: output not truncated as expected");
     });
-    out = concat(parts);
 }
 
 void PackedConv2D::decrypt(const Tiling& t, const std::string& in, Word* c, bool accumulate,
                            size_t threads) const {
-    std::vector<seal::Ciphertext> y(t.tiles * t.out_groups);
-    load_all(*context_, in, y, threads);
-    parallel(threads, y.size(), [&](size_t k) {
+    const Wire& wire       = *wire_;
+    const size_t out_bytes = wire.out_bytes(t.required.size()), cts = t.tiles * t.out_groups;
+    if (in.size() != cts * out_bytes)
+        throw std::runtime_error("PackedConv2D: unexpected size of the encrypted output");
+    parallel(threads, cts, [&](size_t k) {
+        seal::Ciphertext ct(*context_, context_->last_parms_id());
+        ct.resize(2);
+        uint64_t *c0 = ct.data(0), *c1 = ct.data(1);
+        std::fill_n(c0, t.N, 0);
+        thread_local std::vector<uint64_t> v;
+        v.resize(std::max(t.required.size(), t.N));
+        const auto* src = reinterpret_cast<const uint8_t*>(in.data()) + k * out_bytes;
+        unpack_bits(src, t.required.size(), wire.c0_bits, v.data());
+        for (size_t j = 0; j < t.required.size(); j++) c0[t.required[j]] = v[j] << wire.c0_shift;
+        unpack_bits(src + packed_size(t.required.size(), wire.c0_bits), t.N, wire.c1_bits, v.data());
+        for (size_t i = 0; i < t.N; i++) c1[i] = v[i] << wire.c1_shift;
         seal::Plaintext pt;
-        decryptor_->decrypt(y[k], pt);
+        decryptor_->decrypt(ct, pt);
         t.outputs(k / t.out_groups, k % t.out_groups, [&](size_t out, size_t coeff) {
-            Word v = coeff < pt.coeff_count() ? Word(pt[coeff]) : 0;
-            c[out] = accumulate ? Word(c[out] + v) : v;
+            Word m = coeff < pt.coeff_count() ? Word(pt[coeff]) : 0;
+            c[out] = accumulate ? Word(c[out] + m) : m;
         });
     });
 }
@@ -495,7 +615,7 @@ void PackedConv2D::conv(IO::NetIO** ios, int party, const Word* x, const Word* w
                         size_t threads) const {
     size_t oh = ih - kh + 1, ow = iw - kw + 1;
     for (size_t cur = 0; cur < bs; cur += kMaxBatch) {
-        Tiling t(std::min(kMaxBatch, bs - cur), ic, oc, ih, iw, kh, kw, POLY_MOD);
+        Tiling t(std::min(kMaxBatch, bs - cur), ic, oc, ih, iw, kh, kw, *wire_);
         const Word* xc = x ? x + cur * ic * ih * iw : nullptr;
         Word* cc       = c + cur * oc * oh * ow;
         std::string mine, theirs, y;
@@ -544,7 +664,7 @@ void PackedConv2D::conv_pipelined(IO::NetIO** ios, int party, const std::vector<
             size_t oh = job->ih - job->kh + 1, ow = job->iw - job->kw + 1;
             for (size_t cur = 0; cur < job->bs; cur += kMaxBatch) {
                 auto t = std::make_shared<const Tiling>(std::min(kMaxBatch, job->bs - cur), job->ic, job->oc, job->ih,
-                                                        job->iw, job->kh, job->kw, POLY_MOD);
+                                                        job->iw, job->kh, job->kw, *wire_);
                 f(Chunk{job, t, job->x ? job->x + cur * job->ic * job->ih * job->iw : nullptr,
                         job->c + cur * job->oc * oh * ow, cur + kMaxBatch >= job->bs});
             }
