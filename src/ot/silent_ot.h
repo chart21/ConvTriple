@@ -509,6 +509,73 @@ class SilentOT : public sci::OT<SilentOT<IO>> {
         }
     }
 
+    // send_rot_bits with k-bit messages (k <= 64), as k bit planes: bit p of the messages of OT 8i + j is
+    // bit j of m0[p][i] / m1[p][i]. The k bits come from one hash per message (plane 0 = send_rot_bits'
+    // bit), so a COT carries k independent message bits for the price of one.
+    void send_rot_bitplanes(uint8_t* const* m0, uint8_t* const* m1, int k, int64_t length) {
+        block s;
+        ferret->prg.random_block(&s, 1);
+        ferret->io->send_block(&s, 1);
+        ferret->mitccrh.setS(s);
+        ferret->io->flush();
+        std::vector<block> buf(std::min<int64_t>(rot_chunk, length));
+        block pad[2 * ot_bsize];
+        for (int64_t i0 = 0; i0 < length; i0 += rot_chunk) {
+            int64_t n = std::min<int64_t>(rot_chunk, length - i0);
+            timed_rcot(buf.data(), n);
+            for (int64_t i = 0; i < n; i += ot_bsize) {
+                for (int j = 0; j < ot_bsize; j++) {
+                    pad[2 * j]     = buf[i + j];
+                    pad[2 * j + 1] = buf[i + j] ^ ferret->Delta;
+                }
+                ferret->mitccrh.template hash<ot_bsize, 2>(pad);
+                uint64_t h0[ot_bsize], h1[ot_bsize];
+                for (int j = 0; j < ot_bsize; j++) {
+                    h0[j] = uint64_t(_mm_cvtsi128_si64(pad[2 * j]));
+                    h1[j] = uint64_t(_mm_cvtsi128_si64(pad[2 * j + 1]));
+                }
+                for (int p = 0; p < k; p++) {
+                    uint8_t b0 = 0, b1 = 0;
+                    for (int j = 0; j < ot_bsize; j++) {
+                        b0 |= uint8_t((h0[j] >> p) & 1) << j;
+                        b1 |= uint8_t((h1[j] >> p) & 1) << j;
+                    }
+                    m0[p][(i0 + i) / 8] = b0;
+                    m1[p][(i0 + i) / 8] = b1;
+                }
+            }
+        }
+    }
+
+    // receiver side of send_rot_bitplanes: random choice bits c and the k chosen message bit planes mc
+    void recv_rot_bitplanes(uint8_t* const* mc, uint8_t* c, int k, int64_t length) {
+        block s;
+        ferret->io->recv_block(&s, 1);
+        ferret->mitccrh.setS(s);
+        std::vector<block> buf(std::min<int64_t>(rot_chunk, length));
+        block pad[ot_bsize];
+        for (int64_t i0 = 0; i0 < length; i0 += rot_chunk) {
+            int64_t n = std::min<int64_t>(rot_chunk, length - i0);
+            timed_rcot(buf.data(), n);
+            for (int64_t i = 0; i < n; i += ot_bsize) {
+                uint8_t bc = 0;
+                for (int j = 0; j < ot_bsize; j++) {
+                    pad[j] = buf[i + j];
+                    bc |= uint8_t(_mm_cvtsi128_si64(pad[j]) & 1) << j;
+                }
+                ferret->mitccrh.template hash<ot_bsize, 1>(pad);
+                uint64_t h[ot_bsize];
+                for (int j = 0; j < ot_bsize; j++) h[j] = uint64_t(_mm_cvtsi128_si64(pad[j]));
+                for (int p = 0; p < k; p++) {
+                    uint8_t bm = 0;
+                    for (int j = 0; j < ot_bsize; j++) bm |= uint8_t((h[j] >> p) & 1) << j;
+                    mc[p][(i0 + i) / 8] = bm;
+                }
+                c[(i0 + i) / 8] = bc;
+            }
+        }
+    }
+
     // random message, random choice
     template <typename T>
     void send_ot_rm_rc(T* data0, T* data1, int64_t length, int l) {

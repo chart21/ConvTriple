@@ -106,8 +106,14 @@ void dump_tuple(const Buffers& alice, const Buffers& bob, size_t i) {
     dump_bit("  abc", alice.abc.get(), bob.abc.get(), a & b & c, i);
 }
 
-bool check_results(const Buffers& alice, const Buffers& bob, size_t num_tuples) {
+bool check_results(const Buffers& alice, const Buffers& bob, size_t num_tuples, bool local_bc) {
     Buffers revealed(alice.num_bytes);
+    if (local_bc)  // .b known entirely to ALICE (BOB's share 0), .c entirely to BOB (ALICE's share 0)
+        for (size_t i = 0; i < alice.num_bytes; ++i)
+            if (bob.b[i] != 0 || alice.c[i] != 0) {
+                std::cout << std::format("party-local b/c violated at byte {}\n", i);
+                return false;
+            }
 
     for (size_t i = 0; i < alice.num_bytes; ++i) {
         revealed.a[i]   = alice.a[i] ^ bob.a[i];
@@ -157,7 +163,7 @@ void recv_buffers(IO::NetIO& io, Buffers& buffers) {
     io.recv_data(buffers.abc.get(), static_cast<int>(buffers.num_bytes));
 }
 
-bool run(int party, const std::string& ip, int port, size_t num_tuples) {
+bool run(int party, const std::string& ip, int port, size_t num_tuples, bool local_bc) {
     const auto name      = party_name(party);
     const size_t num_bytes = (num_tuples + 7) / 8;
     Buffers buffers(num_bytes);
@@ -170,10 +176,9 @@ bool run(int party, const std::string& ip, int port, size_t num_tuples) {
     auto& keys = Iface::Keys<IO::NetIO>::instance(party, ip, port, threads, io_offset);
     auto** ios = keys.get_ios(threads);
 
-    TripleGenerator<IO::NetIO> triple_gen(party, ios[0], keys.get_otpack(0), false);
 
     auto tuple_gen_start = measure::now();
-    Iface::generateBool3TupleCheetah(buffers.as_tuples(), num_tuples, ip, port, party, 1, 1);
+    Iface::generateBool3TupleCheetah(buffers.as_tuples(), num_tuples, ip, port, party, 1, 1, local_bc);
     const auto secs_passed = Utils::to_sec(Utils::time_diff(tuple_gen_start));
     std::cout << std::format("{}: tuples generated in: {:.2f} seconds / {:.2f} triples per second\n",
         party_name(party), secs_passed, static_cast<double>(num_tuples) / secs_passed);
@@ -185,7 +190,7 @@ bool run(int party, const std::string& ip, int port, size_t num_tuples) {
     } else {
         Buffers bob_buffers(num_bytes);
         recv_buffers(*ios[0], bob_buffers);
-        passed = check_results(buffers, bob_buffers, num_tuples);
+        passed = check_results(buffers, bob_buffers, num_tuples, local_bc);
         std::cout << (passed ? "TUPLE GENERATION TEST PASSED\n" : "TUPLE GENERATION TEST FAILED\n");
     }
 
@@ -196,8 +201,8 @@ bool run(int party, const std::string& ip, int port, size_t num_tuples) {
 } // namespace
 
 int main(int argc, char** argv) {
-    if (argc < 2 || argc > 5) {
-        std::cout << argv[0] << " <party: 0=ALICE, 1=BOB> [port] [host] [num_tuples]\n";
+    if (argc < 2 || argc > 6) {
+        std::cout << argv[0] << " <party: 0=ALICE, 1=BOB> [port] [host] [num_tuples] [local_bc: 0/1]\n";
         return EXEC_FAILED;
     }
 
@@ -211,11 +216,12 @@ int main(int argc, char** argv) {
     const int port           = argc >= 3 ? std::strtol(argv[2], nullptr, 10) : 7777;
     const std::string host   = argc >= 4 ? argv[3] : "127.0.0.1";
     const size_t num_tuples  = argc >= 5 ? std::strtoull(argv[4], nullptr, 10) : 8;
+    const bool local_bc      = argc >= 6 && std::strtol(argv[5], nullptr, 10) != 0;
     const std::string ip     = party == emp::BOB ? host : "";
     const auto start         = measure::now();
 
     std::cout << "TUPLE3: starting the test\n";
-    const bool passed = run(party, ip, port, num_tuples);
+    const bool passed = run(party, ip, port, num_tuples, local_bc);
 
     const auto secs_passed = Utils::to_sec(Utils::time_diff(start));
     std::cout << std::format("{}: seconds passed: {}\n", party_name(party), secs_passed);

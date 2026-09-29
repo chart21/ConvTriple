@@ -135,6 +135,66 @@ void cot_multiply_shares(int party, const sci::OTPack<IO>* otpack, uint8_t* a, u
     }
 }
 
+/// Shares of x[p] * y (p < k) for k bit-packed shared values x[p] with one common factor y. One random OT
+/// per direction carries all k products in its k message bits (send/recv_rot_bitplanes), where
+/// cot_multiply_shares takes one OT per product: per element and party, 1 choice-correction bit plus k
+/// masked bits. A party whose y share is a fresh random value can take it from its receiving OTs'
+/// random choices instead (y is written) and sends no correction: {alice,bob}_y_from_choice, by role.
+template <typename IO>
+void cot_outer_multiply(int party, const sci::OTPack<IO>* otpack, uint8_t* const* x, int k, uint8_t* y,
+                        uint8_t* const* out, size_t num_shares, bool alice_y_from_choice, bool bob_y_from_choice) {
+    const size_t nb = (num_shares + 7) / 8;
+    const bool my_choice = party == emp::ALICE ? alice_y_from_choice : bob_y_from_choice;
+    const bool their_choice = party == emp::ALICE ? bob_y_from_choice : alice_y_from_choice;
+    std::vector<uint8_t> rs(k * nb), r0(k * nb), r1(k * nb), s(nb);
+    std::vector<uint8_t*> prs(k), pr0(k), pr1(k);
+    for (int p = 0; p < k; p++) prs[p] = rs.data() + p * nb, pr0[p] = r0.data() + p * nb, pr1[p] = r1.data() + p * nb;
+
+    switch (party) {  // same directions as cot_multiply_shares
+        case emp::ALICE:
+            otpack->silent_ot_reversed->recv_rot_bitplanes(prs.data(), s.data(), k, int64_t(num_shares));
+            otpack->io->flush();
+            otpack->silent_ot->send_rot_bitplanes(pr0.data(), pr1.data(), k, int64_t(num_shares));
+            break;
+        case emp::BOB:
+            otpack->silent_ot_reversed->send_rot_bitplanes(pr0.data(), pr1.data(), k, int64_t(num_shares));
+            otpack->io->flush();
+            otpack->silent_ot->recv_rot_bitplanes(prs.data(), s.data(), k, int64_t(num_shares));
+            break;
+    }
+    otpack->io->flush();
+
+    // [choice correction] + k masked planes, one message each way
+    const size_t my_len = (my_choice ? 0 : nb) + k * nb, their_len = (their_choice ? 0 : nb) + k * nb;
+    std::vector<uint8_t> mine(my_len), theirs(their_len);
+    uint8_t* w = mine.data();
+    if (my_choice)
+        std::memcpy(y, s.data(), nb);
+    else
+        for (size_t i = 0; i < nb; ++i) *w++ = s[i] ^ y[i];
+    for (int p = 0; p < k; p++)
+        for (size_t i = 0; i < nb; ++i) *w++ = x[p][i] ^ r0[p * nb + i] ^ r1[p * nb + i];
+    if (party == emp::ALICE) {
+        otpack->io->send_data(mine.data(), my_len);
+        otpack->io->recv_data(theirs.data(), their_len);
+    } else {
+        otpack->io->recv_data(theirs.data(), their_len);
+        otpack->io->send_data(mine.data(), my_len);
+    }
+    otpack->io->flush();
+
+    // as in cot_multiply_shares: receiver output rs ^ (y & m), sender output e ? r1 : r0, plus the local product
+    const uint8_t* e = their_choice ? nullptr : theirs.data();
+    const uint8_t* m = theirs.data() + (their_choice ? 0 : nb);
+    for (int p = 0; p < k; p++)
+        for (size_t i = 0; i < nb; ++i) {
+            const uint8_t ei = e ? e[i] : 0;
+            const uint8_t rcv = rs[p * nb + i] ^ (y[i] & m[p * nb + i]);
+            const uint8_t snd = (~ei & r0[p * nb + i]) ^ (ei & r1[p * nb + i]);
+            out[p][i] = (x[p][i] & y[i]) ^ rcv ^ snd;
+        }
+}
+
 static constexpr size_t LEN(const size_t& numTriple, const bool& packed) {
     return numTriple / (packed ? 8 : 1);
 }
@@ -304,18 +364,14 @@ void Server::tuple3_gen(TripleGenerator<Channel>& generator, Beaver3Tuples data,
     } else {
         Server::triple_gen(generator, data.a, data.b, data.ab, num_bytes, packed,
                            triple_gen_method);
-        prg.random_data(data.c, num_bytes);
     }
 
-    auto lhs = std::make_unique<uint8_t[]>(3 * num_bytes);
-    auto rhs = std::make_unique<uint8_t[]>(3 * num_bytes);
-    auto out = std::make_unique<uint8_t[]>(3 * num_bytes);
-
-    pack_buffers({data.a, data.b, data.ab}, lhs.get(), num_bytes);
-    pack_buffers({data.c, data.c, data.c}, rhs.get(), num_bytes);
-    cot_multiply_shares(emp::ALICE, generator.otpack, lhs.get(), rhs.get(), out.get(),
-                        3 * num_tuples);
-    unpack_buffers(out.get(), {data.ac, data.bc, data.abc}, num_bytes);
+    // ac, bc, abc: one OT per direction for all three. A fresh random c share is the OTs' choice (no
+    // correction); only a party-local zero c (the real P0 in mode 1, ALICE role here) is corrected.
+    uint8_t* const xs[3] = {data.a, data.b, data.ab};
+    uint8_t* const outs[3] = {data.ac, data.bc, data.abc};
+    cot_outer_multiply(emp::ALICE, generator.otpack, xs, 3, data.c, outs, num_tuples,
+                       party_local_mode != 1, party_local_mode != 2);
 }
 
 template <class Channel>
@@ -329,19 +385,19 @@ void Server::tuple4_gen(TripleGenerator<Channel>& generator, Beaver4Tuples data,
     Server::triple_gen(generator, data.a, data.b, data.ab, num_bytes, packed, triple_gen_method);
     Server::triple_gen(generator, data.c, data.d, data.cd, num_bytes, packed, triple_gen_method);
 
+    // the 9 products {a, b, ab} x {c, d, cd}: one OT per direction and factor y in {c, d, cd} (all
+    // three in one call), carrying the three products with a, b and ab
     auto lhs = std::make_unique<uint8_t[]>(9 * num_bytes);
-    auto rhs = std::make_unique<uint8_t[]>(9 * num_bytes);
+    auto rhs = std::make_unique<uint8_t[]>(3 * num_bytes);
     auto out = std::make_unique<uint8_t[]>(9 * num_bytes);
-
-    pack_buffers({data.a, data.a, data.b, data.b, data.ab, data.ab, data.a, data.b, data.ab},
-                 lhs.get(), num_bytes);
-    pack_buffers({data.c, data.d, data.c, data.d, data.c, data.d, data.cd, data.cd, data.cd},
-                 rhs.get(), num_bytes);
-    cot_multiply_shares(emp::ALICE, generator.otpack, lhs.get(), rhs.get(), out.get(),
-                        9 * num_tuples);
+    pack_buffers({data.a, data.a, data.a, data.b, data.b, data.b, data.ab, data.ab, data.ab}, lhs.get(), num_bytes);
+    pack_buffers({data.c, data.d, data.cd}, rhs.get(), num_bytes);
+    uint8_t* const xs[3] = {lhs.get(), lhs.get() + 3 * num_bytes, lhs.get() + 6 * num_bytes};
+    uint8_t* const outs[3] = {out.get(), out.get() + 3 * num_bytes, out.get() + 6 * num_bytes};
+    cot_outer_multiply(emp::ALICE, generator.otpack, xs, 3, rhs.get(), outs, 3 * num_tuples, false, false);
     unpack_buffers(out.get(),
-                   {data.ac, data.ad, data.bc, data.bd, data.abc, data.abd, data.acd,
-                    data.bcd, data.abcd},
+                   {data.ac, data.ad, data.acd, data.bc, data.bd, data.bcd, data.abc, data.abd,
+                    data.abcd},
                    num_bytes);
 }
 
@@ -424,19 +480,14 @@ void Client::tuple3_gen(TripleGenerator<Channel>& generator, Beaver3Tuples data,
         }
         cot_multiply_shares(emp::BOB, generator.otpack, data.a, data.b, data.ab, num_tuples);
     } else {
-    Client::triple_gen(generator, data.a, data.b, data.ab, num_bytes, packed, triple_gen_method);
-    prg.random_data(data.c, num_bytes);
+        Client::triple_gen(generator, data.a, data.b, data.ab, num_bytes, packed, triple_gen_method);
     }
 
-    auto lhs = std::make_unique<uint8_t[]>(3 * num_bytes);
-    auto rhs = std::make_unique<uint8_t[]>(3 * num_bytes);
-    auto out = std::make_unique<uint8_t[]>(3 * num_bytes);
-
-    pack_buffers({data.a, data.b, data.ab}, lhs.get(), num_bytes);
-    pack_buffers({data.c, data.c, data.c}, rhs.get(), num_bytes);
-    cot_multiply_shares(emp::BOB, generator.otpack, lhs.get(), rhs.get(), out.get(),
-                        3 * num_tuples);
-    unpack_buffers(out.get(), {data.ac, data.bc, data.abc}, num_bytes);
+    // see Server::tuple3_gen (BOB role here: the real P0's zero c in mode 1 is ours)
+    uint8_t* const xs[3] = {data.a, data.b, data.ab};
+    uint8_t* const outs[3] = {data.ac, data.bc, data.abc};
+    cot_outer_multiply(emp::BOB, generator.otpack, xs, 3, data.c, outs, num_tuples,
+                       party_local_mode != 2, party_local_mode != 1);
 }
 
 template <class Channel>
@@ -450,19 +501,19 @@ void Client::tuple4_gen(TripleGenerator<Channel>& generator, Beaver4Tuples data,
     Client::triple_gen(generator, data.a, data.b, data.ab, num_bytes, packed, triple_gen_method);
     Client::triple_gen(generator, data.c, data.d, data.cd, num_bytes, packed, triple_gen_method);
 
+    // the 9 products {a, b, ab} x {c, d, cd}: one OT per direction and factor y in {c, d, cd} (all
+    // three in one call), carrying the three products with a, b and ab
     auto lhs = std::make_unique<uint8_t[]>(9 * num_bytes);
-    auto rhs = std::make_unique<uint8_t[]>(9 * num_bytes);
+    auto rhs = std::make_unique<uint8_t[]>(3 * num_bytes);
     auto out = std::make_unique<uint8_t[]>(9 * num_bytes);
-
-    pack_buffers({data.a, data.a, data.b, data.b, data.ab, data.ab, data.a, data.b, data.ab},
-                 lhs.get(), num_bytes);
-    pack_buffers({data.c, data.d, data.c, data.d, data.c, data.d, data.cd, data.cd, data.cd},
-                 rhs.get(), num_bytes);
-    cot_multiply_shares(emp::BOB, generator.otpack, lhs.get(), rhs.get(), out.get(),
-                        9 * num_tuples);
+    pack_buffers({data.a, data.a, data.a, data.b, data.b, data.b, data.ab, data.ab, data.ab}, lhs.get(), num_bytes);
+    pack_buffers({data.c, data.d, data.cd}, rhs.get(), num_bytes);
+    uint8_t* const xs[3] = {lhs.get(), lhs.get() + 3 * num_bytes, lhs.get() + 6 * num_bytes};
+    uint8_t* const outs[3] = {out.get(), out.get() + 3 * num_bytes, out.get() + 6 * num_bytes};
+    cot_outer_multiply(emp::BOB, generator.otpack, xs, 3, rhs.get(), outs, 3 * num_tuples, false, false);
     unpack_buffers(out.get(),
-                   {data.ac, data.ad, data.bc, data.bd, data.abc, data.abd, data.acd,
-                    data.bcd, data.abcd},
+                   {data.ac, data.ad, data.acd, data.bc, data.bd, data.bcd, data.abc, data.abd,
+                    data.abcd},
                    num_bytes);
 }
 
