@@ -792,13 +792,55 @@ void PackedConv2D::conv_pipelined(IO::NetIO** ios, int party, const std::vector<
         sender.join();
         rx.join();
     } else { // AB: both roles, c = r_own + (conv(x, w_other) - r_other)
+        // As the AB2 weight holder: several chunks are evaluated at once (chunk k with PRNG call call0 + k),
+        // the results go out in chunk order.
         std::thread enc(encrypt_all, std::ref(to_evaluate));
         std::thread rx(receive_all);
-        std::thread ev([&] {
+        const uint64_t call0 = eval_calls_;
+        eval_calls_ += total;
+        std::mutex m;
+        std::condition_variable cv;
+        std::vector<std::string> out(total);
+        std::vector<char> done(total, 0);
+        std::vector<Chunk> evaluated(total);
+        std::mutex take;  // the next chunk and its input are taken together, in order
+        size_t next = 0;
+        std::vector<std::thread> evaluators;
+        for (size_t e = 0; e < weight_holder_evaluators(); e++)
+            evaluators.emplace_back([&] {
+                for (;;) {
+                    size_t k;
+                    Chunk ch;
+                    std::string in;
+                    {
+                        std::lock_guard<std::mutex> lock(take);
+                        if (next == total)
+                            return;
+                        k  = next++;
+                        ch = to_evaluate.pop();
+                        in = inbox.pop();
+                    }
+                    std::string y;
+                    evaluate(*ch.t, in, ch.x, ch.job->w, ch.c, y, threads, call0 + k);
+                    {
+                        std::lock_guard<std::mutex> lock(m);
+                        out[k]       = std::move(y);
+                        evaluated[k] = std::move(ch);
+                        done[k]      = 1;
+                    }
+                    cv.notify_all();
+                }
+            });
+        std::thread sender([&] {
             for (size_t k = 0; k < total; k++) {
-                Chunk ch = to_evaluate.pop();
                 std::string y;
-                evaluate(*ch.t, inbox.pop(), ch.x, ch.job->w, ch.c, y, threads);
+                Chunk ch;
+                {
+                    std::unique_lock<std::mutex> lock(m);
+                    cv.wait(lock, [&] { return done[k] != 0; });
+                    y  = std::move(out[k]);
+                    ch = std::move(evaluated[k]);
+                }
                 // before sending: the other party reads y only once its own evaluation of this chunk is
                 // sent, so both sends would block on full socket buffers if decrypting waited for them
                 to_decrypt.push(std::move(ch));
@@ -812,7 +854,8 @@ void PackedConv2D::conv_pipelined(IO::NetIO** ios, int party, const std::vector<
         }
         enc.join();
         rx.join();
-        ev.join();
+        for (auto& t : evaluators) t.join();
+        sender.join();
     }
 }
 
