@@ -5,6 +5,7 @@
 #include <chrono>
 #include <atomic>
 #include <climits>
+#include <cstdlib>
 #include <cmath>
 #include <condition_variable>
 #include <deque>
@@ -39,6 +40,11 @@ namespace Iface {
 namespace {
 
 constexpr size_t kMaxBatch = 16; // images per tiling, as on the GPU
+// AB2 weight holder: chunks evaluated at once (conv_pipelined); CONV_PIPE_EVALUATORS overrides it
+size_t weight_holder_evaluators() {
+    static const size_t n = getenv("CONV_PIPE_EVALUATORS") ? std::max(1, atoi(getenv("CONV_PIPE_EVALUATORS"))) : 3;
+    return n;
+}
 
 size_t ceil_div(size_t a, size_t b) { return (a + b - 1) / b; }
 
@@ -457,7 +463,7 @@ void PackedConv2D::encrypt(const Tiling& t, const Word* x, std::string& out, siz
 }
 
 void PackedConv2D::evaluate(const Tiling& t, const std::string& in, const Word* x_own, const Word* w,
-                            Word* r, std::string& out, size_t threads) const {
+                            Word* r, std::string& out, size_t threads, uint64_t call_arg) const {
     const Wire& wire = *wire_;
     std::vector<seal::Ciphertext> x(t.tiles * t.in_groups);
     if (in.size() != x.size() * wire.in_bytes)
@@ -567,7 +573,7 @@ void PackedConv2D::evaluate(const Tiling& t, const std::string& in, const Word* 
 
     // Mask with a random polynomial (its output coefficients are this party's share), flood, truncate
     // and drop the coefficients the other party does not need
-    const uint64_t call = eval_calls_++;
+    const uint64_t call = call_arg == UINT64_MAX ? eval_calls_++ : call_arg;
     const uint64_t t_mask = context_->first_context_data()->parms().plain_modulus().value() - 1;
     const size_t out_bytes = wire.out_bytes(t.required.size());
     out.assign(y.size() * out_bytes, '\0');
@@ -722,13 +728,68 @@ void PackedConv2D::conv_pipelined(IO::NetIO** ios, int party, const std::vector<
         }
         enc.join();
     } else if (!is_ab) { // AB2 weight holder: evaluates as the encryptions arrive
+        // Consecutive chunks are evaluated concurrently, as an AB party overlaps its encryption, evaluation
+        // and decryption: an evaluation's parallel regions have fewer tasks than threads on small layers, and
+        // one chunk after another left the other threads idle (CIFAR convs: AB2 slower than AB, which does
+        // twice the work). The outputs are sent in chunk order, and chunk k uses PRNG call call0 + k, the call
+        // the serial loop gave it, so the triples are the same bits.
         std::thread rx(receive_all);
-        chunks([&](Chunk ch) {
-            std::string y;
-            evaluate(*ch.t, inbox.pop(), ch.x, ch.job->w, ch.c, y, threads);
-            send(res_out, y);
-            finish(ch);
+        const uint64_t call0 = eval_calls_;
+        eval_calls_ += total;
+        struct Work {
+            size_t k;
+            Chunk ch;
+            std::string in;
+        };
+        Pipe<std::shared_ptr<Work>> work; // nullptr ends an evaluator
+        std::mutex m;
+        std::condition_variable cv;
+        std::vector<std::string> out(total);
+        std::vector<char> done(total, 0);
+        std::map<const Job*, size_t> left; // chunks of a convolution still to evaluate (finish() after the last)
+        std::thread sender([&] {
+            for (size_t k = 0; k < total; k++) {
+                std::string y;
+                {
+                    std::unique_lock<std::mutex> lock(m);
+                    cv.wait(lock, [&] { return done[k] != 0; });
+                    y = std::move(out[k]);
+                }
+                send(res_out, y);
+            }
         });
+        std::vector<std::thread> evaluators;
+        for (size_t e = 0; e < weight_holder_evaluators(); e++)
+            evaluators.emplace_back([&] {
+                while (auto wk = work.pop()) {
+                    std::string y;
+                    evaluate(*wk->ch.t, wk->in, wk->ch.x, wk->ch.job->w, wk->ch.c, y, threads, call0 + wk->k);
+                    bool last;
+                    {
+                        std::lock_guard<std::mutex> lock(m);
+                        out[wk->k] = std::move(y);
+                        done[wk->k] = 1;
+                        auto it = left.find(wk->ch.job.get());
+                        last = --it->second == 0;
+                        if (last)
+                            left.erase(it); // a later job may be allocated at the same address
+                    }
+                    cv.notify_all();
+                    if (last && wk->ch.job->finish)
+                        wk->ch.job->finish();
+                }
+            });
+        size_t k = 0;
+        chunks([&](Chunk ch) {
+            {
+                std::lock_guard<std::mutex> lock(m);
+                left.emplace(ch.job.get(), ceil_div(ch.job->bs, kMaxBatch)); // set at the job's first chunk
+            }
+            work.push(std::make_shared<Work>(Work{k++, std::move(ch), inbox.pop()}));
+        });
+        for (size_t e = 0; e < weight_holder_evaluators(); e++) work.push(nullptr);
+        for (auto& t : evaluators) t.join();
+        sender.join();
         rx.join();
     } else { // AB: both roles, c = r_own + (conv(x, w_other) - r_other)
         std::thread enc(encrypt_all, std::ref(to_evaluate));

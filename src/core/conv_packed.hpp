@@ -57,8 +57,10 @@ class PackedConv2D {
     struct Wire; // bit widths and sizes of the ciphertexts on the wire
 
     void encrypt(const Tiling& t, const Word* x, std::string& out, size_t threads) const;
+    // call: the PRNG stream of the masks and flooding (default: the next of eval_calls_); concurrent evaluations
+    // pass the index the serial order would have given them, so the outputs do not depend on scheduling
     void evaluate(const Tiling& t, const std::string& in, const Word* x_own, const Word* w, Word* r,
-                  std::string& out, size_t threads) const;
+                  std::string& out, size_t threads, uint64_t call = UINT64_MAX) const;
     void decrypt(const Tiling& t, const std::string& in, Word* c, bool accumulate, size_t threads) const;
 
     std::shared_ptr<seal::SEALContext> context_;
