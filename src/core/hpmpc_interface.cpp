@@ -1092,6 +1092,68 @@ void generateBNTriplesCheetah(Keys<IO::NetIO>& keys, const UINT_TYPE* a, const U
     accumulateTripleStat("BN", data_sent, data_recv, Utils::to_sec(Utils::time_diff(start)));
 }
 
+void generateBNTriplesBatched(Keys<IO::NetIO>& keys, const std::vector<BNTripleLayer>& layers, int party,
+                              int threads, Utils::PROTO proto, int factor) {
+    // the slot-encoded layers (generateBNTriplesCheetah's choice) are concatenated, the others go alone
+    std::vector<size_t> slot, offset;
+    size_t total = 0;
+    for (size_t l = 0; l < layers.size(); ++l) {
+        const auto& L = layers[l];
+        const size_t hw = L.h * L.w, per_image = L.num_ele * hw;
+        if (((hw + POLY_MOD - 1) / POLY_MOD) * L.num_ele >= ((per_image + POLY_MOD - 1) / POLY_MOD) * 3) {
+            slot.push_back(l);
+            offset.push_back(total);
+            total += per_image * L.batch;
+        } else {
+            generateBNTriplesCheetah(keys, L.a, L.b, L.c, L.batch, L.num_ele, L.h, L.w, party, threads, proto,
+                                     factor);
+        }
+    }
+    if (slot.empty())
+        return;
+    Utils::log(Utils::Level::INFO, "P", party - 1, ", PID", keys.get_io_offset(), ": Generating BN triples of ",
+               slot.size(), " layers in one product (", total, " elements, ", Utils::proto_str(proto),
+               ", threads: ", threads, ")");
+    auto start = measure::now();
+    auto& bn   = keys.get_bn();
+    auto** ios = keys.get_ios(threads);
+
+    Tensor<uint64_t> X({static_cast<long>(total)}), S({static_cast<long>(total)}), C;
+    for (size_t k = 0; k < slot.size(); ++k) {
+        const auto& L = layers[slot[k]];
+        const size_t hw = L.h * L.w, per_image = L.num_ele * hw, ac_batch_size = L.batch / factor;
+        for (size_t bb = 0; bb < size_t(L.batch); ++bb)
+            for (size_t ch = 0; ch < L.num_ele; ++ch)
+                for (size_t p = 0; p < hw; ++p) {
+                    const size_t i = bb * per_image + ch * hw + p;
+                    X(offset[k] + i) = L.a != nullptr ? L.a[i] : 0;
+                    S(offset[k] + i) = L.b != nullptr ? L.b[ch + L.num_ele * (bb / ac_batch_size)] : 0;
+                }
+    }
+    auto code = BN::vector_product(ios, bn, party == emp::ALICE, X, S, C, proto == Utils::PROTO::AB, PLAIN_MOD,
+                                   threads, proto);
+    if (code != Code::OK)
+        Utils::log(Utils::Level::ERROR, "BN triples failed: ", CodeMessage(code));
+    for (size_t k = 0; k < slot.size(); ++k) {
+        const auto& L = layers[slot[k]];
+        const size_t n = L.num_ele * L.h * L.w * L.batch;
+        for (size_t i = 0; i < n; ++i) L.c[i] = C(offset[k] + i);
+    }
+
+    Utils::log(Utils::Level::INFO, "P", party - 1, ", PID", keys.get_io_offset(),
+               ": BN triple   s PRE: ", Utils::to_sec(Utils::time_diff(start)));
+    std::string unit;
+    double data_sent = 0, data_recv = 0;
+    for (int i = 0; i < threads; ++i) {
+        data_sent += Utils::to_MB(ios[i]->counter, unit);
+        data_recv += Utils::to_MB(ios[i]->recv_counter, unit);
+        ios[i]->counter = 0;
+        ios[i]->recv_counter = 0;
+    }
+    Utils::log(Utils::Level::INFO, "P", party - 1, ", PID", keys.get_io_offset(), ": BN triple   MB SENT PRE: ", data_sent, "   MB RECEIVED PRE: ", data_recv);
+    accumulateTripleStat("BN", data_sent, data_recv, Utils::to_sec(Utils::time_diff(start)));
+}
+
 void tmp(int party, int threads) {
     // auto context = Utils::init_he_context();
     auto start = measure::now();

@@ -96,6 +96,20 @@ void generateBNTriplesCheetah(Keys<IO::NetIO>& keys, const UINT_TYPE* a, const U
                               UINT_TYPE* c, int batch, size_t num_ele, size_t h, size_t w,
                               int party, int threads, Utils::PROTO proto, int factor = 1);
 
+// One BN layer's request: the arguments of generateBNTriplesCheetah.
+struct BNTripleLayer {
+    const UINT_TYPE* a;
+    const UINT_TYPE* b;
+    UINT_TYPE* c;
+    int batch;
+    size_t num_ele, h, w;
+};
+
+// generateBNTriplesCheetah for several layers: the slot-encoded ones as ONE elementwise product over their
+// concatenation (one layer alone is latency-bound: 1.6-6 MB in 13-50 ms), the others one at a time.
+void generateBNTriplesBatched(Keys<IO::NetIO>& keys, const std::vector<BNTripleLayer>& layers, int party,
+                              int threads, Utils::PROTO proto, int factor = 1);
+
 void do_multiplex(int num_input, const UINT_TYPE* x32, const uint8_t* sel_packed, UINT_TYPE* y32,
                   int party, const std::string& ip, int port, int io_offset, int threads);
 
