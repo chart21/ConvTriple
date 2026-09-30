@@ -132,7 +132,8 @@ void generateConvTriplesPacked(Keys<IO::NetIO>& keys, const UINT_TYPE* a, const 
 // the batch before it has produced all operands (hpmpc: while its preprocessing pass still runs).
 void generateConvTriplesPackedBatch(Keys<IO::NetIO>& keys, const std::vector<Utils::ConvParm>& parms,
                                     UINT_TYPE** a, UINT_TYPE** b, UINT_TYPE* c, int party, int threads,
-                                    Utils::PROTO proto, const std::function<void(size_t)>& ready = nullptr);
+                                    Utils::PROTO proto, const std::function<void(size_t)>& ready = nullptr,
+                                    IO::NetIO** own_ios = nullptr);
 
 void printTripleStats(int party, unsigned io_offset);
 void resetTripleStats();

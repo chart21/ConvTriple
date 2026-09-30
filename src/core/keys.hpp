@@ -8,6 +8,9 @@
 #ifndef TRIPLE_OT_GROUP
 #define TRIPLE_OT_GROUP 0 // channels (and ferret threads) per OT pack, 0: from the first demand
 #endif
+#include <mutex>
+#include <stdexcept>
+
 #include "core/utils.hpp"
 #include "io/send.hpp"
 #include "ot/cheetah-ot_pack.h"
@@ -87,6 +90,18 @@ class Keys {
                    ", unseeded PRGs: ", emp::det_seed_misses().load(), ")");
     }
     Channel* ot_io(int idx) const { return _ios[size_t(idx) * _ot_group]; }
+    // n channels of their own, after the regular ones (port + (threads + k) * io_offset), made at the first call: for a
+    // generator that runs alongside the OT packs on the regular channels (hpmpc CHEETAH_CONV_EARLY)
+    Channel** get_side_ios(unsigned n) {
+        std::lock_guard<std::mutex> lock(_side_mutex);
+        if (!_side_ios) {
+            const char* addr = _party == emp::ALICE ? nullptr : _ip.c_str();
+            _side_ios = Utils::init_ios<Channel>(addr, _port + _threads * _io_offset, n, _io_offset);
+            _side_n = n;
+        } else if (n > _side_n)
+            throw std::runtime_error("Keys::get_side_ios: more channels than made at the first call");
+        return _side_ios;
+    }
     unsigned get_io_offset() const { return _io_offset; }
 
     void disconnect();
@@ -106,6 +121,9 @@ class Keys {
     uint64_t _ot_calls = 0;
     std::vector<sci::OTPack<Channel>*> _ot_packs;
     bool _connected = false;
+    Channel** _side_ios = nullptr;
+    unsigned _side_n    = 0;
+    std::mutex _side_mutex;
 
     Keys(int party, const std::string& ip, unsigned port, unsigned threads, unsigned io_offset)
         : _threads(threads) {
@@ -151,6 +169,8 @@ class Keys {
     }
 
     ~Keys() noexcept {
+        for (unsigned i = 0; _side_ios && i < _side_n; ++i) delete _side_ios[i];
+        delete[] _side_ios;
         for (auto* pack : _ot_packs) delete pack;
         for (unsigned i = 0; i < _threads; ++i) delete _ios[i];
         delete[] _ios;
