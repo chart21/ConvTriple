@@ -54,6 +54,11 @@ size_t weight_holder_evaluators() {
 
 size_t ceil_div(size_t a, size_t b) { return (a + b - 1) / b; }
 
+size_t live_threads(size_t threads) {
+    const size_t n = conv_threads_now().load(std::memory_order_relaxed);
+    return n ? std::min(n, threads) : threads;
+}
+
 void send(IO::NetIO** ios, const std::string& s) {
     size_t n = s.size();
     ios[0]->send_data(&n, sizeof(n));
@@ -529,6 +534,7 @@ void PackedConv2D::setUpRepack(IO::NetIO** ios, int party, bool both_evaluate) {
 }
 
 void PackedConv2D::encrypt(const Tiling& t, const Word* x, std::string& out, size_t threads) const {
+    threads = live_threads(threads);
     const Wire& wire = *wire_;
     const auto& cd   = *context_->first_context_data();
     const auto& q    = cd.parms().coeff_modulus();
@@ -565,6 +571,7 @@ void PackedConv2D::encrypt(const Tiling& t, const Word* x, std::string& out, siz
 
 void PackedConv2D::evaluate(const Tiling& t, const std::string& in, const Word* x_own, const Word* w,
                             Word* r, std::string& out, size_t threads, uint64_t call_arg) const {
+    threads = live_threads(threads);
     const Wire& wire = *wire_;
     std::vector<seal::Ciphertext> x(t.tiles * t.in_groups);
     if (in.size() != x.size() * wire.in_bytes)
@@ -792,6 +799,7 @@ void PackedConv2D::pack(const Tiling& t, std::vector<seal::Ciphertext>& y, std::
 
 void PackedConv2D::decrypt(const Tiling& t, const std::string& in, Word* c, bool accumulate,
                            size_t threads) const {
+    threads = live_threads(threads);
     const Wire& wire       = *wire_;
     const size_t out_bytes = wire.out_bytes(t.required.size()), cts = t.tiles * t.out_groups;
     if (in.size() != cts * out_bytes)

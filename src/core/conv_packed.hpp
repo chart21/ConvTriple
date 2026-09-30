@@ -8,6 +8,7 @@
 // like HomConv2DSS's. On the wire, both directions carry exactly the bits decryption needs: an input
 // ciphertext is a seed and c0, an output ciphertext the kept high bits of c1 and of its used c0 coefficients.
 
+#include <atomic>
 #include <cstdint>
 #include <functional>
 #include <memory>
@@ -35,6 +36,13 @@ inline bool& conv_repack() {
 inline bool& conv_repack_ab() {
     static bool ab = false;
     return ab;
+}
+// A limit on the threads of the packed convolutions, read at every encryption, evaluation and decryption (0: the
+// caller's count). hpmpc's CHEETAH_CONV_EARLY lowers it while the OT phase runs next to the conv triples and lifts it
+// afterwards, so that the conv triples take the idle cores first and all of them once the OT phase is done.
+inline std::atomic<size_t>& conv_threads_now() {
+    static std::atomic<size_t> n{0};
+    return n;
 }
 
 class PackedConv2D {
