@@ -10,7 +10,7 @@
 //          imagenet - the 53 convs of ResNet50-Cheetah on 224x224 inputs, batch 1
 //   --packed: generateConvTriplesPacked (the GPU path's packing on the CPU) instead of the wrapper
 //   --pipelined: all convs of the suite in one generateConvTriplesPackedBatch (per-layer times not available)
-//   env: CONV_TEST_THREADS (default 1), CONV_TEST_IP (party 1's address, default 127.0.0.1)
+//   env: CONV_TEST_THREADS (default 1), CONV_TEST_IP (party 1's address, default 127.0.0.1), CONV_REPACK=1 (repacking)
 #include "core/hpmpc_interface.hpp"
 
 #include <algorithm>
@@ -112,6 +112,7 @@ int main(int argc, char** argv) {
     // Party 2 connects to CONV_TEST_IP (party 1 listens), for runs on two hosts.
     const int threads   = getenv("CONV_TEST_THREADS") ? atoi(getenv("CONV_TEST_THREADS")) : 1;
     const char* peer_ip = getenv("CONV_TEST_IP") ? getenv("CONV_TEST_IP") : "127.0.0.1";
+    Iface::conv_repack_ab() = ab; // with CONV_REPACK=1: both parties evaluate, so both send Galois keys
     auto& keys = Iface::Keys<IO::NetIO>::instance(party, peer_ip, port, threads, 1);
     auto* io   = keys.get_ios(threads)[0];
     std::mt19937 rng(1234 + party);

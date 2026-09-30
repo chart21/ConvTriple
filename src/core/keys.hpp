@@ -128,6 +128,10 @@ class Keys {
         _fc.setUp(ctx, skey, o_pkey);
         _hom_conv.setUp(ctx, skey, o_pkey);
         _packed_conv.setUp(ctx, skey, o_pkey);
+        if (const char* e = std::getenv("CONV_REPACK"))
+            conv_repack() = std::atoi(e) != 0;
+        if (conv_repack())
+            _packed_conv.setUpRepack(_ios, party, conv_repack_ab());
         _bn.setUp(PLAIN_MOD, ctx, skey, o_pkey);
         setupBn(_ios, ctx, party);
 

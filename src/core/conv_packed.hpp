@@ -21,12 +21,31 @@
 
 namespace Iface {
 
+// Output repacking (hpmpc CHEETAH_CONV_REPACK, set before the first Keys::instance; the environment variable
+// CONV_REPACK=0/1 overrides it): the communication-optimized variant. The convolutions run in their own ring of
+// N = 8192 with a special prime, since packing needs key switching and the 109-bit data modulus already takes
+// the 128-bit budget of N = 4096. An input ciphertext holds channels interleaved (dense, one filter per product),
+// and the evaluator merges the sparse products of C filters into one dense output ciphertext with Galois
+// automorphisms before masking, flooding and sending it. conv_repack_ab(): both parties evaluate (AB triples), so
+// both send their Galois keys; otherwise (AB2) only the input holder does.
+inline bool& conv_repack() {
+    static bool on = false;
+    return on;
+}
+inline bool& conv_repack_ab() {
+    static bool ab = false;
+    return ab;
+}
+
 class PackedConv2D {
   public:
     using Word = std::conditional_t<BIT_LEN == 32, uint32_t, uint64_t>;
 
     void setUp(const seal::SEALContext& context, const seal::SecretKey& sk,
                std::shared_ptr<seal::PublicKey> other_pk);
+    // conv_repack(): replaces setUp's context by the N = 8192 one (own keys, public keys exchanged on ios[0]) and
+    // exchanges the Galois keys the evaluation needs; party is emp's (ALICE evaluates in AB2)
+    void setUpRepack(IO::NetIO** ios, int party, bool both_evaluate);
 
     // Shares c of the stride-1, unpadded conv(x, w) (NCHW input, OIHW weights) of bs images.
     // AB2: the party without w encrypts its x, the other one evaluates (and adds its own x if given);
@@ -55,6 +74,12 @@ class PackedConv2D {
     struct Tiling;
     struct Ntt;  // the primes' NTT tables, for NTTs of weight polynomials outside SEAL
     struct Wire; // bit widths and sizes of the ciphertexts on the wire
+
+    bool repack_ = false;
+    std::shared_ptr<const seal::GaloisKeys> other_gk_; // the other party's, to pack the products of its ciphertexts
+    // repacking: merges the sparse products y (tile-major, oc per tile) into t.tiles * t.out_groups dense ones
+    void pack(const Tiling& t, std::vector<seal::Ciphertext>& y, std::vector<seal::Ciphertext*>& dense,
+              size_t threads) const;
 
     void encrypt(const Tiling& t, const Word* x, std::string& out, size_t threads) const;
     // call: the PRNG stream of the masks and flooding (default: the next of eval_calls_); concurrent evaluations
