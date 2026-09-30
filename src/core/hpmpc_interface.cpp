@@ -1720,7 +1720,7 @@ void generateConvTriplesPacked(Keys<IO::NetIO>& keys, const UINT_TYPE* a, const 
 
 void generateConvTriplesPackedBatch(Keys<IO::NetIO>& keys, const std::vector<Utils::ConvParm>& parms,
                                     UINT_TYPE** a, UINT_TYPE** b, UINT_TYPE* c, int party, int threads,
-                                    Utils::PROTO proto) {
+                                    Utils::PROTO proto, const std::function<void(size_t)>& ready) {
     std::vector<size_t> batch(parms.size()), offset(parms.size() + 1, 0);
     for (size_t i = 0; i < parms.size(); i++) {
         const auto& p = parms[i];
@@ -1729,9 +1729,12 @@ void generateConvTriplesPackedBatch(Keys<IO::NetIO>& keys, const std::vector<Uti
         offset[i + 1] = offset[i] + p.batchsize * p.n_filters * nh * nw;
     }
     if (threads < 4) { // the pipeline takes 4 channels
-        for (size_t i = 0; i < parms.size(); i++)
+        for (size_t i = 0; i < parms.size(); i++) {
+            if (ready)
+                ready(i);
             generateConvTriplesPacked(keys, a ? a[i] : nullptr, b ? b[i] : nullptr, c + offset[i], parms[i], party, threads,
                                       proto);
+        }
         return;
     }
     auto start = measure::now();
@@ -1739,6 +1742,8 @@ void generateConvTriplesPackedBatch(Keys<IO::NetIO>& keys, const std::vector<Uti
     keys.get_packed_conv().conv_pipelined(
         ios, party, batch,
         [&](size_t i) {
+            if (ready)
+                ready(i);
             const auto& p = parms[i];
             auto r = std::make_shared<ConvLayout::Reduced<UINT_TYPE>>(a ? a[i] : nullptr, b ? b[i] : nullptr, c + offset[i],
                                                                       p.batchsize, p.ic, p.ih, p.iw, p.fh, p.fw,

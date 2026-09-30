@@ -5,6 +5,7 @@
 #include <seal/encryptor.h>
 #include <seal/keygenerator.h>
 #include <seal/serializable.h>
+#include <functional>
 #include <string>
 
 #include <io/net_io_channel.hpp>
@@ -127,9 +128,11 @@ void generateConvTriplesPacked(Keys<IO::NetIO>& keys, const UINT_TYPE* a, const 
 // generateConvTriplesPacked for all convolutions of a network, pipelined across them
 // (PackedConv2D::conv_pipelined): a[i] and b[i] are the operands of convolution i (a or b null when not
 // held), c their outputs back to back. One lane (factor 1); layer by layer below 4 threads.
+// ready(i), if given, is called before a[i] / b[i] are read and returns once they are there: the caller can start
+// the batch before it has produced all operands (hpmpc: while its preprocessing pass still runs).
 void generateConvTriplesPackedBatch(Keys<IO::NetIO>& keys, const std::vector<Utils::ConvParm>& parms,
                                     UINT_TYPE** a, UINT_TYPE** b, UINT_TYPE* c, int party, int threads,
-                                    Utils::PROTO proto);
+                                    Utils::PROTO proto, const std::function<void(size_t)>& ready = nullptr);
 
 void printTripleStats(int party, unsigned io_offset);
 void resetTripleStats();
