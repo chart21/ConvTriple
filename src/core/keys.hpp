@@ -301,7 +301,7 @@ void Keys<Channel>::disconnect() {
             }
         Utils::log(Utils::Level::INFO, "P", _party - 1, ", PID", _io_offset, ": OT packs: ", _ot_packs.size(),
                    " x ", _ot_group, " threads, ferret extensions after setup: ", ext, ", time in rcot (sum over packs): ",
-                   sec, " s");
+                   sec, " s, in the LPN step (incl. setup): ", cheetah::lpn_ns().load() * 1e-9, " s");
     }
     if (gemini::kSeeded && emp::det_seed_misses().load())
         Utils::log(Utils::Level::INFO, "P", _party - 1, ", PID", _io_offset, ": PRGs seeded outside a DetSeedScope: ",

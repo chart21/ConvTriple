@@ -43,10 +43,11 @@ if(TRIPLE_GPU)
         troy/conv2d_gpu.cu
         troy/random.cpp
         core/conv_packed_gpu.cu
+        ot/lpn_gpu.cu
     )
 
     target_link_libraries(${HE_LIB} PUBLIC Troy::troy CUDA::cudart CUDA::cufft)
-    target_compile_definitions(${HE_LIB} PRIVATE USE_PACKED_GPU=1)
+    target_compile_definitions(${HE_LIB} PRIVATE USE_PACKED_GPU=1 USE_LPN_GPU=1)
     target_compile_definitions(${HE_LIB} PRIVATE USE_CONV_CUDA=1 CONV_MAX_BATCH_SIZE=${CONV_MAX_BATCH_SIZE})
     if(TRIPLE_GPU_REVERSE)
         target_compile_definitions(${HE_LIB} PRIVATE USE_CONV_CUDA=1 REVERSE_GPU=1 CONV_MAX_BATCH_SIZE=${CONV_MAX_BATCH_SIZE})
@@ -185,6 +186,13 @@ target_compile_options(
     "$<$<CONFIG:Release>:-Wall;-Wextra>"
     "-march=native;-Wno-ignored-attributes;-Wno-ignored-qualifiers;-Wno-unused-parameter"
 )
+
+if(TRIPLE_GPU)
+    # ferret's LPN step on the GPU against the CPU: bit-for-bit check and timing (lpn_gpu_bench [instances])
+    add_executable(cheetah_lpn_gpu_bench lpn_gpu_bench.cpp)
+    target_link_libraries(cheetah_lpn_gpu_bench PRIVATE ${HE_LIB})
+    target_compile_options(cheetah_lpn_gpu_bench PRIVATE "-march=native;-Wno-ignored-attributes")
+endif()
 
 file(GLOB_RECURSE SRC_FILES
     "${CMAKE_CURRENT_SOURCE_DIR}/*.cpp"

@@ -22,6 +22,20 @@
 // computed ahead and their rows of the table are prefetched. With one ferret instance per thread the
 // tables of all instances do not fit the caches, and the 40 random reads of one group alone kept the core
 // waiting on memory (LPN step of 32 instances at once on an EPYC 7543, b13: 0.34 -> 0.28 s).
+namespace cheetah {
+// time in ferret's LPN step, summed over all instances and threads (reported with the rcot time, Keys::disconnect)
+inline std::atomic<int64_t>& lpn_ns() {
+    static std::atomic<int64_t> ns{0};
+    return ns;
+}
+} // namespace cheetah
+
+// The LPN step itself (emp's compute: the seed, then task() over `threads` ranges on the pool), or on the GPU in
+// TRIPLE_GPU builds (ot/lpn_gpu.cu, bit for bit the same outputs; LPN_GPU=0 turns it off). Defined once, in the HE
+// library (hpmpc_interface.cpp), so that every translation unit uses the same one.
+template <>
+void LpnF2<IO::NetIO, 10>::compute(block* nn, const block* kk, block s);
+
 template <>
 inline void LpnF2<IO::NetIO, 10>::task(block* nn, const block* kk, int64_t start, int64_t end) {
     constexpr int d = 10, ahead = 4;

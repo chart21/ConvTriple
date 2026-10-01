@@ -21,6 +21,44 @@
 namespace cheetah {
 const PrimalLPNParameter& ferret_param() { return TRIPLE_FERRET; }
 } // namespace cheetah
+
+#if USE_LPN_GPU
+#include "ot/lpn_gpu.h"
+#endif
+
+template <>
+void LpnF2<IO::NetIO, 10>::compute(block* nn, const block* kk, block s) {
+    const auto t0 = std::chrono::steady_clock::now();
+    if (!cmpBlock(&s, &zero_block, 1))
+        seed = s;
+    else
+        seed = seed_gen();
+    const int64_t width = n / threads;
+#if USE_LPN_GPU
+    if (cheetah::lpn_gpu::available()) {
+        // the groups of 4 of every task range on the GPU, the at most 7 trailing outputs of a range here
+        PRP prp(seed);
+        uint32_t rk[44];
+        std::memcpy(rk, prp.aes.rd_key, sizeof(rk));
+        for (int i = 0; i < threads; ++i) {
+            const int64_t start = i * width, end = i == threads - 1 ? n : std::min((i + 1) * width, n);
+            const int64_t groups = end - 4 > start ? (end - 4 - start + 3) / 4 : 0;
+            cheetah::lpn_gpu::compute(nn, kk, n, k, uint32_t(mask), rk, start, groups);
+            for (int64_t j = start + 4 * groups; j < end; ++j) __compute1(nn, kk, j, &prp);
+        }
+        cheetah::lpn_ns() += std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count();
+        return;
+    }
+#endif
+    std::vector<std::future<void>> fut;
+    for (int i = 0; i < threads - 1; ++i) {
+        const int64_t start = i * width, end = std::min((i + 1) * width, n);
+        fut.push_back(pool->enqueue([this, nn, kk, start, end]() { task(nn, kk, start, end); }));
+    }
+    task(nn, kk, (threads - 1) * width, n);
+    for (auto& f : fut) f.get();
+    cheetah::lpn_ns() += std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count();
+}
 #include "protocols/ot_proto.hpp"
 
 #include "ot/bit-triple-generator.h"
