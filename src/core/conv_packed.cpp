@@ -25,6 +25,9 @@
 #include "seal/util/scalingvariant.h"
 #include "gemini/core/util/ThreadPool.h"
 #include "emp-tool/utils/prg.h"
+#if USE_PACKED_GPU
+#include "core/conv_packed_gpu.hpp"
+#endif
 
 namespace gemini { // output post-processing of HomConv2DSS (hom_conv2d_ss.cc)
 void flood_ciphertext(seal::Ciphertext& ct, std::shared_ptr<seal::UniformRandomGenerator> prng,
@@ -53,6 +56,33 @@ size_t weight_holder_evaluators() {
 }
 
 size_t ceil_div(size_t a, size_t b) { return (a + b - 1) / b; }
+
+// CONV_PROFILE=1: seconds spent per stage, summed over calls (concurrent evaluations overlap), printed after each
+// conv_pipelined
+struct Profile {
+    std::atomic<uint64_t> ns[7]{};
+    static const char* name(int i) {
+        static const char* n[] = {"encrypt", "eval.inputs", "eval.weights+mac", "eval.outputs", "decrypt", "eval.repack", "eval.wait"};
+        return n[i];
+    }
+};
+Profile& profile() {
+    static Profile p;
+    return p;
+}
+bool profiling() {
+    static const bool on = getenv("CONV_PROFILE") && atoi(getenv("CONV_PROFILE")) != 0;
+    return on;
+}
+struct Stage {
+    int i;
+    std::chrono::steady_clock::time_point t0 = std::chrono::steady_clock::now();
+    explicit Stage(int i) : i(i) {}
+    ~Stage() {
+        if (profiling())
+            profile().ns[i] += std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count();
+    }
+};
 
 size_t live_threads(size_t threads) {
     const size_t n = conv_threads_now().load(std::memory_order_relaxed);
@@ -483,6 +513,36 @@ void PackedConv2D::setUp(const seal::SEALContext& context, const seal::SecretKey
             ntt->small[a].push_back(std::move(sm));
         }
     ntt_ = ntt;
+#if USE_PACKED_GPU
+    // the evaluator's transforms and products on the GPU, with SEAL's tables (the slot order of c1 and of the CPU path)
+    gpu_.reset();
+    if (N == 4096 && packed_gpu::available()) {
+        try {
+            std::vector<packed_gpu::Prime> ps;
+            for (size_t l = 0; l < cd->parms().coeff_modulus().size(); l++) {
+                const seal::Modulus& q = cd->parms().coeff_modulus()[l];
+                const seal::util::NTTTables& tb = cd->small_ntt_tables()[l];
+                packed_gpu::Prime p;
+                p.q = q.value(), p.ratio0 = q.const_ratio()[0], p.ratio1 = q.const_ratio()[1];
+                for (size_t i = 0; i < N; i++) {
+                    p.root.push_back(tb.get_from_root_powers()[i].operand);
+                    p.root_quot.push_back(tb.get_from_root_powers()[i].quotient);
+                    p.inv_root.push_back(tb.get_from_inv_root_powers()[i].operand);
+                    p.inv_root_quot.push_back(tb.get_from_inv_root_powers()[i].quotient);
+                }
+                p.inv_n = tb.inv_degree_modulo().operand, p.inv_n_quot = tb.inv_degree_modulo().quotient;
+                seal::util::MultiplyUIntModOperand last;
+                last.set(seal::util::multiply_uint_mod(p.inv_root[N - 1], p.inv_n, q), q);
+                p.last = last.operand, p.last_quot = last.quotient;
+                p.increment = cd->plain_upper_half_increment()[l];
+                ps.push_back(std::move(p));
+            }
+            gpu_ = std::make_shared<packed_gpu::Engine>(N, cd->plain_upper_half_threshold(), ps, ntt->fold);
+        } catch (const std::exception& e) {
+            fprintf(stderr, "PackedConv2D: no GPU evaluator (%s), the CPU evaluates\n", e.what());
+        }
+    }
+#endif
 }
 
 void PackedConv2D::setUpRepack(IO::NetIO** ios, int party, bool both_evaluate) {
@@ -539,6 +599,7 @@ void PackedConv2D::encrypt(const Tiling& t, const Word* x, std::string& out, siz
     const auto& cd   = *context_->first_context_data();
     const auto& q    = cd.parms().coeff_modulus();
     const size_t N = wire.N, L = q.size();
+    Stage stage(0);
     out.assign(t.tiles * t.in_groups * wire.in_bytes, '\0');
     const uint64_t call = enc_calls_++;
     parallel(threads, t.tiles * t.in_groups, [&](size_t k) {
@@ -569,11 +630,11 @@ void PackedConv2D::encrypt(const Tiling& t, const Word* x, std::string& out, siz
     });
 }
 
-void PackedConv2D::evaluate(const Tiling& t, const std::string& in, const Word* x_own, const Word* w,
-                            Word* r, std::string& out, size_t threads, uint64_t call_arg) const {
-    threads = live_threads(threads);
+void PackedConv2D::multiply(const Tiling& t, const std::string& in, const Word* x_own, const Word* w,
+                            std::vector<seal::Ciphertext>& y, size_t threads) const {
     const Wire& wire = *wire_;
     std::vector<seal::Ciphertext> x(t.tiles * t.in_groups);
+    auto stage = std::make_unique<Stage>(1);
     if (in.size() != x.size() * wire.in_bytes)
         throw std::runtime_error("PackedConv2D: unexpected size of the encrypted input");
     parallel(threads, x.size(), [&](size_t k) {
@@ -603,7 +664,7 @@ void PackedConv2D::evaluate(const Tiling& t, const std::string& in, const Word* 
     // y[t][o] = sum_g x[t][g] * w[o][g], per output group: its weight polynomials are NTT-transformed
     // right before use (each is used once per tile, and on large images there is one tile) and the
     // products are summed in 128 bits, reduced once at the end instead of after every product.
-    std::vector<seal::Ciphertext> y(t.tiles * t.eval_groups);
+    stage = std::make_unique<Stage>(2);
     const Ntt& ntt = *ntt_;
     const size_t L = ntt.primes.size(), B = t.h * t.w;
     std::vector<uint32_t> gather;
@@ -678,17 +739,79 @@ void PackedConv2D::evaluate(const Tiling& t, const std::string& in, const Word* 
                     for (size_t i = 0; i < N; i++) ct.data(p)[l * N + i] = reduce(((ob * t.tiles + tile) * 2 + p) * N + i);
             }
     });
+}
+
+// multiply() on the GPU: the host parses the inputs (c0 as sent, c1 from the seed, the own share added), the device
+// does the transforms and the products (packed_gpu::Engine), y comes back in coefficient form
+void PackedConv2D::multiply_gpu(const Tiling& t, const std::string& in, const Word* x_own, const Word* w,
+                                std::vector<seal::Ciphertext>& y, size_t threads) const {
+#if USE_PACKED_GPU
+    const Wire& wire = *wire_;
+    const auto& cd   = *context_->first_context_data();
+    const size_t N = wire.N, L = cd.parms().coeff_modulus().size(), ct_words = 2 * L * N, nin = t.tiles * t.in_groups;
+    auto stage = std::make_unique<Stage>(1);
+    if (in.size() != nin * wire.in_bytes)
+        throw std::runtime_error("PackedConv2D: unexpected size of the encrypted input");
+    uint64_t* xp = gpu_->staging(nin * ct_words, 0);
+    parallel(threads, nin, [&](size_t k) {
+        const auto* src = reinterpret_cast<const uint8_t*>(in.data()) + k * wire.in_bytes;
+        emp::block seed;
+        std::memcpy(&seed, src, sizeof(seed));
+        src += sizeof(seed);
+        uint64_t* c0 = xp + k * ct_words;
+        for (size_t l = 0; l < L; l++) {
+            unpack_bits(src, N, wire.q_bits[l], c0 + l * N);
+            src += packed_size(N, wire.q_bits[l]);
+        }
+        if (x_own) {
+            seal::Plaintext pt;
+            t.input_poly(x_own, k / t.in_groups, k % t.in_groups, pt);
+            seal::util::multiply_add_plain_with_scaling_variant(pt, cd, seal::util::RNSIter(c0, N));
+        }
+        seal::util::sample_poly_uniform(std::make_shared<AesPrng>(seed), cd.parms(), c0 + L * N);
+    });
+    stage = std::make_unique<Stage>(2);
+    uint64_t* yp = gpu_->staging(y.size() * ct_words, 1);
+    gpu_->evaluate(packed_gpu::Geometry{t.tiles, t.in_groups, t.out_groups, t.ic, t.oc, t.ci, t.co, t.h, t.w, t.kh, t.kw},
+                   xp, w, yp);
+    parallel(threads, y.size(), [&](size_t k) {
+        y[k].resize(*context_, context_->first_parms_id(), 2);
+        y[k].is_ntt_form() = false;
+        std::copy_n(yp + k * ct_words, ct_words, y[k].data());
+    });
+#else
+    (void) t, (void) in, (void) x_own, (void) w, (void) y, (void) threads;
+    throw std::runtime_error("PackedConv2D: built without TRIPLE_GPU");
+#endif
+}
+
+void PackedConv2D::evaluate(const Tiling& t, const std::string& in, const Word* x_own, const Word* w,
+                            Word* r, std::string& out, size_t threads, uint64_t call_arg) const {
+    threads = live_threads(threads);
+    const Wire& wire = *wire_;
+    std::vector<seal::Ciphertext> y(t.tiles * t.eval_groups);
+#if USE_PACKED_GPU
+    if (gpu_ && !t.rp)
+        multiply_gpu(t, in, x_own, w, y, threads);
+    else
+#endif
+        multiply(t, in, x_own, w, y, threads);
 
     // Mask with a random polynomial (its output coefficients are this party's share), flood, truncate
     // and drop the coefficients the other party does not need
+    auto stage = std::make_unique<Stage>(3);
     const uint64_t call = call_arg == UINT64_MAX ? eval_calls_++ : call_arg;
     const uint64_t t_mask = context_->first_context_data()->parms().plain_modulus().value() - 1;
     const size_t out_bytes = wire.out_bytes(t.required.size());
     std::vector<seal::Ciphertext*> z(t.tiles * t.out_groups); // the output ciphertexts
-    if (t.rp)
+    if (t.rp) {
+        Stage repack(5);
         pack(t, y, z, threads);
+    }
     else
         for (size_t k = 0; k < z.size(); k++) z[k] = &y[k];
+    if (t.rp)
+        stage = std::make_unique<Stage>(3);
     out.assign(z.size() * out_bytes, '\0');
     parallel(threads, z.size(), [&](size_t k) {
         seal::Ciphertext& ct = *z[k];
@@ -801,6 +924,7 @@ void PackedConv2D::decrypt(const Tiling& t, const std::string& in, Word* c, bool
                            size_t threads) const {
     threads = live_threads(threads);
     const Wire& wire       = *wire_;
+    Stage stage(4);
     const size_t out_bytes = wire.out_bytes(t.required.size()), cts = t.tiles * t.out_groups;
     if (in.size() != cts * out_bytes)
         throw std::runtime_error("PackedConv2D: unexpected size of the encrypted output");
@@ -861,6 +985,21 @@ void PackedConv2D::conv_pipelined(IO::NetIO** ios, int party, const std::vector<
                                   const std::function<Job(size_t)>& prepare, bool is_ab, size_t threads) const {
     if (batch.empty())
         return;
+    struct Report {
+        int party;
+        std::chrono::steady_clock::time_point t0 = std::chrono::steady_clock::now();
+        ~Report() {
+            if (!profiling())
+                return;
+            const double wall = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+            fprintf(stderr, "CONV_PROFILE party %d: wall %.3f s", party, wall);
+            for (int i = 0; i < 7; i++) {
+                const uint64_t v = profile().ns[i].exchange(0);
+                if (v) fprintf(stderr, ", %s %.3f s", Profile::name(i), v * 1e-9);
+            }
+            fprintf(stderr, "\n");
+        }
+    } report{party};
     // chunks of at most kMaxBatch images of a convolution, as in conv()
     struct Chunk {
         std::shared_ptr<Job> job;

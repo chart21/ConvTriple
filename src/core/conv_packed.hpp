@@ -22,6 +22,10 @@
 
 namespace Iface {
 
+namespace packed_gpu {
+class Engine;
+}
+
 // Output repacking (hpmpc CHEETAH_CONV_REPACK, set before the first Keys::instance; the environment variable
 // CONV_REPACK=0/1 overrides it): the communication-optimized variant. The convolutions run in their own ring of
 // N = 8192 with a special prime, since packing needs key switching and the 109-bit data modulus already takes
@@ -94,6 +98,12 @@ class PackedConv2D {
     // pass the index the serial order would have given them, so the outputs do not depend on scheduling
     void evaluate(const Tiling& t, const std::string& in, const Word* x_own, const Word* w, Word* r,
                   std::string& out, size_t threads, uint64_t call = UINT64_MAX) const;
+    // evaluate's products y[tile][og] = sum_g x[tile][g] * w[og][g] (y sized by the caller): on the CPU, or on the GPU
+    // (gpu_, built with TRIPLE_GPU; not for repacking)
+    void multiply(const Tiling& t, const std::string& in, const Word* x_own, const Word* w,
+                  std::vector<seal::Ciphertext>& y, size_t threads) const;
+    void multiply_gpu(const Tiling& t, const std::string& in, const Word* x_own, const Word* w,
+                      std::vector<seal::Ciphertext>& y, size_t threads) const;
     void decrypt(const Tiling& t, const std::string& in, Word* c, bool accumulate, size_t threads) const;
 
     std::shared_ptr<seal::SEALContext> context_;
@@ -104,6 +114,7 @@ class PackedConv2D {
     std::shared_ptr<const seal::SecretKey> sk_;
     std::shared_ptr<const Ntt> ntt_;
     std::shared_ptr<const Wire> wire_;
+    std::shared_ptr<const packed_gpu::Engine> gpu_; // set by setUp when a GPU is there (TRIPLE_GPU builds)
 };
 
 } // namespace Iface
