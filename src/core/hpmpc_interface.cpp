@@ -219,6 +219,14 @@ DevState* dev_state(const void* ferret, int64_t n, bool make) {
 #endif
 
 namespace cheetah {
+bool ferret_on_gpu() {
+#if USE_LPN_GPU
+    return lpn_gpu::mpcot_available();
+#else
+    return false;
+#endif
+}
+
 bool ferret_on_device(const void* ferret) {
 #if USE_LPN_GPU
     std::lock_guard<std::mutex> lock(g_dev_mutex);
@@ -313,10 +321,13 @@ void FerretCOT<IO::NetIO>::extend(block* ot_output, MpcotReg<IO::NetIO>* mpcot, 
         // into it directly (until the destructor)
         DevState* dev = nullptr;
         if (ot_output == ot_data && lpn->n == param.n) {
-            cheetah::lpn_gpu::pin(ot_data, size_t(param.n) * sizeof(block));
             // the outputs stay on the device; the host gets the last M (the next extension's pre-OTs) now, the rest
-            // when rcot hands it out
+            // when rcot hands it out. Where they cannot stay, ot_data is pinned for the copies (FERRET_PIN=0 / 1: never
+            // / always; pinning when most COTs stay on the device cost more than it saved)
             dev = dev_state(this, param.n, true);
+            static const int pin = getenv("FERRET_PIN") ? atoi(getenv("FERRET_PIN")) : -1;
+            if (pin == 1 || (pin == -1 && !dev->leaves))
+                cheetah::lpn_gpu::pin(ot_data, size_t(param.n) * sizeof(block));
         }
         void* leaves = dev ? dev->leaves : nullptr;
         if (extend_gpu(party, Delta, ot_output, mpcot, preot, lpn, ot_input + mpcot->consist_check_cot_num, seed, t0,

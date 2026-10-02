@@ -64,6 +64,8 @@ inline DeviceConsumer*& device_consumer() {
 }
 // this FerretCOT keeps its extensions' outputs on the device (GPU builds; defined in the HE library)
 bool ferret_on_device(const void* ferret);
+// ferret's extensions run on the GPU (a GPU build with a device, LPN_GPU / MPCOT_GPU not 0)
+bool ferret_on_gpu();
 // emp's MITCCRH<8> bits of these COTs on the GPU (lpn_gpu::rot_bits; defined in the HE library)
 void rot_bits_device(const void* cots, bool on_device, int64_t count, const emp::block& s, uint64_t gid0,
                      const emp::block* delta, int k, uint8_t* out, int64_t stride);

@@ -68,7 +68,11 @@ class Keys {
         unsigned group = TRIPLE_OT_GROUP;
         if (const char* e = std::getenv("CHEETAH_OT_GROUP"))  // experiments: channels per pack
             group = unsigned(std::max(1, std::atoi(e)));
-        if (group == 0) {
+        if (group == 0 && cheetah::ferret_on_gpu()) {
+            // ferret on the GPU (TRIPLE_GPU): an extension is cheap, the packs' setup is not; 4 channels per pack was
+            // the fastest on a 16-thread workstation (OT setup 2.0-2.5 -> 0.8-1.2 s, preprocessing 0.6-1.3 s less)
+            group = 4;
+        } else if (group == 0) {
             const double per_ext = 0.8 * double(cheetah::ferret_param().n); // headroom for COT / MUX
             group = _threads;
             while (group > 1 && double(cots) > per_ext * double(_threads / group)) group /= 2;
