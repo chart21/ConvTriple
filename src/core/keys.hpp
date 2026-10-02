@@ -96,6 +96,15 @@ class Keys {
                    " s, of which MPCOT ", cheetah::mpcot_ns().load() * 1e-9, " s, LPN ", cheetah::lpn_ns().load() * 1e-9, " s)");
     }
     Channel* ot_io(int idx) const { return _ios[size_t(idx) * _ot_group]; }
+    // the OT packs' memory (ferret's buffers, on the host and the device) back, once nothing extends any more (hpmpc:
+    // after the preprocessing); a later request makes new packs
+    void release_ot() {
+        if (_ot_packs.empty())
+            return;
+        disconnect();  // the stats first (they read the packs)
+        for (auto* pack : _ot_packs) delete pack;
+        _ot_packs.clear();
+    }
     // n channels of their own, after the regular ones (port + (threads + k) * io_offset), made at the first call: for a
     // generator that runs alongside the OT packs on the regular channels (hpmpc CHEETAH_CONV_EARLY)
     Channel** get_side_ios(unsigned n) {
