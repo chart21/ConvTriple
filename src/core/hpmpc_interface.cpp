@@ -634,6 +634,9 @@ struct BoolMultRounds {
     std::vector<uint8_t> mine, theirs;  // one round's corrections: choice corrections, then masked values
     std::thread gen;                    // the random OTs (boolCOTMultRoundsBegin)
     double wait_seconds = 0;            // until the first round had them
+    double t_corr = 0, t_xchg = 0, t_out = 0, t_between = 0;  // round phases, and the caller's work between rounds
+    decltype(measure::now()) last_end;
+    bool any_round = false;
     // fn(wid) on every worker with a byte range, in parallel
     template <typename F>
     void each(F fn) {
@@ -704,6 +707,9 @@ void boolCOTMultRound(BoolMultRounds* h, int round, const uint8_t* a, const uint
         h->gen.join();
         h->wait_seconds = Utils::to_sec(Utils::time_diff(h->t0));
     }
+    auto tr0 = measure::now();
+    if (h->any_round)
+        h->t_between += Utils::to_sec(Utils::time_diff(h->last_end));
     const size_t nb  = h->num_bytes;
     auto& mine       = h->mine;
     auto& theirs     = h->theirs;
@@ -717,6 +723,8 @@ void boolCOTMultRound(BoolMultRounds* h, int round, const uint8_t* a, const uint
         for (size_t i = 0; i < n; ++i) e[i] = s[i] ^ a[W.start + i];
         for (size_t i = 0; i < n; ++i) m[i] = b[W.start + i] ^ r0[i] ^ r1[i];
     });
+    auto tr1 = measure::now();
+    h->t_corr += Utils::to_sec(Utils::time_diff(tr0));
     const int nch = std::min<int>(nch_env, int(h->w.size()));
     std::vector<std::future<void>> fut;
     for (int ch = 0; ch < nch; ++ch)
@@ -734,6 +742,8 @@ void boolCOTMultRound(BoolMultRounds* h, int round, const uint8_t* a, const uint
             }
         }));
     for (auto& f : fut) f.get();
+    auto tr2 = measure::now();
+    h->t_xchg += Utils::to_sec(Utils::time_diff(tr1));
     h->each([h, round, a, b, c](int wid) {
         auto& W          = h->w[wid];
         const size_t n   = W.end - W.start, off = size_t(round) * n;
@@ -747,6 +757,9 @@ void boolCOTMultRound(BoolMultRounds* h, int round, const uint8_t* a, const uint
             c[W.start + i]        = (ai & bi) ^ rcv_mul ^ snd_mul;
         }
     });
+    h->t_out += Utils::to_sec(Utils::time_diff(tr2));
+    h->last_end  = measure::now();
+    h->any_round = true;
 }
 
 void boolCOTMultRoundsEnd(BoolMultRounds* h) {
@@ -764,7 +777,8 @@ void boolCOTMultRoundsEnd(BoolMultRounds* h) {
     }
     Utils::log(Utils::Level::INFO, "P", h->party - 1, ", PID", h->keys->get_io_offset(), ": Bool COT Mult rounds (",
                h->rounds, ")   s PRE: ", sec, " (random OTs ", h->ot_seconds, " s, first round waited until ", h->wait_seconds,
-               " s)   MB SENT PRE: ", data_sent,
+               " s; rounds: corrections ", h->t_corr, " s, exchange ", h->t_xchg, " s, outputs ", h->t_out,
+               " s, between rounds ", h->t_between, " s)   MB SENT PRE: ", data_sent,
                "   MB RECEIVED PRE: ", data_recv);
     accumulateTripleStat("BOOL_COT_MULT", data_sent, data_recv, sec);
     delete h;
