@@ -387,6 +387,11 @@ template <>
 void FerretCOT<IO::NetIO>::rcot(block* data, int64_t num) {
     if (ot_data == nullptr) {
         ot_data = new block[param.n];
+#if USE_LPN_GPU
+        // with the outputs on the device, the host buffer only receives the ranges it needs: untouched pages stay
+        // unallocated (every extension writes before anything reads)
+        if (!cheetah::lpn_gpu::mpcot_available())
+#endif
         memset(ot_data, 0, param.n * sizeof(block));
     }
     if (extend_initialized == false)
