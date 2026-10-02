@@ -1853,8 +1853,7 @@ void tmp(int party, int threads) {
 }
 
 void do_multiplex(int num_input, const UINT_TYPE* x32, const uint8_t* sel_packed, UINT_TYPE* y32,
-                  int party, const std::string& ip, int port, int io_offset, int threads) {
-    int bitlen = BIT_LEN;
+                  int party, const std::string& ip, int port, int io_offset, int threads, int bitlen) {
 
     auto& keys = Keys<IO::NetIO>::instance(party, ip, port, threads, io_offset);
 
@@ -2030,7 +2029,7 @@ void generateOT(int party, const std::string& ip, int port, int threads, int io_
 
 void generateCOT(int party, const UINT_TYPE* a, const uint8_t* b, UINT_TYPE* c,
                  const unsigned& num_triples, const std::string& ip, int port, int threads,
-                 int io_offset) {
+                 int io_offset, int bitlen) {
     Utils::log(Utils::Level::DEBUG, "P", party - 1, ", PID", io_offset, ": Generating ", num_triples, " COT triples");
     auto& keys = Keys<IO::NetIO>::instance(party, ip, port, threads, io_offset);
 
@@ -2054,7 +2053,7 @@ void generateCOT(int party, const UINT_TYPE* a, const uint8_t* b, UINT_TYPE* c,
 
         switch (party) {
         case emp::ALICE: {
-            silent->send_cot(c + start, a + start, n, 32);
+            silent->send_cot(c + start, a + start, n, bitlen);
             for (size_t i = 0; i < n; ++i) {
                 c[i + start] = -c[i + start] & moduloMask;
             }
@@ -2064,7 +2063,7 @@ void generateCOT(int party, const UINT_TYPE* a, const uint8_t* b, UINT_TYPE* c,
             uint8_t* sel = new uint8_t[n];
             for (size_t i = 0; i < n; ++i) sel[i] = get_nth(b, start + i);
 
-            silent->recv_cot(c + start, (bool*)sel, n, 32);
+            silent->recv_cot(c + start, (bool*)sel, n, bitlen);
             delete[] sel;
             break;
         }

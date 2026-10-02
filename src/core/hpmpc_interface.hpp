@@ -121,14 +121,16 @@ struct BNTripleLayer {
 void generateBNTriplesBatched(Keys<IO::NetIO>& keys, const std::vector<BNTripleLayer>& layers, int party,
                               int threads, Utils::PROTO proto, int factor = 1);
 
+// bitlen: the width of x and y (narrow multiplexers send bitlen-bit corrections; y is correct mod 2^bitlen)
 void do_multiplex(int num_input, const UINT_TYPE* x32, const uint8_t* sel_packed, UINT_TYPE* y32,
-                  int party, const std::string& ip, int port, int io_offset, int threads);
+                  int party, const std::string& ip, int port, int io_offset, int threads, int bitlen = BIT_LEN);
 
 void generateOT(int party, const std::string& ip, int port, int threads, int io_offset);
 
+// bitlen: the width of the correlation a (narrow COTs send bitlen-bit corrections; c is correct mod 2^bitlen)
 void generateCOT(int party, const UINT_TYPE* a, const uint8_t* b, UINT_TYPE* c,
                  const unsigned& num_triples, const std::string& ip, int port, int threads,
-                 int io_offset);
+                 int io_offset, int bitlen = BIT_LEN);
 
 // Conv triples on the CPU with the GPU path's packing (several images and output channels per ciphertext):
 // same interface and roles as generateConvTriplesCheetahWrapper (AB2: party 1 holds b = w, party 2 a = x).
