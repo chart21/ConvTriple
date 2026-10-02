@@ -5,6 +5,7 @@
 #include <seal/ciphertext.h>
 #include <seal/serializable.h>
 #include <sstream>
+#include <mutex>
 #include <thread>
 #include <unordered_map>
 
@@ -513,8 +514,10 @@ struct TripleStatEntry {
 };
 
 static std::unordered_map<std::string, TripleStatEntry> g_triple_stats;
+static std::mutex g_triple_stats_mutex;  // generators on two threads (conv triples on side channels)
 
 static void accumulateTripleStat(const std::string& type, double sent, double recv, double time) {
+    std::lock_guard<std::mutex> lock(g_triple_stats_mutex);
     auto& e = g_triple_stats[type];
     e.mb_sent += sent;
     e.mb_recv += recv;

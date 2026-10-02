@@ -11,6 +11,7 @@
 #include <unordered_map>
 
 #include <cstdio>
+#include <cstdint>
 #include <cstdlib>
 #include <cstring>
 #include <stdexcept>
@@ -118,13 +119,13 @@ __global__ void lpn_gather(uint4* G, const uint4* __restrict__ kk, int64_t start
     load_table(te);
     for (int i = threadIdx.x; i < 44; i += blockDim.x) rk[i] = rkeys.w[i];
     __syncthreads();
-    const int64_t t = int64_t(blockIdx.x) * blockDim.x + threadIdx.x;
-    if (t >= count)
-        return;
-    uint4 acc[4] = {};
-    lpn_group(acc, kk, start + 4 * (g0 + t), mask, k, rk, te, threadIdx.x & 31);
+    // grid-stride: a few blocks per SM, each loading the table once
+    for (int64_t t = int64_t(blockIdx.x) * blockDim.x + threadIdx.x; t < count; t += int64_t(gridDim.x) * blockDim.x) {
+        uint4 acc[4] = {};
+        lpn_group(acc, kk, start + 4 * (g0 + t), mask, k, rk, te, threadIdx.x & 31);
 #pragma unroll
-    for (int m = 0; m < 4; m++) G[4 * t + m] = acc[m];
+        for (int m = 0; m < 4; m++) G[4 * t + m] = acc[m];
+    }
 }
 
 // the same on the sparse vector on the device: nn[start + 4g + m] ^= the gathers, g < groups
@@ -135,17 +136,16 @@ __global__ void lpn_inplace(uint4* nn, const uint4* __restrict__ kk, int64_t sta
     load_table(te);
     for (int i = threadIdx.x; i < 44; i += blockDim.x) rk[i] = rkeys.w[i];
     __syncthreads();
-    const int64_t t = int64_t(blockIdx.x) * blockDim.x + threadIdx.x;
-    if (t >= groups)
-        return;
-    const int64_t i = start + 4 * t;
-    uint4 acc[4] = {};
-    lpn_group(acc, kk, i, mask, k, rk, te, threadIdx.x & 31);
+    for (int64_t t = int64_t(blockIdx.x) * blockDim.x + threadIdx.x; t < groups; t += int64_t(gridDim.x) * blockDim.x) {
+        const int64_t i = start + 4 * t;
+        uint4 acc[4] = {};
+        lpn_group(acc, kk, i, mask, k, rk, te, threadIdx.x & 31);
 #pragma unroll
-    for (int m = 0; m < 4; m++) {
-        uint4 v = nn[i + m];
-        v.x ^= acc[m].x, v.y ^= acc[m].y, v.z ^= acc[m].z, v.w ^= acc[m].w;
-        nn[i + m] = v;
+        for (int m = 0; m < 4; m++) {
+            uint4 v = nn[i + m];
+            v.x ^= acc[m].x, v.y ^= acc[m].y, v.z ^= acc[m].z, v.w ^= acc[m].w;
+            nn[i + m] = v;
+        }
     }
 }
 
@@ -179,7 +179,10 @@ __global__ void ggm_level(uint4* out, const uint4* __restrict__ in, int64_t tree
     for (int i = threadIdx.x; i < 88; i += blockDim.x) rk[i] = keys.w[i];
     __syncthreads();
     const int lane = threadIdx.x & 31;
-    const int64_t t = int64_t(blockIdx.x) * blockDim.x + threadIdx.x;
+    const int64_t total = trees << log_p;
+    // grid-stride, block-uniform (the shuffles below need whole warps)
+    for (int64_t base = int64_t(blockIdx.x) * blockDim.x; base < total; base += int64_t(gridDim.x) * blockDim.x) {
+    const int64_t t = base + threadIdx.x;
     const int64_t tree = t >> log_p, j = t & ((int64_t(1) << log_p) - 1);
     uint4 c0 = {}, c1 = {};
     if (tree < trees) {
@@ -205,6 +208,7 @@ __global__ void ggm_level(uint4* out, const uint4* __restrict__ in, int64_t tree
         uint4* s = sums + 2 * (tree * levels + log_p);
         atomic_xor4(s, c0);
         atomic_xor4(s + 1, c1);
+    }
     }
 }
 
@@ -312,9 +316,10 @@ __global__ void rot_hash(uint8_t* out, const uint4* __restrict__ cots, RotParams
     load_table(te);
     __syncthreads();
     const int lane = threadIdx.x & 31;
-    const int64_t o = int64_t(blockIdx.x) * blockDim.x + threadIdx.x;
+    for (int64_t base = int64_t(blockIdx.x) * blockDim.x; base < p.count; base += int64_t(gridDim.x) * blockDim.x) {
+    const int64_t o = base + threadIdx.x;
     if ((o & ~int64_t(31)) >= p.count)  // whole warps past the end (their words would be the next plane's)
-        return;
+        continue;
     const bool valid = o < p.count;
     uint64_t h0 = 0, h1 = 0;
     uint32_t c = 0;
@@ -354,6 +359,7 @@ __global__ void rot_hash(uint8_t* out, const uint4* __restrict__ cots, RotParams
                 w[(1 + q) * pw + word] = b;
         }
     }
+    }
 }
 
 __global__ void aes_test(uint32_t* out, RoundKeys rkeys, int n) {
@@ -370,7 +376,13 @@ __global__ void aes_test(uint32_t* out, RoundKeys rkeys, int n) {
 
 struct Device {
     bool ready = false;
+    unsigned max_blocks = 0;  // blocks of a table kernel that the GPU runs at once (grid-stride kernels launch at most these)
     Device() {
+        int sms = 0;
+        check(cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, 0), "SM count");
+        int per_sm = 0;
+        check(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&per_sm, lpn_inplace, 256, kTableBytes), "occupancy");
+        max_blocks = unsigned(std::max(1, sms * std::max(1, per_sm)));
         uint32_t te[256];
         uint8_t sb[256];
         make_tables(te, sb);
@@ -381,6 +393,18 @@ struct Device {
 Device& device() {
     static Device d;
     return d;
+}
+// blocks of 256 threads for `items` work items: one per 256, or (OT_GRID=k > 0) at most k times what runs at once
+unsigned grid(int64_t items) {
+    static const int64_t cap = getenv("OT_GRID") && atoi(getenv("OT_GRID")) > 0
+                                   ? int64_t(atoi(getenv("OT_GRID"))) * device().max_blocks : INT64_MAX;
+    static const bool shown = [] {
+        if (getenv("OT_GRID"))
+            fprintf(stderr, "OT kernels: %u blocks at once, OT_GRID=%s\n", device().max_blocks, getenv("OT_GRID"));
+        return true;
+    }();
+    (void) shown;
+    return unsigned(std::max<int64_t>(1, std::min<int64_t>((items + 255) / 256, cap)));
 }
 
 // a context: a stream, the table on the device, a ring of chunk buffers (device and pinned host), and the trees' buffers
@@ -514,7 +538,7 @@ void compute(void* nn_, const void* kk_, int64_t n, int64_t k, uint32_t mask, co
             xor_chunk(ch - kRing);
         const int b = int(ch % kRing);
         const int64_t g0 = ch * kChunkGroups, cnt = std::min(kChunkGroups, groups - g0);
-        lpn_gather<<<unsigned((cnt + 255) / 256), 256, kTableBytes, c.stream>>>(c.dG[b], c.dkk, start, g0, cnt, mask, uint32_t(k), rk);
+        lpn_gather<<<grid(cnt), 256, kTableBytes, c.stream>>>(c.dG[b], c.dkk, start, g0, cnt, mask, uint32_t(k), rk);
         check(cudaGetLastError(), "launch");
         check(cudaMemcpyAsync(c.hG[b], c.dG[b], size_t(4 * cnt) * sizeof(uint4), cudaMemcpyDeviceToHost, c.stream), "copy back");
         check(cudaEventRecord(c.done[b], c.stream), "event");
@@ -601,7 +625,7 @@ void Extension::sender_trees(const void* seeds, int64_t trees, int depth, const 
     for (int L = 1; L <= levels; L++) {
         const int64_t threads = trees << (L - 1);
         const uint4* in = L == 1 ? c.dSeed : level_buf(D, c, L - 1, depth);
-        ggm_level<<<unsigned((threads + 255) / 256), 256, kTableBytes, c.stream>>>(level_buf(D, c, L, depth), in, trees, L - 1, levels,
+        ggm_level<<<grid(threads), 256, kTableBytes, c.stream>>>(level_buf(D, c, L, depth), in, trees, L - 1, levels,
                                                                                     c.dSums, nullptr, L == levels, tk);
         check(cudaGetLastError(), "launch tree level");
     }
@@ -625,7 +649,7 @@ void Extension::recver_trees(const void* msg, const uint8_t* bits, const void* s
         const int64_t threads = trees << (L - 1);
         const uint4* in = L == 1 ? c.dSeed : level_buf(D, c, L - 1, depth);
         uint4* out = level_buf(D, c, L, depth);
-        ggm_level<<<unsigned((threads + 255) / 256), 256, kTableBytes, c.stream>>>(out, in, trees, L - 1, levels, c.dSums,
+        ggm_level<<<grid(threads), 256, kTableBytes, c.stream>>>(out, in, trees, L - 1, levels, c.dSums,
                                                                                     c.dPunct, L == levels, tk);
         check(cudaGetLastError(), "launch tree level");
         ggm_fix<<<unsigned((trees + 127) / 128), 128, 0, c.stream>>>(out, trees, L, levels, c.dSums, c.dMsg, c.dBits, c.dSecret,
@@ -640,7 +664,7 @@ void Extension::lpn(int64_t k, uint32_t mask, const uint32_t round_keys[44], int
         return;
     RoundKeys rk;
     std::memcpy(rk.w, round_keys, sizeof(rk.w));
-    lpn_inplace<<<unsigned((groups + 255) / 256), 256, kTableBytes, c.stream>>>(static_cast<uint4*>(leaves_), c.dkk, start, groups,
+    lpn_inplace<<<grid(groups), 256, kTableBytes, c.stream>>>(static_cast<uint4*>(leaves_), c.dkk, start, groups,
                                                                                  mask, uint32_t(k), rk);
     check(cudaGetLastError(), "launch lpn");
 }
@@ -739,7 +763,7 @@ void rot_bits(const void* cots, bool on_device, int64_t count, const uint64_t s[
         src = c.dD;
     }
     const int64_t threads = ((count + 31) / 32) * 32;
-    rot_hash<<<unsigned((threads + 255) / 256), 256, kTableBytes, c.stream>>>(c.dRot, src, prm);
+    rot_hash<<<grid(threads), 256, kTableBytes, c.stream>>>(c.dRot, src, prm);
     check(cudaGetLastError(), "launch rot hash");
     check(cudaMemcpyAsync(out, c.dRot, size_t(planes) * size_t(stride), cudaMemcpyDeviceToHost, c.stream), "copy rot planes");
     check(cudaStreamSynchronize(c.stream), "rot bits");
