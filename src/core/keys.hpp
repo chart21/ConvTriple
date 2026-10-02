@@ -87,7 +87,9 @@ class Keys {
         gemini::LaunchWorks(tpool, _ot_packs.size(), init_ot);
         Utils::log(Utils::Level::INFO, "P", _party - 1, ", PID", _io_offset, ": OT packs   s PRE: ",
                    Utils::to_sec(Utils::time_diff(start)), " (packs: ", _ot_packs.size(), ", ferret threads: ", _ot_group,
-                   ", unseeded PRGs: ", emp::det_seed_misses().load(), ")");
+                   ", unseeded PRGs: ", emp::det_seed_misses().load(), "; sums over instances: ferret setup ",
+                   cheetah::ferret_setup_ns().load() * 1e-9, " s, first extension ", cheetah::ferret_warmup_ns().load() * 1e-9,
+                   " s, of which MPCOT ", cheetah::mpcot_ns().load() * 1e-9, " s, LPN ", cheetah::lpn_ns().load() * 1e-9, " s)");
     }
     Channel* ot_io(int idx) const { return _ios[size_t(idx) * _ot_group]; }
     // n channels of their own, after the regular ones (port + (threads + k) * io_offset), made at the first call: for a
@@ -301,8 +303,17 @@ void Keys<Channel>::disconnect() {
             }
         Utils::log(Utils::Level::INFO, "P", _party - 1, ", PID", _io_offset, ": OT packs: ", _ot_packs.size(),
                    " x ", _ot_group, " threads, ferret extensions after setup: ", ext, ", time in rcot (sum over packs): ",
-                   sec, " s, in the LPN step (incl. setup): ", cheetah::lpn_ns().load() * 1e-9, " s");
+                   sec, " s, in the LPN step (incl. setup): ", cheetah::lpn_ns().load() * 1e-9, " s, in MPCOT: ",
+                   cheetah::mpcot_ns().load() * 1e-9, " s");
     }
+    if (!_ot_packs.empty())
+        for (int c = 0; c < cheetah::kConsumers; ++c) {
+            const auto& st = cheetah::consumer_stats()[c];
+            if (st.calls.load())
+                Utils::log(Utils::Level::INFO, "P", _party - 1, ", PID", _io_offset, ": OT consumer ", cheetah::consumer_name(c),
+                           ": calls ", st.calls.load(), ", COTs ", st.cots.load(), ", time ", st.ns.load() * 1e-9,
+                           " s, of which rcot ", st.rcot_ns.load() * 1e-9, " s (sums over threads)");
+        }
     if (gemini::kSeeded && emp::det_seed_misses().load())
         Utils::log(Utils::Level::INFO, "P", _party - 1, ", PID", _io_offset, ": PRGs seeded outside a DetSeedScope: ",
                    emp::det_seed_misses().load(), " (the OT outputs may differ between runs)");

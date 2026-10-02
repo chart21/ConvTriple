@@ -28,6 +28,40 @@ inline std::atomic<int64_t>& lpn_ns() {
     static std::atomic<int64_t> ns{0};
     return ns;
 }
+// time in ferret's MPCOT (the GGM trees and their OTs), summed the same way
+inline std::atomic<int64_t>& mpcot_ns() {
+    static std::atomic<int64_t> ns{0};
+    return ns;
+}
+// COTs and time per consumer of SilentOT (outermost call only; rcot = the time in ferret's rcot inside it), summed
+enum Consumer { kCamCc, kCmCcBlock, kCmCcT, kRcmCc, kRmCc, kRmRcBlock, kRotBits, kRotPlanes, kRmRcT, kCmCcN, kConsumers };
+inline const char* consumer_name(int c) {
+    static const char* n[] = {"cam_cc", "cm_cc(block)", "cm_cc(T)", "rcm_cc", "rm_cc", "rm_rc(block)", "rot_bits",
+                              "rot_bitplanes", "rm_rc(T)", "cm_cc(N)"};
+    return n[c];
+}
+struct ConsumerStats {
+    std::atomic<int64_t> cots{0}, ns{0}, rcot_ns{0}, calls{0};
+};
+inline ConsumerStats* consumer_stats() {
+    static ConsumerStats s[kConsumers];
+    return s;
+}
+inline int& consumer_depth() {
+    thread_local int d = 0;
+    return d;
+}
+
+// SilentOT's construction, summed over instances: ferret's setup (base OTs, IKNP, the small first extension), then the
+// warm-up rcot (the first full extension)
+inline std::atomic<int64_t>& ferret_setup_ns() {
+    static std::atomic<int64_t> ns{0};
+    return ns;
+}
+inline std::atomic<int64_t>& ferret_warmup_ns() {
+    static std::atomic<int64_t> ns{0};
+    return ns;
+}
 } // namespace cheetah
 
 // The LPN step itself (emp's compute: the seed, then task() over `threads` ranges on the pool), or on the GPU in
@@ -35,6 +69,13 @@ inline std::atomic<int64_t>& lpn_ns() {
 // library (hpmpc_interface.cpp), so that every translation unit uses the same one.
 template <>
 void LpnF2<IO::NetIO, 10>::compute(block* nn, const block* kk, block s);
+// ferret's extension (MPCOT, then the LPN step), with the MPCOT time measured; defined in hpmpc_interface.cpp
+template <>
+void FerretCOT<IO::NetIO>::extend(block* ot_output, MpcotReg<IO::NetIO>* mpcot, OTPre<IO::NetIO>* preot,
+                                 LpnF2<IO::NetIO, 10>* lpn, block* ot_input, block seed);
+// and its destructor (emp's, after releasing the GPU's pinning of ot_data); defined in hpmpc_interface.cpp
+template <>
+FerretCOT<IO::NetIO>::~FerretCOT();
 
 template <>
 inline void LpnF2<IO::NetIO, 10>::task(block* nn, const block* kk, int64_t start, int64_t end) {
@@ -85,6 +126,26 @@ class SilentOT : public sci::OT<SilentOT<IO>> {
     IO** ios;
     emp::block seed;
 
+    struct Probe {
+        SilentOT* self;
+        int id;
+        int64_t n, rcot0;
+        std::chrono::steady_clock::time_point t0;
+        Probe(SilentOT* s, int id, int64_t n)
+            : self(s), id(id), n(n), rcot0(s->rcot_ns_), t0(std::chrono::steady_clock::now()) {
+            ++consumer_depth();
+        }
+        ~Probe() {
+            if (--consumer_depth() != 0)
+                return;
+            ConsumerStats& c = consumer_stats()[id];
+            c.cots += n;
+            c.calls += 1;
+            c.ns += std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count();
+            c.rcot_ns += self->rcot_ns_ - rcot0;
+        }
+    };
+
   public:
     FerretCOT<IO>* ferret;
     static constexpr int64_t rot_chunk = 4096; // OTs per chunk of send/recv_rot_bits (64 KiB of COTs)
@@ -92,7 +153,10 @@ class SilentOT : public sci::OT<SilentOT<IO>> {
     SilentOT(int party, int threads, IO** ios, bool malicious = false, bool run_setup = true,
              std::string pre_file = "", bool warm_up = true)
         : threads(threads), ios(ios) {
+        const auto t0 = std::chrono::steady_clock::now();
         ferret = new FerretCOT<IO>(party, threads, ios, malicious, run_setup, ferret_param(), pre_file);
+        const auto t1 = std::chrono::steady_clock::now();
+        ferret_setup_ns() += std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0).count();
 
 #if PRG_SEED != -1
         seed = _mm_set1_epi64x(int64_t(gemini::party_seed64(ios[0]->port, 1)));
@@ -101,6 +165,7 @@ class SilentOT : public sci::OT<SilentOT<IO>> {
         if (warm_up) {
             block tmp;
             ferret->rcot(&tmp, 1);
+            ferret_warmup_ns() += std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t1).count();
         }
         count_rcot_ = 0;
     }
@@ -159,6 +224,7 @@ class SilentOT : public sci::OT<SilentOT<IO>> {
     // ('data0').
     template <class T>
     void send_ot_cam_cc(T* data0, const T* corr, int64_t length, int l) {
+        Probe probe_(this, kCamCc, length);
         T modulo_mask = (1ULL << l) - 1;
         if (l == sizeof(T) * 8)
             modulo_mask = (T)(-1ULL);
@@ -206,6 +272,7 @@ class SilentOT : public sci::OT<SilentOT<IO>> {
     // receives 'x' if b = 0, and 'x + corr' if b = 1
     template <class T>
     void recv_ot_cam_cc(T* data, const bool* b, int64_t length, int l) {
+        Probe probe_(this, kCamCc, length);
         T modulo_mask = (1ULL << l) - 1;
         if (l == sizeof(T) * 8)
             modulo_mask = (T)(-1ULL);
@@ -249,6 +316,7 @@ class SilentOT : public sci::OT<SilentOT<IO>> {
 
     // chosen message, chosen choice
     void send_ot_cm_cc(const block* data0, const block* data1, int64_t length) {
+        Probe probe_(this, kCmCcBlock, length);
         block* data = new block[length];
         send_ot_rcm_cc(data, length);
 
@@ -280,6 +348,7 @@ class SilentOT : public sci::OT<SilentOT<IO>> {
 
     // chosen message, chosen choice
     void recv_ot_cm_cc(block* data, const bool* r, int64_t length) {
+        Probe probe_(this, kCmCcBlock, length);
         recv_ot_rcm_cc(data, r, length);
 
         block s;
@@ -305,6 +374,7 @@ class SilentOT : public sci::OT<SilentOT<IO>> {
     // 1-out-of-N OT.
     template <typename T>
     void send_ot_cm_cc(T** data, int64_t length, int l) {
+        Probe probe_(this, kCmCcT, length);
         block* rcm_data = new block[length];
         send_ot_rcm_cc(rcm_data, length);
 
@@ -347,6 +417,7 @@ class SilentOT : public sci::OT<SilentOT<IO>> {
     // order to be general and compatible with the API of 1-out-of-N OT.
     template <typename T>
     void recv_ot_cm_cc(T* data, const uint8_t* r, int64_t length, int l) {
+        Probe probe_(this, kCmCcT, length);
         block* rcm_data = new block[length];
         recv_ot_rcm_cc(rcm_data, (const bool*)r, length);
 
@@ -378,17 +449,20 @@ class SilentOT : public sci::OT<SilentOT<IO>> {
 
     // random correlated message, chosen choice
     void send_ot_rcm_cc(block* data0, int64_t length) {
+        Probe probe_(this, kRcmCc, length);
         ferret->send_cot(data0, length);
         count_rcot_.fetch_add(length);
     }
 
     // random correlated message, chosen choice
     void recv_ot_rcm_cc(block* data, const bool* b, int64_t length) {
+        Probe probe_(this, kRcmCc, length);
         ferret->recv_cot(data, b, length);
     }
 
     // random message, chosen choice
     void send_ot_rm_cc(block* data0, block* data1, int64_t length) {
+        Probe probe_(this, kRmCc, length);
         send_ot_rcm_cc(data0, length);
         block s;
         ferret->prg.random_block(&s, 1);
@@ -412,6 +486,7 @@ class SilentOT : public sci::OT<SilentOT<IO>> {
 
     // random message, chosen choice
     void recv_ot_rm_cc(block* data, const bool* r, int64_t length) {
+        Probe probe_(this, kRmCc, length);
         recv_ot_rcm_cc(data, r, length);
         block s;
         ferret->io->recv_block(&s, 1);
@@ -427,6 +502,7 @@ class SilentOT : public sci::OT<SilentOT<IO>> {
 
     // random message, random choice
     void send_ot_rm_rc(block* data0, block* data1, int64_t length) {
+        Probe probe_(this, kRmRcBlock, length);
         timed_rcot(data0, length);
 
         block s;
@@ -451,6 +527,7 @@ class SilentOT : public sci::OT<SilentOT<IO>> {
 
     // random message, random choice
     void recv_ot_rm_rc(block* data, bool* r, int64_t length) {
+        Probe probe_(this, kRmRcBlock, length);
         timed_rcot(data, length);
         for (int64_t i = 0; i < length; i++) {
             r[i] = getLSB(data[i]);
@@ -472,6 +549,7 @@ class SilentOT : public sci::OT<SilentOT<IO>> {
     // multiple of 8). The COTs are taken from ferret, hashed and reduced to bits in cache-sized chunks,
     // where send_ot_rm_rc<T> stores two 16-byte blocks and a T per OT and makes several passes over them.
     void send_rot_bits(uint8_t* m0, uint8_t* m1, int64_t length) {
+        Probe probe_(this, kRotBits, length);
         block s;
         ferret->prg.random_block(&s, 1);
         ferret->io->send_block(&s, 1);
@@ -501,6 +579,7 @@ class SilentOT : public sci::OT<SilentOT<IO>> {
 
     // receiver side of send_rot_bits: random choice bits c and the chosen message bits mc
     void recv_rot_bits(uint8_t* mc, uint8_t* c, int64_t length) {
+        Probe probe_(this, kRotBits, length);
         block s;
         ferret->io->recv_block(&s, 1);
         ferret->mitccrh.setS(s);
@@ -527,6 +606,7 @@ class SilentOT : public sci::OT<SilentOT<IO>> {
     // bit j of m0[p][i] / m1[p][i]. The k bits come from one hash per message (plane 0 = send_rot_bits'
     // bit), so a COT carries k independent message bits for the price of one.
     void send_rot_bitplanes(uint8_t* const* m0, uint8_t* const* m1, int k, int64_t length) {
+        Probe probe_(this, kRotPlanes, length);
         block s;
         ferret->prg.random_block(&s, 1);
         ferret->io->send_block(&s, 1);
@@ -563,6 +643,7 @@ class SilentOT : public sci::OT<SilentOT<IO>> {
 
     // receiver side of send_rot_bitplanes: random choice bits c and the k chosen message bit planes mc
     void recv_rot_bitplanes(uint8_t* const* mc, uint8_t* c, int k, int64_t length) {
+        Probe probe_(this, kRotPlanes, length);
         block s;
         ferret->io->recv_block(&s, 1);
         ferret->mitccrh.setS(s);
@@ -593,6 +674,7 @@ class SilentOT : public sci::OT<SilentOT<IO>> {
     // random message, random choice
     template <typename T>
     void send_ot_rm_rc(T* data0, T* data1, int64_t length, int l) {
+        Probe probe_(this, kRmRcT, length);
         block* rm_data0 = new block[length];
         block* rm_data1 = new block[length];
         send_ot_rm_rc(rm_data0, rm_data1, length);
@@ -611,6 +693,7 @@ class SilentOT : public sci::OT<SilentOT<IO>> {
     // random message, random choice
     template <typename T>
     void recv_ot_rm_rc(T* data, bool* r, int64_t length, int l) {
+        Probe probe_(this, kRmRcT, length);
         block* rm_data = new block[length];
         recv_ot_rm_rc(rm_data, r, length);
 
@@ -627,6 +710,7 @@ class SilentOT : public sci::OT<SilentOT<IO>> {
     // One-oo-N OT, where each message has l bits. Here, the 2nd dim of data is N.
     template <typename T>
     void send_ot_cm_cc(T** data, int64_t length, int N, int l) {
+        Probe probe_(this, kCmCcN, length);
         int logN = (int)ceil(log2(N));
 
         block* rm_data0 = new block[length * logN];
@@ -693,6 +777,7 @@ class SilentOT : public sci::OT<SilentOT<IO>> {
     // N).
     template <typename T>
     void recv_ot_cm_cc(T* data, const uint8_t* r, int64_t length, int N, int l) {
+        Probe probe_(this, kCmCcN, length);
         int logN = (int)ceil(log2(N));
 
         block* rm_data  = new block[length * logN];

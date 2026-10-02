@@ -26,6 +26,213 @@ const PrimalLPNParameter& ferret_param() { return TRIPLE_FERRET; }
 #include "ot/lpn_gpu.h"
 #endif
 
+#if USE_LPN_GPU
+namespace {
+// TwoKeyPRP's two key schedules (the GGM trees' PRG), as the GPU takes them
+void two_key_schedules(uint32_t keys[88]) {
+    TwoKeyPRP prp(zero_block, makeBlock(0, 1));
+    std::memcpy(keys, prp.aes_key[0].rd_key, 44 * sizeof(uint32_t));
+    std::memcpy(keys + 44, prp.aes_key[1].rd_key, 44 * sizeof(uint32_t));
+}
+
+// MpcotReg::exec_parallel_sender/recver's split of the trees over the ios (group j < threads - 1: the trees j width ..
+// (j + 1) width - 1 on ios[j], the last group the rest on ios[threads - 1]): f(first, end, io) per group, in parallel
+// on the pool
+template <typename F>
+void per_io(MpcotReg<IO::NetIO>* mpcot, const F& f) {
+    const int threads = mpcot->threads, trees = mpcot->tree_n, width = trees / threads;
+    std::vector<std::future<void>> fut;
+    for (int j = 0; j < threads - 1; ++j)
+        fut.push_back(mpcot->pool->enqueue([=, &f] { f(j * width, (j + 1) * width, mpcot->ios[j]); }));
+    f((threads - 1) * width, trees, mpcot->ios[threads - 1]);
+    for (auto& x : fut) x.get();
+}
+
+int64_t mismatches(const block* a, const block* b, int64_t n) {
+    int64_t bad = 0;
+    for (int64_t i = 0; i < n; ++i) bad += !cmpBlock(a + i, b + i, 1);
+    return bad;
+}
+
+// One semi-honest extension with MPCOT's trees and the LPN step on the GPU (lpn_gpu::Extension): the same messages on
+// the same ios in the same order as MpcotReg::mpcot, then LpnF2::compute's seed, so the outputs are emp's bit for bit
+// (and either party can run either path). False (nothing sent yet) when the device has no room left.
+// FERRET_GPU_CHECK=1 compares the trees and the outputs with emp's CPU code.
+bool extend_gpu(int party, block Delta, block* ot_output, MpcotReg<IO::NetIO>* mpcot, OTPre<IO::NetIO>* preot,
+                LpnF2<IO::NetIO, 10>* lpn, const block* kk, block seed, std::chrono::steady_clock::time_point t0) {
+    const int depth = mpcot->tree_height, levels = depth - 1;
+    const int64_t trees = mpcot->tree_n, leave_n = mpcot->leave_n, n = lpn->n;
+    std::unique_ptr<cheetah::lpn_gpu::Extension> gpu;
+    try {
+        gpu = std::make_unique<cheetah::lpn_gpu::Extension>();
+        gpu->reserve(trees, depth, lpn->k);
+    } catch (const std::exception& e) {
+        static std::atomic<bool> said{false};
+        if (!said.exchange(true))
+            std::cerr << "ferret on the GPU: " << e.what() << ", this extension (and the next ones that do not fit) on the CPU\n";
+        return false;
+    }
+    gpu->upload_kk(kk, lpn->k);
+    uint32_t keys[88];
+    two_key_schedules(keys);
+    static const bool check = getenv("FERRET_GPU_CHECK") && atoi(getenv("FERRET_GPU_CHECK")) != 0;
+    std::vector<block> ref(check ? n : 0);  // emp's sparse vector, then its outputs (check)
+    const block one = makeBlock(0xFFFFFFFFFFFFFFFFLL, 0xFFFFFFFFFFFFFFFELL);
+    int64_t bad_msgs = 0;
+    if (party == ALICE) {
+        std::vector<SPCOT_Sender<IO::NetIO>*> senders;
+        mpcot->mpcot_init_sender(senders, preot);
+        std::vector<block> seeds(trees), msg(size_t(trees) * levels * 2);
+        for (int64_t i = 0; i < trees; ++i) seeds[i] = senders[i]->seed;
+        gpu->sender_trees(seeds.data(), trees, depth, keys, msg.data());
+        for (int64_t i = 0; i < trees; ++i) {
+            SPCOT_Sender<IO::NetIO>* s = senders[i];
+            const block* mi = msg.data() + 2 * i * levels;
+            const block sum = ((mi[2 * levels - 2] ^ mi[2 * levels - 1]) & one) ^ mpcot->Delta_f2k;
+            if (check) {
+                s->compute(ref.data() + i * leave_n, mpcot->Delta_f2k);
+                for (int h = 0; h < levels; ++h)
+                    bad_msgs += !cmpBlock(&s->m[h], mi + 2 * h, 1) + !cmpBlock(&s->m[levels + h], mi + 2 * h + 1, 1);
+                bad_msgs += !cmpBlock(&s->secret_sum_f2, &sum, 1);
+            }
+            for (int h = 0; h < levels; ++h) s->m[h] = mi[2 * h], s->m[levels + h] = mi[2 * h + 1];
+            s->secret_sum_f2 = sum;
+        }
+        // SPCOT_Sender::send_f2k of every tree of a group (OTPre::send's pads, level by level, then the secret sum),
+        // as one message: the same bytes, without emp's flush after every tree
+        per_io(mpcot, [&](int first, int end, IO::NetIO* io) {
+            std::vector<block> buf(size_t(end - first) * (2 * levels + 1));
+            block* b = buf.data();
+            for (int i = first; i < end; ++i) {
+                const block* m = senders[i]->m;
+                for (int h = 0; h < levels; ++h) {
+                    const int64_t k = int64_t(i) * levels + h;
+                    *b++ = m[h] ^ preot->pre_data[k];
+                    *b++ = m[levels + h] ^ preot->pre_data[k + preot->n];
+                }
+                *b++ = senders[i]->secret_sum_f2;
+            }
+            io->send_data(buf.data(), buf.size() * sizeof(block));
+            io->flush();
+        });
+        for (auto* s : senders) delete s;
+    } else {
+        std::vector<SPCOT_Recver<IO::NetIO>*> recvers;
+        mpcot->mpcot_init_recver(recvers, preot);
+        // SPCOT_Recver::recv_f2k of every tree of a group, from one message (OTPre::recv: the chosen pad ^ pre_data)
+        std::vector<block> msg(size_t(trees) * levels), secret(trees);
+        std::vector<uint8_t> bits(size_t(trees) * levels);
+        per_io(mpcot, [&](int first, int end, IO::NetIO* io) {
+            std::vector<block> buf(size_t(end - first) * (2 * levels + 1));
+            io->recv_data(buf.data(), buf.size() * sizeof(block));
+            const block* b = buf.data();
+            for (int i = first; i < end; ++i) {
+                SPCOT_Recver<IO::NetIO>* r = recvers[i];
+                for (int h = 0; h < levels; ++h, b += 2) {
+                    const int64_t k = int64_t(i) * levels + h;
+                    r->m[h] = preot->pre_data[k] ^ b[r->b[h] ? 1 : 0];
+                    msg[k] = r->m[h], bits[k] = r->b[h];
+                }
+                r->secret_sum_f2 = *b++;
+                secret[i] = r->secret_sum_f2;
+            }
+        });
+        gpu->recver_trees(msg.data(), bits.data(), secret.data(), trees, depth, keys);
+        if (check)
+            for (int64_t i = 0; i < trees; ++i) recvers[i]->compute(ref.data() + i * leave_n);
+        for (auto* r : recvers) delete r;
+    }
+    int64_t bad_trees = 0;
+    if (check) {
+        gpu->download(ot_output, n);
+        bad_trees = mismatches(ot_output, ref.data(), n);
+    }
+    const auto t1 = std::chrono::steady_clock::now();
+    cheetah::mpcot_ns() += std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0).count();
+    // LpnF2::compute: the seed, then the groups of 4 of every task range on the GPU, the trailing outputs here
+    lpn->seed = cmpBlock(&seed, &zero_block, 1) ? lpn->seed_gen() : seed;
+    PRP prp(lpn->seed);
+    uint32_t rk[44];
+    std::memcpy(rk, prp.aes.rd_key, sizeof(rk));
+    const int64_t width = n / lpn->threads;
+    auto range = [&](int t, int64_t& start, int64_t& end) {
+        start = t * width, end = t == lpn->threads - 1 ? n : std::min((t + 1) * width, n);
+        return end - 4 > start ? (end - 4 - start + 3) / 4 : int64_t(0);
+    };
+    int64_t start, end;
+    for (int t = 0; t < lpn->threads; ++t) {
+        const int64_t groups = range(t, start, end);
+        gpu->lpn(lpn->k, uint32_t(lpn->mask), rk, start, groups);
+    }
+    gpu->download(ot_output, n);
+    for (int t = 0; t < lpn->threads; ++t)
+        for (int64_t j = start + 4 * range(t, start, end); j < end; ++j) lpn->__compute1(ot_output, kk, j, &prp);
+    cheetah::lpn_ns() += std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t1).count();
+    if (check) {
+        for (int t = 0; t < lpn->threads; ++t) {
+            range(t, start, end);
+            lpn->task(ref.data(), kk, start, end);
+        }
+        const int64_t bad_out = mismatches(ot_output, ref.data(), n);
+        std::cerr << "FERRET_GPU_CHECK P" << party << ": " << trees << " trees of " << leave_n << " leaves, messages "
+                  << (bad_msgs ? "DIFFER" : "equal") << ", trees " << (bad_trees ? "DIFFER" : "equal") << " ("
+                  << bad_trees << "), outputs " << (bad_out ? "DIFFER" : "equal") << " (" << bad_out << " of " << n
+                  << ")\n";
+    }
+    return true;
+}
+} // namespace
+#endif
+
+template <>
+void FerretCOT<IO::NetIO>::extend(block* ot_output, MpcotReg<IO::NetIO>* mpcot, OTPre<IO::NetIO>* preot,
+                                 LpnF2<IO::NetIO, 10>* lpn, block* ot_input, block seed) {
+    const auto t0 = std::chrono::steady_clock::now();
+    if (party == ALICE)
+        mpcot->sender_init(Delta);
+    else
+        mpcot->recver_init();
+#if USE_LPN_GPU
+    // semi-honest, with the leaves exactly the LPN's outputs (b12: 2507 trees of 4096)
+    if (!is_malicious && cheetah::lpn_gpu::mpcot_available() && int64_t(mpcot->tree_n) * mpcot->leave_n == lpn->n) {
+        // ot_data, where rcot's extensions go (ConvTriple takes COTs in chunks), is pinned once: the outputs are copied
+        // into it directly (until the destructor)
+        if (ot_output == ot_data && lpn->n == param.n)
+            cheetah::lpn_gpu::pin(ot_data, size_t(param.n) * sizeof(block));
+        if (extend_gpu(party, Delta, ot_output, mpcot, preot, lpn, ot_input + mpcot->consist_check_cot_num, seed, t0))
+            return;
+    }
+#endif
+    mpcot->mpcot(ot_output, preot, ot_input);
+    cheetah::mpcot_ns() += std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count();
+    lpn->compute(ot_output, ot_input + mpcot->consist_check_cot_num, seed);
+}
+
+template <>
+FerretCOT<IO::NetIO>::~FerretCOT() {
+#if USE_LPN_GPU
+    if (ot_data != nullptr)
+        cheetah::lpn_gpu::unpin(ot_data);
+#endif
+    if (ot_pre_data != nullptr) {
+        if (party == ALICE)
+            write_pre_data128_to_file((void*) ot_pre_data, (__uint128_t) Delta, pre_ot_filename);
+        else
+            write_pre_data128_to_file((void*) ot_pre_data, (__uint128_t) 0, pre_ot_filename);
+        delete[] ot_pre_data;
+    }
+    if (ot_data != nullptr)
+        delete[] ot_data;
+    if (pre_ot != nullptr)
+        delete pre_ot;
+    delete base_cot;
+    delete pool;
+    if (lpn_f2 != nullptr)
+        delete lpn_f2;
+    if (mpcot != nullptr)
+        delete mpcot;
+}
+
 template <>
 void LpnF2<IO::NetIO, 10>::compute(block* nn, const block* kk, block s) {
     const auto t0 = std::chrono::steady_clock::now();
