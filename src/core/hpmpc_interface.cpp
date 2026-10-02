@@ -631,6 +631,9 @@ struct BoolMultRounds {
     std::vector<Worker> w;
     decltype(measure::now()) t0;
     double ot_seconds = 0;
+    std::vector<uint8_t> mine, theirs;  // one round's corrections: choice corrections, then masked values
+    std::thread gen;                    // the random OTs (boolCOTMultRoundsBegin)
+    double wait_seconds = 0;            // until the first round had them
     // fn(wid) on every worker with a byte range, in parallel
     template <typename F>
     void each(F fn) {
@@ -665,7 +668,9 @@ BoolMultRounds* boolCOTMultRoundsBegin(uint64_t num_triples, int rounds, const s
         h->w[wid].start = std::min<size_t>(size_t(wid) * load, h->num_bytes);
         h->w[wid].end   = std::min<size_t>(h->w[wid].start + load, h->num_bytes);
     }
-    // all rounds' random OTs: as cot_multiply_shares, the reversed instance first, then the straight one
+    // all rounds' random OTs: as cot_multiply_shares, the reversed instance first, then the straight one; on a thread
+    // of its own (the caller may do other work meanwhile; the first round waits)
+    h->gen = std::thread([h, ot_call, rounds] {
     h->each([h, ot_call, rounds](int wid) {
         emp::DetSeedScope det_scope(Keys<IO::NetIO>::ot_seed_tag(ot_call, wid), gemini::kSeeded);  // reproducible OT
         auto& W           = h->w[wid];
@@ -686,39 +691,67 @@ BoolMultRounds* boolCOTMultRoundsBegin(uint64_t num_triples, int rounds, const s
         otpack->io->flush();
     });
     h->ot_seconds = Utils::to_sec(Utils::time_diff(h->t0));
+    });
     return h;
 }
 
 void boolCOTMultRound(BoolMultRounds* h, int round, const uint8_t* a, const uint8_t* b, uint8_t* c) {
+    // The corrections of all workers' ranges into one buffer (on the pool), exchanged over A2B_ROUND_CHANNELS channels
+    // (default 4: the bytes per round are few, so many small messages mostly wait for their slowest one), then the
+    // outputs (on the pool). Which party sends first follows the channel's pack role, as cot_multiply_shares.
+    static const int nch_env = getenv("A2B_ROUND_CHANNELS") ? std::max(1, atoi(getenv("A2B_ROUND_CHANNELS"))) : 4;
+    if (h->gen.joinable()) {
+        h->gen.join();
+        h->wait_seconds = Utils::to_sec(Utils::time_diff(h->t0));
+    }
+    const size_t nb  = h->num_bytes;
+    auto& mine       = h->mine;
+    auto& theirs     = h->theirs;
+    mine.resize(2 * nb), theirs.resize(2 * nb);
+    h->each([h, round, a, b](int wid) {
+        auto& W          = h->w[wid];
+        const size_t n   = W.end - W.start, off = size_t(round) * n;
+        const uint8_t *r0 = W.r0.data() + off, *r1 = W.r1.data() + off, *s = W.s.data() + off;
+        uint8_t* e = h->mine.data() + W.start;           // choice corrections
+        uint8_t* m = h->mine.data() + h->num_bytes + W.start;  // masked values
+        for (size_t i = 0; i < n; ++i) e[i] = s[i] ^ a[W.start + i];
+        for (size_t i = 0; i < n; ++i) m[i] = b[W.start + i] ^ r0[i] ^ r1[i];
+    });
+    const int nch = std::min<int>(nch_env, int(h->w.size()));
+    std::vector<std::future<void>> fut;
+    for (int ch = 0; ch < nch; ++ch)
+        fut.push_back(h->pool->enqueue([h, ch, nch, nb] {
+            const size_t lo = 2 * nb * ch / nch, hi = 2 * nb * (ch + 1) / nch;
+            auto* io = h->keys->get_otpack(ch)->io;
+            if ((ch & 1 ? OTHER_PARTY(h->party) : h->party) == emp::ALICE) {
+                io->send_data(h->mine.data() + lo, hi - lo);
+                io->flush();
+                io->recv_data(h->theirs.data() + lo, hi - lo);
+            } else {
+                io->recv_data(h->theirs.data() + lo, hi - lo);
+                io->send_data(h->mine.data() + lo, hi - lo);
+                io->flush();
+            }
+        }));
+    for (auto& f : fut) f.get();
     h->each([h, round, a, b, c](int wid) {
         auto& W          = h->w[wid];
-        const size_t nb  = W.end - W.start, off = size_t(round) * nb;
-        const uint8_t *r0 = W.r0.data() + off, *r1 = W.r1.data() + off, *s = W.s.data() + off, *rs = W.rs.data() + off;
-        const uint8_t *ai = a + W.start, *bi = b + W.start;
-        std::vector<uint8_t> mine(2 * nb), theirs(2 * nb);  // choice corrections, then masked values
-        for (size_t i = 0; i < nb; ++i) mine[i] = s[i] ^ ai[i];
-        for (size_t i = 0; i < nb; ++i) mine[nb + i] = bi[i] ^ r0[i] ^ r1[i];
-        auto* io = h->keys->get_otpack(wid)->io;
-        if ((wid & 1 ? OTHER_PARTY(h->party) : h->party) == emp::ALICE) {
-            io->send_data(mine.data(), 2 * nb);
-            io->flush();
-            io->recv_data(theirs.data(), 2 * nb);
-        } else {
-            io->recv_data(theirs.data(), 2 * nb);
-            io->send_data(mine.data(), 2 * nb);
-            io->flush();
-        }
-        const uint8_t *tc = theirs.data(), *tm = theirs.data() + nb;
-        uint8_t* ci = c + W.start;
-        for (size_t i = 0; i < nb; ++i) {
-            const uint8_t rcv_mul = rs[i] ^ (ai[i] & tm[i]);  // cot_multiply_shares
+        const size_t n   = W.end - W.start, off = size_t(round) * n;
+        const uint8_t *r0 = W.r0.data() + off, *r1 = W.r1.data() + off, *rs = W.rs.data() + off;
+        const uint8_t* tc = h->theirs.data() + W.start;
+        const uint8_t* tm = h->theirs.data() + h->num_bytes + W.start;
+        for (size_t i = 0; i < n; ++i) {
+            const uint8_t ai = a[W.start + i], bi = b[W.start + i];
+            const uint8_t rcv_mul = rs[i] ^ (ai & tm[i]);  // cot_multiply_shares
             const uint8_t snd_mul = (~tc[i] & r0[i]) ^ (tc[i] & r1[i]);
-            ci[i]                 = (ai[i] & bi[i]) ^ rcv_mul ^ snd_mul;
+            c[W.start + i]        = (ai & bi) ^ rcv_mul ^ snd_mul;
         }
     });
 }
 
 void boolCOTMultRoundsEnd(BoolMultRounds* h) {
+    if (h->gen.joinable())
+        h->gen.join();
     const double sec = Utils::to_sec(Utils::time_diff(h->t0));
     auto** ios       = h->keys->get_ios(h->threads);
     std::string unit;
@@ -730,7 +763,8 @@ void boolCOTMultRoundsEnd(BoolMultRounds* h) {
         ios[i]->recv_counter = 0;
     }
     Utils::log(Utils::Level::INFO, "P", h->party - 1, ", PID", h->keys->get_io_offset(), ": Bool COT Mult rounds (",
-               h->rounds, ")   s PRE: ", sec, " (random OTs ", h->ot_seconds, " s)   MB SENT PRE: ", data_sent,
+               h->rounds, ")   s PRE: ", sec, " (random OTs ", h->ot_seconds, " s, first round waited until ", h->wait_seconds,
+               " s)   MB SENT PRE: ", data_sent,
                "   MB RECEIVED PRE: ", data_recv);
     accumulateTripleStat("BOOL_COT_MULT", data_sent, data_recv, sec);
     delete h;
