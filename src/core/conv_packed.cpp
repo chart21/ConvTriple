@@ -37,6 +37,9 @@ void truncate_for_decryption(seal::Ciphertext& ct, const seal::Evaluator& evalua
                              const seal::SEALContext& context);
 void remove_unused_coeffs(seal::Ciphertext& ct, const seal::Evaluator& evaluator,
                           std::vector<size_t> used_indices);
+void encrypt_zero_prng(const seal::SEALContext& context, const seal::PublicKey& pk,
+                       const seal::parms_id_type& parms_id, bool is_ntt_form,
+                       std::shared_ptr<seal::UniformRandomGenerator> prng, seal::Ciphertext& destination);
 } // namespace gemini
 
 namespace Iface {
@@ -205,6 +208,53 @@ void pack_bits(const uint64_t* v, size_t n, int bits, uint8_t* dst) {
     for (; have > 0; have -= 8, acc >>= 8) *dst++ = uint8_t(acc);
 }
 
+using u128 = unsigned __int128;
+
+// pack_bits / unpack_bits of values below 2^bits, bits <= 127 (the 64-bit outputs' coefficients modulo two primes)
+void pack_bits128(const u128* v, size_t n, int bits, uint8_t* dst) {
+    u128 acc = 0;
+    int have = 0;
+    auto put = [&](uint64_t w, int nb) {
+        acc |= u128(w) << have;
+        for (have += nb; have >= 64; have -= 64, acc >>= 64, dst += 8) std::memcpy(dst, &acc, 8);
+    };
+    for (size_t i = 0; i < n; i++) {
+        if (bits <= 64) {
+            put(uint64_t(v[i]), bits);
+            continue;
+        }
+        put(uint64_t(v[i]), 64);
+        put(uint64_t(v[i] >> 64), bits - 64);
+    }
+    for (; have > 0; have -= 8, acc >>= 8) *dst++ = uint8_t(acc);
+}
+
+void unpack_bits128(const uint8_t* src, size_t n, int bits, u128* v) {
+    const uint8_t* end = src + packed_size(n, bits);
+    u128 acc = 0;
+    int have = 0;
+    auto get = [&](int nb) {
+        while (have < nb) {
+            uint64_t word = 0;
+            size_t take   = std::min<size_t>(8, end - src);
+            std::memcpy(&word, src, take);
+            acc |= u128(word) << have;
+            src += take, have += 8 * int(take);
+        }
+        const uint64_t r = nb == 64 ? uint64_t(acc) : uint64_t(acc) & ((uint64_t(1) << nb) - 1);
+        acc >>= nb, have -= nb;
+        return r;
+    };
+    for (size_t i = 0; i < n; i++) {
+        if (bits <= 64) {
+            v[i] = get(bits);
+            continue;
+        }
+        const uint64_t lo = get(64);
+        v[i] = u128(get(bits - 64)) << 64 | lo;
+    }
+}
+
 void unpack_bits(const uint8_t* src, size_t n, int bits, uint64_t* v) {
     const uint64_t mask = bits == 64 ? ~uint64_t(0) : (uint64_t(1) << bits) - 1;
     const uint8_t* end  = src + packed_size(n, bits);
@@ -235,6 +285,67 @@ struct PackedConv2D::Wire {
     size_t in_bytes;         // one input ciphertext
     int c0_shift, c0_bits, c1_shift, c1_bits;
     size_t out_bytes(size_t used) const { return packed_size(used, c0_bits) + packed_size(N, c1_bits); }
+};
+
+// setUpWide (BIT_LEN = 64): the plaintext modulus t = 2^64 outside SEAL. An output ciphertext leaves at two primes
+// (q' < 2^127), its coefficients composed (CRT) and truncated as integers below q'.
+struct PackedConv2D::Wide {
+    // round(q m / 2^64) = D m + round(r m / 2^64) for q = D 2^64 + r, per level
+    struct Level {
+        seal::parms_id_type id;
+        std::vector<seal::Modulus> q;
+        std::vector<uint64_t> d; // D mod q_l
+        uint64_t r;
+        explicit Level(const seal::SEALContext::ContextData& cd) : id(cd.parms_id()), q(cd.parms().coeff_modulus()) {
+            const uint64_t* total = cd.total_coeff_modulus(); // q, little-endian 64-bit words
+            const size_t words = q.size();
+            r = total[0];
+            for (const auto& p : q) {
+                uint64_t acc = 0; // D = q >> 64, reduced word by word from the top
+                for (size_t w = words; w-- > 1;) {
+                    const uint64_t in[2] = {total[w], acc};
+                    acc = seal::util::barrett_reduce_128(in, p);
+                }
+                d.push_back(acc);
+            }
+        }
+    };
+    Level in, out;           // the inputs' and products' level (three primes), the outputs' (two)
+    u128 q_out;              // the outputs' modulus
+    uint64_t crt[2];         // (q' / q_l)^-1 mod q_l
+    int q_out_bits;          // bits of q'
+    int flood_bits;          // the flooding noise at the input level: below 2^flood_bits
+    Wide(const seal::SEALContext& ctx)
+        : in(*ctx.first_context_data()), out(*ctx.first_context_data()->next_context_data()) {
+        if (out.q.size() != 2 || in.q.size() != 3)
+            throw std::runtime_error("PackedConv2D: the 64-bit triples take three primes, the outputs two");
+        const uint64_t p0 = out.q[0].value(), p1 = out.q[1].value();
+        q_out = u128(p0) * p1;
+        if (!seal::util::try_invert_uint_mod(p1 % p0, p0, crt[0]) || !seal::util::try_invert_uint_mod(p0 % p1, p1, crt[1]))
+            throw std::runtime_error("PackedConv2D: primes not coprime");
+        q_out_bits = 128 - __builtin_clzll(uint64_t(q_out >> 64));
+        // the noise budget at q' (see setUp's wire widths): the flooding below 2^(n_delta - 3) after the switch,
+        // which divides by the dropped prime p > 2^(bits(p) - 1)
+        flood_bits = in.q.back().bit_count() - 1 + (q_out_bits - 64) - 3;
+    }
+    // the integer below q' with residues (a0, a1)
+    u128 compose(uint64_t a0, uint64_t a1) const {
+        const uint64_t t0 = seal::util::multiply_uint_mod(a0, crt[0], out.q[0]);
+        const uint64_t t1 = seal::util::multiply_uint_mod(a1, crt[1], out.q[1]);
+        u128 x = u128(t0) * out.q[1].value() + u128(t1) * out.q[0].value();
+        return x >= q_out ? x - q_out : x;
+    }
+    // round(x 2^64 / q') mod 2^64 for x below q': a long double estimate corrected with the exact remainder (it
+    // lies within a few q' of the estimate's, so modulo 2^128 it is exact)
+    uint64_t scale_down(u128 x) const {
+        const long double est = (long double) x / (long double) q_out * 18446744073709551616.0L;
+        u128 quo = est <= 0 ? 0 : est >= 18446744073709551616.0L ? u128(1) << 64 : u128((uint64_t) est);
+        const u128 num = (x << 64) + (q_out >> 1); // modulo 2^128, as the products below
+        __int128 rem   = (__int128) (num - quo * q_out);
+        while (rem < 0) quo--, rem += (__int128) q_out;
+        while (rem >= (__int128) q_out) quo++, rem -= (__int128) q_out;
+        return uint64_t(quo);
+    }
 };
 
 // The block layout of troy's Conv2dHelper for a stride-1 convolution of bs H x W images. A polynomial
@@ -380,6 +491,7 @@ struct PackedConv2D::Ntt {
         seal::Modulus q;
         const seal::util::NTTTables* tables;
         uint64_t increment;             // SEAL's centered lift: plaintext coefficients >= threshold get it added
+        uint64_t t_mod = 0;             // wide: 2^64 mod q
         std::vector<uint64_t> power;    // psi^m, m < 2N
         std::vector<uint32_t> exponent; // NTT slot j holds the evaluation at psi^exponent[j]
     };
@@ -391,6 +503,7 @@ struct PackedConv2D::Ntt {
     };
     size_t N;
     uint64_t threshold;
+    bool wide = false; // t = 2^64: weights are centered 64-bit values (lift reduces them)
     std::vector<Prime> primes;
     std::vector<std::vector<Small>> small; // [a][prime]
     size_t fold; // products a 128-bit accumulator takes before it has to be reduced
@@ -409,7 +522,13 @@ struct PackedConv2D::Ntt {
         return a;
     }
 
-    uint64_t lift(uint64_t v, const Prime& p) const { return v >= threshold ? v + p.increment : v; }
+    uint64_t lift(uint64_t v, const Prime& p) const {
+        if (wide) { // the centered representative of a 64-bit weight
+            const uint64_t r = seal::util::barrett_reduce_64(v, p.q);
+            return v >> 63 ? seal::util::sub_uint_mod(r, p.t_mod, p.q) : r;
+        }
+        return v >= threshold ? v + p.increment : v;
+    }
 
     // NTT of a weight polynomial modulo prime l into o. 1x1 weights go through the small NTT
     // (see one_by_one); a polynomial with few terms is evaluated from the power table, sum_k v_k psi^(e_j k)
@@ -466,6 +585,19 @@ void PackedConv2D::setUp(const seal::SEALContext& context, const seal::SecretKey
             wire->q_bits.push_back(q.bit_count());
             wire->in_bytes += packed_size(wire->N, q.bit_count());
         }
+        if (wide_) {
+            // t = 2^64 at q' (two primes): decryption is exact while the noise stays below Delta'/2, Delta' = q'/t.
+            // Budget: the flooding after the switch below 2^(n_delta - 3) (flood_bits), the truncation of c0
+            // below 2^(n_delta - 4), that of c1 times the ternary secret below 2^(c1_shift + log2 N) = 2^(n_delta - 4)
+            // (worst case), the products, the switch and the encryption of zero far below
+            const int q_bits       = wide_->q_out_bits;
+            const int n_delta_bits = q_bits - 64;
+            const int log_n        = __builtin_ctzll(wire->N);
+            wire->c0_shift         = n_delta_bits - 4;
+            wire->c1_shift         = n_delta_bits - 4 - log_n;
+            wire->c0_bits          = q_bits - wire->c0_shift;
+            wire->c1_bits          = q_bits - wire->c1_shift;
+        } else {
         const int q_bits       = last.coeff_modulus()[0].bit_count();
         const uint64_t t       = last.plain_modulus().value();
         const int n_delta_bits = q_bits - last.plain_modulus().bit_count();
@@ -475,6 +607,7 @@ void PackedConv2D::setUp(const seal::SEALContext& context, const seal::SecretKey
         wire->c1_shift         = std::clamp(n_delta_bits - n_var_bits, 0, 63);
         wire->c0_bits          = q_bits - wire->c0_shift;
         wire->c1_bits          = q_bits - wire->c1_shift;
+        }
     }
     wire_ = wire;
 
@@ -482,10 +615,15 @@ void PackedConv2D::setUp(const seal::SEALContext& context, const seal::SecretKey
     auto ntt       = std::make_shared<Ntt>();
     ntt->N         = cd->parms().poly_modulus_degree();
     ntt->threshold = cd->plain_upper_half_threshold();
+    ntt->wide      = wide_ != nullptr;
     ntt->fold      = SIZE_MAX;
     size_t N       = ntt->N;
     for (size_t l = 0; l < cd->parms().coeff_modulus().size(); l++) {
-        Ntt::Prime p{cd->parms().coeff_modulus()[l], &cd->small_ntt_tables()[l], cd->plain_upper_half_increment()[l], {}, {}};
+        Ntt::Prime p{cd->parms().coeff_modulus()[l], &cd->small_ntt_tables()[l], cd->plain_upper_half_increment()[l], 0, {}, {}};
+        {
+            const uint64_t two64[2] = {0, 1};
+            p.t_mod = seal::util::barrett_reduce_128(two64, p.q);
+        }
         p.power.resize(2 * N);
         p.power[0] = 1;
         for (size_t m = 1; m < 2 * N; m++) p.power[m] = seal::util::multiply_uint_mod(p.power[m - 1], p.tables->get_root(), p.q);
@@ -543,6 +681,64 @@ void PackedConv2D::setUp(const seal::SEALContext& context, const seal::SecretKey
         }
     }
 #endif
+}
+
+void PackedConv2D::setUpWide(IO::NetIO** ios, int party) {
+    if (conv_repack())
+        throw std::runtime_error("PackedConv2D: no repacking with 64-bit triples");
+    constexpr size_t N = 8192; // the 180-bit modulus takes N = 8192 (128-bit security: up to 218 bits)
+    seal::EncryptionParameters params(seal::scheme_type::bfv);
+    params.set_poly_modulus_degree(N);
+    params.set_n_special_primes(0);
+    params.set_coeff_modulus(seal::CoeffModulus::Create(N, {60, 60, 60}));
+    params.set_plain_modulus(uint64_t(1) << 20); // SEAL's context wants one; t = 2^64 is done here
+#if PRG_SEED != -1
+    params.set_random_generator(std::make_shared<seal::Blake2xbPRNGFactory>(seal::prng_seed_type{gemini::party_seed64(0x6464)}));
+#endif
+    seal::SEALContext ctx(params, true, seal::sec_level_type::tc128);
+    seal::KeyGenerator keygen(ctx);
+    auto pk = std::make_shared<seal::PublicKey>(), other_pk = std::make_shared<seal::PublicKey>();
+    keygen.create_public_key(*pk);
+    auto put = [&](const auto& obj) {
+        std::stringstream ss;
+        obj.save(ss);
+        send(ios, ss.str());
+    };
+    auto get = [&](auto& obj) {
+        std::stringstream ss(recv(ios));
+        obj.load(ctx, ss);
+    };
+    if (party == emp::ALICE) // ALICE first, as Keys::exchange_keys
+        put(*pk), get(*other_pk);
+    else
+        get(*other_pk), put(*pk);
+    wide_ = std::make_shared<Wide>(ctx);
+    setUp(ctx, keygen.secret_key(), other_pk);
+}
+
+void PackedConv2D::add_scaled(const uint64_t* m, size_t n, const seal::SEALContext::ContextData& cd, uint64_t* c,
+                              bool sub) const {
+    const size_t N = cd.parms().poly_modulus_degree();
+    if (!wide_) {
+        seal::Plaintext pt(N);
+        std::copy_n(m, n, pt.data());
+        if (sub)
+            seal::util::multiply_sub_plain_with_scaling_variant(pt, cd, seal::util::RNSIter(c, N));
+        else
+            seal::util::multiply_add_plain_with_scaling_variant(pt, cd, seal::util::RNSIter(c, N));
+        return;
+    }
+    const Wide::Level& lv = cd.parms_id() == wide_->in.id ? wide_->in : wide_->out;
+    for (size_t i = 0; i < n; i++) {
+        const uint64_t rm = uint64_t((u128(lv.r) * m[i] + (u128(1) << 63)) >> 64); // round(r m / 2^64)
+        for (size_t l = 0; l < lv.q.size(); l++) {
+            const seal::Modulus& p = lv.q[l];
+            uint64_t v = seal::util::multiply_uint_mod(lv.d[l], seal::util::barrett_reduce_64(m[i], p), p);
+            v          = seal::util::add_uint_mod(v, seal::util::barrett_reduce_64(rm, p), p);
+            uint64_t& x = c[l * N + i];
+            x = sub ? seal::util::sub_uint_mod(x, v, p) : seal::util::add_uint_mod(x, v, p);
+        }
+    }
 }
 
 void PackedConv2D::setUpRepack(IO::NetIO** ios, int party, bool both_evaluate) {
@@ -619,7 +815,10 @@ void PackedConv2D::encrypt(const Tiling& t, const Word* x, std::string& out, siz
             seal::util::inverse_ntt_negacyclic_harvey(c, cd.small_ntt_tables()[l]);
             seal::util::add_poly_coeffmod(c, e.data() + l * N, N, q[l], c);
         }
-        seal::util::multiply_add_plain_with_scaling_variant(pt, cd, seal::util::RNSIter(c0.data(), N));
+        if (wide_)
+            add_scaled(pt.data(), N, cd, c0.data(), false);
+        else
+            seal::util::multiply_add_plain_with_scaling_variant(pt, cd, seal::util::RNSIter(c0.data(), N));
         auto* dst = reinterpret_cast<uint8_t*>(out.data()) + k * wire.in_bytes;
         std::memcpy(dst, &seed, sizeof(seed));
         dst += sizeof(seed);
@@ -654,7 +853,10 @@ void PackedConv2D::multiply(const Tiling& t, const std::string& in, const Word* 
         if (x_own) { // conv(x_other + x_own, w): the own-share term belongs to the triple too
             seal::Plaintext pt;
             t.input_poly(x_own, k / t.in_groups, k % t.in_groups, pt);
-            seal::util::multiply_add_plain_with_scaling_variant(pt, cd, seal::util::RNSIter(c0, N));
+            if (wide_)
+                add_scaled(pt.data(), N, cd, c0, false);
+            else
+                seal::util::multiply_add_plain_with_scaling_variant(pt, cd, seal::util::RNSIter(c0, N));
         }
         for (size_t l = 0; l < L; l++) seal::util::ntt_negacyclic_harvey(c0 + l * N, cd.small_ntt_tables()[l]);
         seal::util::sample_poly_uniform(std::make_shared<AesPrng>(seed), cd.parms(), x[k].data(1));
@@ -813,6 +1015,10 @@ void PackedConv2D::evaluate(const Tiling& t, const std::string& in, const Word* 
     if (t.rp)
         stage = std::make_unique<Stage>(3);
     out.assign(z.size() * out_bytes, '\0');
+    if (wide_) {
+        evaluate_wide_outputs(t, z, r, out, threads, call);
+        return;
+    }
     parallel(threads, z.size(), [&](size_t k) {
         seal::Ciphertext& ct = *z[k];
         if (ct.is_ntt_form())
@@ -920,6 +1126,57 @@ void PackedConv2D::pack(const Tiling& t, std::vector<seal::Ciphertext>& y, std::
     for (size_t k = 0; k < trees; k++) dense[k] = node[k * C];
 }
 
+// evaluate()'s output processing for t = 2^64: flood at the products' level (as flood_ciphertext, wider), switch to
+// the outputs' two primes, add an encryption of zero under the other party's key, subtract the mask (this party's
+// shares), then the kept high bits of the composed coefficients: c0's used ones, then c1's
+void PackedConv2D::evaluate_wide_outputs(const Tiling& t, std::vector<seal::Ciphertext*>& z, Word* r, std::string& out,
+                                         size_t threads, uint64_t call) const {
+    const Wire& wire = *wire_;
+    const Wide& wd   = *wide_;
+    const size_t out_bytes = wire.out_bytes(t.required.size());
+    const auto& cd_out = *context_->get_context_data(wd.out.id);
+    parallel(threads, z.size(), [&](size_t k) {
+        seal::Ciphertext& ct = *z[k];
+        const size_t N = t.N;
+        if (ct.is_ntt_form())
+            evaluator_->transform_from_ntt_inplace(ct);
+        auto prng = task_prng(3, call, k);
+        {
+            const int hi_bits = wd.flood_bits - 64;
+            const uint64_t hi_mask = hi_bits >= 64 ? ~uint64_t(0) : (uint64_t(1) << hi_bits) - 1;
+            thread_local std::vector<uint64_t> f;
+            f.resize(2 * N);
+            prng->generate(2 * N * sizeof(uint64_t), reinterpret_cast<seal::seal_byte*>(f.data()));
+            for (size_t i = 0; i < N; i++) {
+                const uint64_t in2[2] = {f[2 * i], f[2 * i + 1] & hi_mask};
+                for (size_t l = 0; l < wd.in.q.size(); l++) {
+                    uint64_t& x = ct.data(0)[l * N + i];
+                    x = seal::util::add_uint_mod(x, seal::util::barrett_reduce_128(in2, wd.in.q[l]), wd.in.q[l]);
+                }
+            }
+        }
+        evaluator_->mod_switch_to_inplace(ct, wd.out.id);
+        seal::Ciphertext zero;
+        gemini::encrypt_zero_prng(*context_, *other_pk_, wd.out.id, false, prng, zero);
+        evaluator_->add_inplace(ct, zero);
+        thread_local std::vector<uint64_t> mask;
+        mask.resize(N);
+        prng->generate(N * sizeof(uint64_t), reinterpret_cast<seal::seal_byte*>(mask.data()));
+        add_scaled(mask.data(), N, cd_out, ct.data(0), true);
+        t.outputs(k / t.out_groups, k % t.out_groups, [&](size_t o, size_t coeff) { r[o] = Word(mask[coeff]); });
+        thread_local std::vector<u128> v;
+        v.resize(std::max(t.required.size(), N));
+        const uint64_t *c0 = ct.data(0), *c1 = ct.data(1);
+        for (size_t j = 0; j < t.required.size(); j++)
+            v[j] = wd.compose(c0[t.required[j]], c0[N + t.required[j]]) >> wire.c0_shift;
+        auto* dst = reinterpret_cast<uint8_t*>(out.data()) + k * out_bytes;
+        pack_bits128(v.data(), t.required.size(), wire.c0_bits, dst);
+        dst += packed_size(t.required.size(), wire.c0_bits);
+        for (size_t i = 0; i < N; i++) v[i] = wd.compose(c1[i], c1[N + i]) >> wire.c1_shift;
+        pack_bits128(v.data(), N, wire.c1_bits, dst);
+    });
+}
+
 void PackedConv2D::decrypt(const Tiling& t, const std::string& in, Word* c, bool accumulate,
                            size_t threads) const {
     threads = live_threads(threads);
@@ -928,6 +1185,48 @@ void PackedConv2D::decrypt(const Tiling& t, const std::string& in, Word* c, bool
     const size_t out_bytes = wire.out_bytes(t.required.size()), cts = t.tiles * t.out_groups;
     if (in.size() != cts * out_bytes)
         throw std::runtime_error("PackedConv2D: unexpected size of the encrypted output");
+    if (wide_) {
+        // t = 2^64: the coefficients below q' back from their kept high bits, into residues; the phase
+        // c0 + c1 s per prime, composed; m = round(phase t / q')
+        const Wide& wd = *wide_;
+        const auto& cd = *context_->get_context_data(wd.out.id);
+        parallel(threads, cts, [&](size_t k) {
+            const size_t N = t.N;
+            thread_local std::vector<u128> v;
+            thread_local std::vector<uint64_t> ph, c1;
+            v.resize(std::max(t.required.size(), N));
+            ph.assign(2 * N, 0), c1.resize(2 * N);
+            const auto* src = reinterpret_cast<const uint8_t*>(in.data()) + k * out_bytes;
+            unpack_bits128(src, t.required.size(), wire.c0_bits, v.data());
+            for (size_t j = 0; j < t.required.size(); j++) {
+                const u128 x = v[j] << wire.c0_shift;
+                for (size_t l = 0; l < 2; l++) {
+                    const uint64_t in2[2] = {uint64_t(x), uint64_t(x >> 64)};
+                    ph[l * N + t.required[j]] = seal::util::barrett_reduce_128(in2, wd.out.q[l]);
+                }
+            }
+            unpack_bits128(src + packed_size(t.required.size(), wire.c0_bits), N, wire.c1_bits, v.data());
+            for (size_t i = 0; i < N; i++) {
+                const u128 x = v[i] << wire.c1_shift;
+                for (size_t l = 0; l < 2; l++) {
+                    const uint64_t in2[2] = {uint64_t(x), uint64_t(x >> 64)};
+                    c1[l * N + i] = seal::util::barrett_reduce_128(in2, wd.out.q[l]);
+                }
+            }
+            for (size_t l = 0; l < 2; l++) {
+                uint64_t* a = c1.data() + l * N;
+                seal::util::ntt_negacyclic_harvey(a, cd.small_ntt_tables()[l]);
+                seal::util::dyadic_product_coeffmod(a, sk_->data().data() + l * N, N, wd.out.q[l], a);
+                seal::util::inverse_ntt_negacyclic_harvey(a, cd.small_ntt_tables()[l]);
+                seal::util::add_poly_coeffmod(ph.data() + l * N, a, N, wd.out.q[l], ph.data() + l * N);
+            }
+            t.outputs(k / t.out_groups, k % t.out_groups, [&](size_t out, size_t coeff) {
+                const Word m = Word(wd.scale_down(wd.compose(ph[coeff], ph[N + coeff])));
+                c[out] = accumulate ? Word(c[out] + m) : m;
+            });
+        });
+        return;
+    }
     parallel(threads, cts, [&](size_t k) {
         seal::Ciphertext ct(*context_, context_->last_parms_id());
         ct.resize(2);

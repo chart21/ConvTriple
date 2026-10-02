@@ -165,8 +165,14 @@ class Keys {
             conv_repack() = std::atoi(e) != 0;
         if (conv_repack())
             _packed_conv.setUpRepack(_ios, party, conv_repack_ab());
-        _bn.setUp(PLAIN_MOD, ctx, skey, o_pkey);
-        setupBn(_ios, ctx, party);
+        if constexpr (BIT_LEN == 64) {
+            // 64-bit triples: the convolutions and FC layers run in the packed evaluator's own t = 2^64 context;
+            // gemini's FC, conv and BN stay in SEAL's plaintext space (at most 60 bits) and are not used
+            _packed_conv.setUpWide(_ios, party);
+        } else {
+            _bn.setUp(PLAIN_MOD, ctx, skey, o_pkey);
+            setupBn(_ios, ctx, party);
+        }
 
         _connected = true;
 

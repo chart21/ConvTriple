@@ -58,6 +58,12 @@ class PackedConv2D {
     // conv_repack(): replaces setUp's context by the N = 8192 one (own keys, public keys exchanged on ios[0]) and
     // exchanges the Galois keys the evaluation needs; party is emp's (ALICE evaluates in AB2)
     void setUpRepack(IO::NetIO** ios, int party, bool both_evaluate);
+    // BIT_LEN = 64: replaces setUp's context by one for the plaintext modulus t = 2^64, which SEAL cannot hold
+    // (its plaintext moduli have at most 60 bits), so the encodings, the masks, the output truncation and the
+    // decryption do t themselves: N = 8192, three 60-bit primes for the inputs and the products, two for the outputs
+    // (own keys, public keys exchanged on ios[0]). Encoding round(q m / t) is exact; the inputs and the weights are
+    // centered 64-bit values.
+    void setUpWide(IO::NetIO** ios, int party);
 
     // Shares c of the stride-1, unpadded conv(x, w) (NCHW input, OIHW weights) of bs images.
     // AB2: the party without w encrypts its x, the other one evaluates (and adds its own x if given);
@@ -86,6 +92,12 @@ class PackedConv2D {
     struct Tiling;
     struct Ntt;  // the primes' NTT tables, for NTTs of weight polynomials outside SEAL
     struct Wire; // bit widths and sizes of the ciphertexts on the wire
+    struct Wide; // setUpWide: t = 2^64 outside SEAL
+
+    std::shared_ptr<const Wide> wide_;
+    // c +- round(q m / t) at the level of cd for the n coefficients m (c: RNS, coefficient form): SEAL's scaling
+    // variant, or wide_'s for t = 2^64
+    void add_scaled(const uint64_t* m, size_t n, const seal::SEALContext::ContextData& cd, uint64_t* c, bool sub) const;
 
     bool repack_ = false;
     std::shared_ptr<const seal::GaloisKeys> other_gk_; // the other party's, to pack the products of its ciphertexts
@@ -105,6 +117,8 @@ class PackedConv2D {
     void multiply_gpu(const Tiling& t, const std::string& in, const Word* x_own, const Word* w,
                       std::vector<seal::Ciphertext>& y, size_t threads) const;
     void decrypt(const Tiling& t, const std::string& in, Word* c, bool accumulate, size_t threads) const;
+    void evaluate_wide_outputs(const Tiling& t, std::vector<seal::Ciphertext*>& z, Word* r, std::string& out,
+                               size_t threads, uint64_t call) const;
 
     std::shared_ptr<seal::SEALContext> context_;
     std::shared_ptr<seal::Encryptor> encryptor_;

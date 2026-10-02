@@ -37,11 +37,15 @@ constexpr uint64_t BIT_LEN = TRIPLE_BITLEN;
 constexpr uint64_t BIT_LEN = 32;
 #endif
 constexpr uint64_t POLY_MOD  = 1ULL << 12;
-constexpr uint64_t PLAIN_MOD = 1ULL << BIT_LEN;
+// BIT_LEN = 64: SEAL's plaintext modulus has at most 60 bits. The shared context (gemini's FC, conv and BN) keeps
+// 2^32 then, and the 64-bit triples come from the packed convolutions, which do t = 2^64 themselves
+// (PackedConv2D::setUpWide)
+static_assert(BIT_LEN == 32 || BIT_LEN == 64, "TRIPLE_BITLEN: 32 or 64");
+constexpr uint64_t PLAIN_MOD = 1ULL << (BIT_LEN < 64 ? BIT_LEN : 32);
 
 constexpr uint64_t MOD         = PLAIN_MOD;
-constexpr uint64_t moduloMask  = MOD - 1;
-constexpr uint64_t moduloMidPt = MOD / 2;
+constexpr uint64_t moduloMask  = BIT_LEN < 64 ? MOD - 1 : ~0ULL;
+constexpr uint64_t moduloMidPt = BIT_LEN < 64 ? MOD / 2 : 1ULL << 63;
 
 #ifndef PRG_SEED
 #define PRG_SEED 42

@@ -24,12 +24,12 @@
 
 namespace {
 
-using U = uint32_t;
+using U = Iface::UINT_TYPE; // the triples' ring: 2^BIT_LEN
 struct Shape {
     int ic, h, k, s, p, oc, bs = 1;
 };
 
-// Plain strided, zero-padded convolution over a batch (NCHW, OIHW), mod 2^32
+// Plain strided, zero-padded convolution over a batch (NCHW, OIHW), mod 2^BIT_LEN
 std::vector<U> ideal(const std::vector<U>& x, const std::vector<U>& w, const Shape& sh) {
     int n = (sh.h + 2 * sh.p - sh.k) / sh.s + 1;
     std::vector<U> y((size_t)sh.bs * sh.oc * n * n, 0);
@@ -115,7 +115,7 @@ int main(int argc, char** argv) {
     Iface::conv_repack_ab() = ab; // with CONV_REPACK=1: both parties evaluate, so both send Galois keys
     auto& keys = Iface::Keys<IO::NetIO>::instance(party, peer_ip, port, threads, 1);
     auto* io   = keys.get_ios(threads)[0];
-    std::mt19937 rng(1234 + party);
+    std::mt19937_64 rng(1234 + party); // full words in both rings
     int failed = 0;
     double total_time = 0, total_sent = 0, total_recv = 0;
     std::map<std::string, std::array<double, 4>> groups; // shape -> count, sent, recv, time
@@ -126,15 +126,15 @@ int main(int argc, char** argv) {
     auto check = [&](const Shape& sh, const std::vector<U>& x, const std::vector<U>& w, const U* c, size_t c_size) {
         size_t bad = 0;
         if (party == 2) {
-            io->send_data(x.data(), x.size() * 4);
-            io->send_data(w.data(), w.size() * 4);
-            io->send_data(c, c_size * 4);
+            io->send_data(x.data(), x.size() * sizeof(U));
+            io->send_data(w.data(), w.size() * sizeof(U));
+            io->send_data(c, c_size * sizeof(U));
             io->flush();
         } else {
             std::vector<U> x2(x.size()), w2(w.size()), c2(c_size);
-            io->recv_data(x2.data(), x2.size() * 4);
-            io->recv_data(w2.data(), w2.size() * 4);
-            io->recv_data(c2.data(), c2.size() * 4);
+            io->recv_data(x2.data(), x2.size() * sizeof(U));
+            io->recv_data(w2.data(), w2.size() * sizeof(U));
+            io->recv_data(c2.data(), c2.size() * sizeof(U));
             for (size_t i = 0; i < x.size(); i++) x2[i] += x[i];
             for (size_t i = 0; i < w.size(); i++) w2[i] += w[i];
             auto y = ideal(x2, w2, sh);

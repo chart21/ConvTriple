@@ -404,6 +404,13 @@ void flood_ciphertext(seal::Ciphertext& ct, std::shared_ptr<seal::UniformRandomG
     }
 }
 
+// A public-key encryption of zero at parms_id from the given generator (PackedConv2D's outputs for t = 2^64)
+void encrypt_zero_prng(const seal::SEALContext& context, const seal::PublicKey& pk,
+                       const seal::parms_id_type& parms_id, bool is_ntt_form,
+                       std::shared_ptr<seal::UniformRandomGenerator> prng, seal::Ciphertext& destination) {
+    asymmetric_encrypt_zero(context, pk, parms_id, is_ntt_form, std::move(prng), destination);
+}
+
 void truncate_for_decryption(seal::Ciphertext& ct, const seal::Evaluator& evaluator,
                              const seal::SEALContext& context) {
     auto context_data = context.last_context_data();

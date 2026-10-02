@@ -15,3 +15,4 @@ data
 *.bak
 
 *.triple
+build64/

@@ -1131,6 +1131,31 @@ void generateFCTriplesCheetah(Keys<IO::NetIO>& keys, const UINT_TYPE* a, const U
                meta.weight_shape, " ", Utils::proto_str(proto), " (batch: ", batch, ", threads: ", threads, ")");
 
     auto start = measure::now();
+    if constexpr (BIT_LEN == 64) {
+        // gemini's FC computes in SEAL's plaintext space (at most 60 bits): the packed evaluator (t = 2^64) takes the
+        // product as a 1x1 convolution of 1x1 images, per weight group of batch / factor inputs
+        if (proto == Utils::PROTO::AB2P)
+            throw std::runtime_error("generateFCTriplesCheetah: no prescribed shares with 64-bit triples");
+        auto** fios = keys.get_ios(threads);
+        const size_t per = batch / factor;
+        for (int i = 0; i < factor; ++i)
+            keys.get_packed_conv().conv(fios, party, a ? a + i * per * com_dim : nullptr, b ? b + i * com_dim * dim2 : nullptr,
+                                        c + i * per * dim2, per, com_dim, 1, 1, 1, 1, dim2, proto == Utils::PROTO::AB,
+                                        threads);
+        std::string unit;
+        double data_sent = 0, data_recv = 0;
+        for (int i = 0; i < threads; ++i) {
+            data_sent += Utils::to_MB(fios[i]->counter, unit);
+            data_recv += Utils::to_MB(fios[i]->recv_counter, unit);
+            fios[i]->counter      = 0;
+            fios[i]->recv_counter = 0;
+        }
+        Utils::log(Utils::Level::INFO, "P", party - 1, ", PID", keys.get_io_offset(),
+                   ": FC triple (packed)   MB SENT PRE: ", data_sent, "   MB RECEIVED PRE: ", data_recv);
+        accumulateTripleStat("FC", data_sent, data_recv, Utils::to_sec(Utils::time_diff(start)));
+        (void) prescribed;
+        return;
+    }
 
     // meta.is_shared_input = proto == Utils::PROTO::AB;
     auto& fc   = keys.get_fc();
@@ -1271,6 +1296,9 @@ void generateConvTriplesCheetah(Keys<IO::NetIO>& keys, size_t total_batches,
                                 std::vector<Utils::ConvParm>& parms, UINT_TYPE** a, UINT_TYPE** b,
                                 UINT_TYPE* c, Utils::PROTO proto, int party, int threads,
                                 int factor, bool is_shared_input) {
+    if (BIT_LEN == 64 && !parms.empty())
+        throw std::runtime_error("generateConvTriplesCheetah: gemini works in SEAL's plaintext space (at most 60 bits); 64-bit triples "
+                                 "take the packed convolutions (CHEETAH_CONV_PACKED=1)");
     auto start = measure::now();
 
     vector<vector<seal::Plaintext>> enc_a(total_batches);
@@ -1490,6 +1518,9 @@ void generateConvTriplesCheetah(Keys<IO::NetIO>& keys, const UINT_TYPE* a, const
                                 UINT_TYPE* c, const gemini::HomConv2DSS::Meta& meta, int batch,
                                 int party, int threads, Utils::PROTO proto, int factor,
                                 const UINT_TYPE* prescribed) {
+    if constexpr (BIT_LEN == 64)
+        throw std::runtime_error("generateConvTriplesCheetah: gemini works in SEAL's plaintext space (at most 60 bits); 64-bit triples "
+                                 "take the packed convolutions (CHEETAH_CONV_PACKED=1)");
     auto start = measure::now();
     auto& conv = keys.get_conv();
     auto** ios = keys.get_ios(threads);
@@ -1649,6 +1680,9 @@ void generateConvTriplesCheetah(Keys<IO::NetIO>& keys, const UINT_TYPE* a, const
 void generateBNTriplesCheetah(Keys<IO::NetIO>& keys, const UINT_TYPE* a, const UINT_TYPE* b,
                               UINT_TYPE* c, int batch, size_t num_ele, size_t h, size_t w,
                               int party, int threads, Utils::PROTO proto, int factor) {
+    if constexpr (BIT_LEN == 64)
+        throw std::runtime_error("generateBNTriplesCheetah: gemini works in SEAL's plaintext space (at most 60 bits); 64-bit triples "
+                                 "take the packed convolutions, fuse the BatchNorms (FUSE_CONV_BN=1)");
     auto meta = Utils::init_meta_bn(num_ele, h, w);
     Utils::log(Utils::Level::INFO, "P", party - 1, ", PID", keys.get_io_offset(),
                ": Generating BN triples ", meta.ishape, " x ", meta.vec_shape,
@@ -1730,6 +1764,9 @@ void generateBNTriplesCheetah(Keys<IO::NetIO>& keys, const UINT_TYPE* a, const U
 
 void generateBNTriplesBatched(Keys<IO::NetIO>& keys, const std::vector<BNTripleLayer>& layers, int party,
                               int threads, Utils::PROTO proto, int factor) {
+    if (BIT_LEN == 64 && !layers.empty())
+        throw std::runtime_error("generateBNTriplesBatched: gemini works in SEAL's plaintext space (at most 60 bits); 64-bit triples "
+                                 "take the packed convolutions, fuse the BatchNorms (FUSE_CONV_BN=1)");
     // the slot-encoded layers (generateBNTriplesCheetah's choice) are concatenated, the others go alone
     std::vector<size_t> slot, offset;
     size_t total = 0;
