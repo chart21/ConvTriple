@@ -619,6 +619,123 @@ void generateBoolCOTMultTriplesCheetah(uint8_t a[], uint8_t b[], uint8_t c[],
     // keys.disconnect();
 }
 
+struct BoolMultRounds {
+    Keys<IO::NetIO>* keys = nullptr;
+    int party = 0, rounds = 0, threads = 0;
+    uint64_t num_bytes = 0;
+    std::unique_ptr<gemini::ThreadPool> pool;
+    struct Worker {
+        size_t start = 0, end = 0;
+        std::vector<uint8_t> r0, r1, s, rs;  // rounds blocks of end - start bytes each
+    };
+    std::vector<Worker> w;
+    decltype(measure::now()) t0;
+    double ot_seconds = 0;
+    // fn(wid) on every worker with a byte range, in parallel
+    template <typename F>
+    void each(F fn) {
+        std::vector<std::future<void>> fut;
+        for (int wid = 0; wid < int(w.size()); ++wid)
+            if (w[wid].start < w[wid].end)
+                fut.push_back(pool->enqueue([&fn, wid] { fn(wid); }));
+        for (auto& f : fut) f.get();
+    }
+};
+
+BoolMultRounds* boolCOTMultRoundsBegin(uint64_t num_triples, int rounds, const std::string& ip, int port, int party,
+                                       int threads, unsigned io_offset) {
+    Utils::log(Utils::Level::INFO, "P", party - 1, ", PID", io_offset, ": Generating ", num_triples, " x ", rounds,
+               " BOOL COT MULT triples in dependent rounds (threads: ", threads, ")");
+    require_tuple_count_multiple_of_8(num_triples);
+    auto* h      = new BoolMultRounds;
+    h->party     = party;
+    h->rounds    = rounds;
+    h->threads   = threads;
+    h->num_bytes = num_triples / 8;
+    h->keys      = &Keys<IO::NetIO>::instance(party, ip, port, threads, io_offset);
+    h->t0        = measure::now();
+    h->keys->get_ios(threads);
+    h->keys->ensure_ot(num_triples * uint64_t(rounds));
+    const int ot_threads = h->keys->ot_workers();  // one worker per OT pack, LaunchWorks' split of the bytes
+    const uint64_t ot_call = h->keys->next_ot_call();
+    h->pool = std::make_unique<gemini::ThreadPool>(ot_threads);
+    h->w.resize(ot_threads);
+    const size_t load = (h->num_bytes + ot_threads - 1) / ot_threads;
+    for (int wid = 0; wid < ot_threads; ++wid) {
+        h->w[wid].start = std::min<size_t>(size_t(wid) * load, h->num_bytes);
+        h->w[wid].end   = std::min<size_t>(h->w[wid].start + load, h->num_bytes);
+    }
+    // all rounds' random OTs: as cot_multiply_shares, the reversed instance first, then the straight one
+    h->each([h, ot_call, rounds](int wid) {
+        emp::DetSeedScope det_scope(Keys<IO::NetIO>::ot_seed_tag(ot_call, wid), gemini::kSeeded);  // reproducible OT
+        auto& W           = h->w[wid];
+        const size_t nb   = W.end - W.start;
+        const int64_t n   = int64_t(nb) * 8 * rounds;
+        W.r0.resize(nb * rounds), W.r1.resize(nb * rounds), W.s.resize(nb * rounds), W.rs.resize(nb * rounds);
+        const int cur_party = wid & 1 ? OTHER_PARTY(h->party) : h->party;
+        const auto* otpack  = h->keys->get_otpack(wid);
+        if (cur_party == emp::ALICE) {
+            otpack->silent_ot_reversed->recv_rot_bits(W.rs.data(), W.s.data(), n);
+            otpack->io->flush();
+            otpack->silent_ot->send_rot_bits(W.r0.data(), W.r1.data(), n);
+        } else {
+            otpack->silent_ot_reversed->send_rot_bits(W.r0.data(), W.r1.data(), n);
+            otpack->io->flush();
+            otpack->silent_ot->recv_rot_bits(W.rs.data(), W.s.data(), n);
+        }
+        otpack->io->flush();
+    });
+    h->ot_seconds = Utils::to_sec(Utils::time_diff(h->t0));
+    return h;
+}
+
+void boolCOTMultRound(BoolMultRounds* h, int round, const uint8_t* a, const uint8_t* b, uint8_t* c) {
+    h->each([h, round, a, b, c](int wid) {
+        auto& W          = h->w[wid];
+        const size_t nb  = W.end - W.start, off = size_t(round) * nb;
+        const uint8_t *r0 = W.r0.data() + off, *r1 = W.r1.data() + off, *s = W.s.data() + off, *rs = W.rs.data() + off;
+        const uint8_t *ai = a + W.start, *bi = b + W.start;
+        std::vector<uint8_t> mine(2 * nb), theirs(2 * nb);  // choice corrections, then masked values
+        for (size_t i = 0; i < nb; ++i) mine[i] = s[i] ^ ai[i];
+        for (size_t i = 0; i < nb; ++i) mine[nb + i] = bi[i] ^ r0[i] ^ r1[i];
+        auto* io = h->keys->get_otpack(wid)->io;
+        if ((wid & 1 ? OTHER_PARTY(h->party) : h->party) == emp::ALICE) {
+            io->send_data(mine.data(), 2 * nb);
+            io->flush();
+            io->recv_data(theirs.data(), 2 * nb);
+        } else {
+            io->recv_data(theirs.data(), 2 * nb);
+            io->send_data(mine.data(), 2 * nb);
+            io->flush();
+        }
+        const uint8_t *tc = theirs.data(), *tm = theirs.data() + nb;
+        uint8_t* ci = c + W.start;
+        for (size_t i = 0; i < nb; ++i) {
+            const uint8_t rcv_mul = rs[i] ^ (ai[i] & tm[i]);  // cot_multiply_shares
+            const uint8_t snd_mul = (~tc[i] & r0[i]) ^ (tc[i] & r1[i]);
+            ci[i]                 = (ai[i] & bi[i]) ^ rcv_mul ^ snd_mul;
+        }
+    });
+}
+
+void boolCOTMultRoundsEnd(BoolMultRounds* h) {
+    const double sec = Utils::to_sec(Utils::time_diff(h->t0));
+    auto** ios       = h->keys->get_ios(h->threads);
+    std::string unit;
+    double data_sent = 0, data_recv = 0;
+    for (int i = 0; i < h->threads; ++i) {
+        data_sent += Utils::to_MB(ios[i]->counter, unit);
+        data_recv += Utils::to_MB(ios[i]->recv_counter, unit);
+        ios[i]->counter      = 0;
+        ios[i]->recv_counter = 0;
+    }
+    Utils::log(Utils::Level::INFO, "P", h->party - 1, ", PID", h->keys->get_io_offset(), ": Bool COT Mult rounds (",
+               h->rounds, ")   s PRE: ", sec, " (random OTs ", h->ot_seconds, " s)   MB SENT PRE: ", data_sent,
+               "   MB RECEIVED PRE: ", data_recv);
+    accumulateTripleStat("BOOL_COT_MULT", data_sent, data_recv, sec);
+    delete h;
+}
+
 void generateRandomMultiplicationsCheetah(uint8_t a[], uint8_t b[], uint64_t num_muls,
                                           const std::string& ip, int port, int party,
                                           int threads, unsigned io_offset) {

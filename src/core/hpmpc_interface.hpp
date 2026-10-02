@@ -40,6 +40,15 @@ void generateBoolCOTMultTriplesCheetah(uint8_t a[], uint8_t b[], uint8_t c[],
                                 int bitlength [[maybe_unused]], uint64_t num_triples,
                                 const std::string& ip, int port, int party, int threads,
                                  unsigned io_offset = 1);
+// `rounds` dependent COT multiplications of num_triples shares each (the bake's Boolean addition: round r's inputs are
+// round r - 1's outputs). The random OTs of all rounds come first, one call per OT pack and direction, so the extensions
+// run at full throughput and none falls inside a round; a round then only exchanges every share's two correction bits,
+// one message per pack (cot_multiply_shares' arithmetic).
+struct BoolMultRounds;
+BoolMultRounds* boolCOTMultRoundsBegin(uint64_t num_triples, int rounds, const std::string& ip, int port, int party,
+                                       int threads, unsigned io_offset = 1);
+void boolCOTMultRound(BoolMultRounds* h, int round, const uint8_t* a, const uint8_t* b, uint8_t* c);
+void boolCOTMultRoundsEnd(BoolMultRounds* h);
 
 void generateBoolTriplesCheetah(uint8_t a[], uint8_t b[], uint8_t c[], int bitlength,
                                 uint64_t num_triples, const std::string& ip, int port, int party,
