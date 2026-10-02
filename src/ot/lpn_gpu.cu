@@ -698,6 +698,7 @@ void Extension::download_range(void* out_, int64_t first, int64_t n) {
         check(cudaStreamSynchronize(c.stream), "download");
         return;
     }
+    c.ring(false);  // the bounce buffers (a context leased only for a download has none yet)
     const int64_t chunk = 4 * kChunkGroups, chunks = (n + chunk - 1) / chunk;
     auto copy_chunk = [&](int64_t ch) {
         const int b = int(ch % kRing);
