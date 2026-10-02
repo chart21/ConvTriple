@@ -233,6 +233,129 @@ __global__ void ggm_fix(uint4* out, int64_t trees, int L, int levels, const uint
     }
 }
 
+// LpnF2::__compute1 for single outputs (the at most 4 trailing outputs of a task range): 3 AES blocks makeBlock(i, m),
+// nn[i] ^= kk[r[j] % k] for the first 10 words r[j]
+constexpr int kMaxSingles = 64;
+struct Singles {
+    int64_t i[kMaxSingles];
+};
+__global__ void lpn_one(uint4* nn, const uint4* __restrict__ kk, Singles idx, int count, uint32_t k, RoundKeys rkeys) {
+    extern __shared__ uint32_t te[];
+    __shared__ uint32_t rk[44];
+    load_table(te);
+    for (int i = threadIdx.x; i < 44; i += blockDim.x) rk[i] = rkeys.w[i];
+    __syncthreads();
+    if (int(threadIdx.x) >= count)
+        return;
+    const int64_t i = idx.i[threadIdx.x];
+    uint32_t r[12];
+    for (int m = 0; m < 3; m++) {
+        uint32_t s[4] = {uint32_t(m), 0u, uint32_t(uint64_t(i)), uint32_t(uint64_t(i) >> 32)};
+        aes128(s, rk, te, threadIdx.x & 31);
+        for (int w = 0; w < 4; w++) r[4 * m + w] = s[w];
+    }
+    uint4 v = nn[i];
+    for (int j = 0; j < 10; j++) v = xor4(v, kk[r[j] % k]);
+    nn[i] = v;
+}
+
+// emp's MITCCRH<8> over COTs (SilentOT's send/recv_rot_bits and _bitplanes): OT o's key is s ^ makeBlock(gid0 + o, 0),
+// its hash H(x) = x ^ AES_key(x); the sender hashes x and x ^ Delta, the receiver x (its choice bit: x's bit 0).
+// Output planes of `stride` bytes, bit j of byte i = OT 8i + j: sender m0 planes 0 .. k - 1 (bit p of H(x)'s low 64
+// bits), then m1 planes; receiver: the choice bits, then the k planes of H(x).
+struct RotParams {
+    uint4 s, delta;
+    uint64_t gid0;
+    int64_t count, stride;
+    int k;
+    bool sender;
+};
+// AES-128 of H blocks under one key, the key schedule computed on the fly (AES-NI's byte order: words little-endian)
+template <int H>
+__device__ __forceinline__ void aes128_otf(uint32_t st[H][4], uint32_t k0, uint32_t k1, uint32_t k2, uint32_t k3,
+                                           const uint32_t* te, int lane) {
+#define TE(x) te[((x) << 5) | lane]
+#define SB(x) ((TE(x) >> 8) & 0xff)
+#pragma unroll
+    for (int h = 0; h < H; h++) st[h][0] ^= k0, st[h][1] ^= k1, st[h][2] ^= k2, st[h][3] ^= k3;
+    uint32_t rcon = 1;
+#pragma unroll
+    for (int r = 1; r <= 10; r++) {
+        uint32_t t = (k3 >> 8) | (k3 << 24);  // RotWord
+        t = SB(t & 0xff) | SB((t >> 8) & 0xff) << 8 | SB((t >> 16) & 0xff) << 16 | SB(t >> 24) << 24;
+        t ^= rcon;
+        rcon = ((rcon << 1) ^ ((rcon & 0x80) ? 0x1b : 0)) & 0xff;
+        k0 ^= t, k1 ^= k0, k2 ^= k1, k3 ^= k2;
+#pragma unroll
+        for (int h = 0; h < H; h++) {
+            const uint32_t a0 = st[h][0], a1 = st[h][1], a2 = st[h][2], a3 = st[h][3];
+            if (r < 10) {
+                st[h][0] = TE(a0 & 0xff) ^ rotl8(TE((a1 >> 8) & 0xff)) ^ rotl8(rotl8(TE((a2 >> 16) & 0xff))) ^ rotl8(rotl8(rotl8(TE(a3 >> 24)))) ^ k0;
+                st[h][1] = TE(a1 & 0xff) ^ rotl8(TE((a2 >> 8) & 0xff)) ^ rotl8(rotl8(TE((a3 >> 16) & 0xff))) ^ rotl8(rotl8(rotl8(TE(a0 >> 24)))) ^ k1;
+                st[h][2] = TE(a2 & 0xff) ^ rotl8(TE((a3 >> 8) & 0xff)) ^ rotl8(rotl8(TE((a0 >> 16) & 0xff))) ^ rotl8(rotl8(rotl8(TE(a1 >> 24)))) ^ k2;
+                st[h][3] = TE(a3 & 0xff) ^ rotl8(TE((a0 >> 8) & 0xff)) ^ rotl8(rotl8(TE((a1 >> 16) & 0xff))) ^ rotl8(rotl8(rotl8(TE(a2 >> 24)))) ^ k3;
+            } else {
+                st[h][0] = (SB(a0 & 0xff) | SB((a1 >> 8) & 0xff) << 8 | SB((a2 >> 16) & 0xff) << 16 | SB(a3 >> 24) << 24) ^ k0;
+                st[h][1] = (SB(a1 & 0xff) | SB((a2 >> 8) & 0xff) << 8 | SB((a3 >> 16) & 0xff) << 16 | SB(a0 >> 24) << 24) ^ k1;
+                st[h][2] = (SB(a2 & 0xff) | SB((a3 >> 8) & 0xff) << 8 | SB((a0 >> 16) & 0xff) << 16 | SB(a1 >> 24) << 24) ^ k2;
+                st[h][3] = (SB(a3 & 0xff) | SB((a0 >> 8) & 0xff) << 8 | SB((a1 >> 16) & 0xff) << 16 | SB(a2 >> 24) << 24) ^ k3;
+            }
+        }
+    }
+#undef TE
+#undef SB
+}
+
+// one OT per thread; the bits of a warp's 32 OTs go out as one word per plane (ballot)
+__global__ void rot_hash(uint8_t* out, const uint4* __restrict__ cots, RotParams p) {
+    extern __shared__ uint32_t te[];
+    load_table(te);
+    __syncthreads();
+    const int lane = threadIdx.x & 31;
+    const int64_t o = int64_t(blockIdx.x) * blockDim.x + threadIdx.x;
+    if ((o & ~int64_t(31)) >= p.count)  // whole warps past the end (their words would be the next plane's)
+        return;
+    const bool valid = o < p.count;
+    uint64_t h0 = 0, h1 = 0;
+    uint32_t c = 0;
+    if (valid) {
+        const uint4 x = cots[o];
+        const uint64_t g = p.gid0 + uint64_t(o);
+        const uint32_t k0 = p.s.x, k1 = p.s.y, k2 = p.s.z ^ uint32_t(g), k3 = p.s.w ^ uint32_t(g >> 32);
+        if (p.sender) {
+            uint32_t st[2][4] = {{x.x, x.y, x.z, x.w}, {x.x ^ p.delta.x, x.y ^ p.delta.y, x.z ^ p.delta.z, x.w ^ p.delta.w}};
+            aes128_otf<2>(st, k0, k1, k2, k3, te, lane);
+            h0 = (uint64_t(x.y ^ st[0][1]) << 32) | (x.x ^ st[0][0]);
+            h1 = (uint64_t(x.y ^ p.delta.y ^ st[1][1]) << 32) | (x.x ^ p.delta.x ^ st[1][0]);
+        } else {
+            uint32_t st[1][4] = {{x.x, x.y, x.z, x.w}};
+            aes128_otf<1>(st, k0, k1, k2, k3, te, lane);
+            h0 = (uint64_t(x.y ^ st[0][1]) << 32) | (x.x ^ st[0][0]);
+            c  = x.x & 1;
+        }
+    }
+    const int64_t word = o >> 5;  // the warp's word of each plane
+    uint32_t* w = reinterpret_cast<uint32_t*>(out);
+    const int64_t pw = p.stride / 4;
+    if (p.sender) {
+        for (int q = 0; q < p.k; q++) {
+            const uint32_t b0 = __ballot_sync(0xffffffffu, valid && ((h0 >> q) & 1));
+            const uint32_t b1 = __ballot_sync(0xffffffffu, valid && ((h1 >> q) & 1));
+            if (lane == 0)
+                w[q * pw + word] = b0, w[(p.k + q) * pw + word] = b1;
+        }
+    } else {
+        const uint32_t bc = __ballot_sync(0xffffffffu, valid && c);
+        if (lane == 0)
+            w[word] = bc;
+        for (int q = 0; q < p.k; q++) {
+            const uint32_t b = __ballot_sync(0xffffffffu, valid && ((h0 >> q) & 1));
+            if (lane == 0)
+                w[(1 + q) * pw + word] = b;
+        }
+    }
+}
+
 __global__ void aes_test(uint32_t* out, RoundKeys rkeys, int n) {
     extern __shared__ uint32_t te[];
     load_table(te);
@@ -286,10 +409,12 @@ struct Ctx {
     uint4 *dD = nullptr, *dT = nullptr, *dSeed = nullptr, *dSums = nullptr, *dMsg = nullptr, *dSecret = nullptr;
     uint8_t* dBits = nullptr;
     int32_t* dPunct = nullptr;
+    uint8_t* dRot = nullptr;  // rot_bits' planes
+    size_t cap_rot = 0;
     size_t cap_D = 0, cap_T = 0, cap_seed = 0, cap_sums = 0, cap_msg = 0, cap_secret = 0, cap_bits = 0, cap_punct = 0;
     ~Ctx() {
         for (void* p : {(void*) dkk, (void*) dD, (void*) dT, (void*) dSeed, (void*) dSums, (void*) dMsg, (void*) dSecret,
-                        (void*) dBits, (void*) dPunct})
+                        (void*) dBits, (void*) dPunct, (void*) dRot})
             if (p)
                 cudaFree(p);
         for (int b = 0; b < kRing; b++) {
@@ -339,7 +464,7 @@ TwoKeys two_keys(const uint32_t keys[88]) {
     return k;
 }
 // level L's buffer: the leaves (L = depth - 1) in D, then alternately T, D, ...
-uint4* level_buf(Ctx& c, int L, int depth) { return (depth - 1 - L) % 2 == 0 ? c.dD : c.dT; }
+uint4* level_buf(uint4* D, Ctx& c, int L, int depth) { return (depth - 1 - L) % 2 == 0 ? D : c.dT; }
 
 } // namespace
 
@@ -400,10 +525,16 @@ void compute(void* nn_, const void* kk_, int64_t n, int64_t k, uint32_t mask, co
 namespace {
 std::mutex g_pin_mutex;
 std::unordered_map<const void*, size_t> g_pinned;  // pinned host buffers and their sizes
-bool pinned(const void* p, size_t bytes) {
+// [p, p + bytes) inside one pinned buffer
+bool pinned_range(const void* p, size_t bytes) {
     std::lock_guard<std::mutex> lock(g_pin_mutex);
-    auto it = g_pinned.find(p);
-    return it != g_pinned.end() && it->second >= bytes;
+    const char* q = static_cast<const char*>(p);
+    for (const auto& [base, size] : g_pinned) {
+        const char* b = static_cast<const char*>(base);
+        if (q >= b && q + bytes <= b + size)
+            return true;
+    }
+    return false;
 }
 } // namespace
 
@@ -440,7 +571,10 @@ Extension::~Extension() {
 void Extension::reserve(int64_t trees, int depth, int64_t k) {
     Ctx& c = *static_cast<Ctx*>(ctx_);
     const size_t leaves = size_t(trees) << (depth - 1), levels = size_t(depth - 1);
-    grow(c.dD, c.cap_D, leaves, "alloc leaves");
+    if (!leaves_) {
+        grow(c.dD, c.cap_D, leaves, "alloc leaves");
+        leaves_ = c.dD;
+    }
     grow(c.dT, c.cap_T, leaves / 2, "alloc tree level");
     grow(c.dSeed, c.cap_seed, size_t(trees), "alloc seeds");
     grow(c.dSums, c.cap_sums, 2 * levels * size_t(trees), "alloc sums");
@@ -459,14 +593,15 @@ void Extension::upload_kk(const void* kk, int64_t k) {
 
 void Extension::sender_trees(const void* seeds, int64_t trees, int depth, const uint32_t keys[88], void* msg) {
     Ctx& c = *static_cast<Ctx*>(ctx_);
+    uint4* D = static_cast<uint4*>(leaves_);
     const int levels = depth - 1;
     const TwoKeys tk = two_keys(keys);
     check(cudaMemcpyAsync(c.dSeed, seeds, size_t(trees) * sizeof(uint4), cudaMemcpyHostToDevice, c.stream), "copy seeds");
     check(cudaMemsetAsync(c.dSums, 0, 2 * size_t(levels) * size_t(trees) * sizeof(uint4), c.stream), "zero sums");
     for (int L = 1; L <= levels; L++) {
         const int64_t threads = trees << (L - 1);
-        const uint4* in = L == 1 ? c.dSeed : level_buf(c, L - 1, depth);
-        ggm_level<<<unsigned((threads + 255) / 256), 256, kTableBytes, c.stream>>>(level_buf(c, L, depth), in, trees, L - 1, levels,
+        const uint4* in = L == 1 ? c.dSeed : level_buf(D, c, L - 1, depth);
+        ggm_level<<<unsigned((threads + 255) / 256), 256, kTableBytes, c.stream>>>(level_buf(D, c, L, depth), in, trees, L - 1, levels,
                                                                                     c.dSums, nullptr, L == levels, tk);
         check(cudaGetLastError(), "launch tree level");
     }
@@ -478,6 +613,7 @@ void Extension::sender_trees(const void* seeds, int64_t trees, int depth, const 
 void Extension::recver_trees(const void* msg, const uint8_t* bits, const void* secret, int64_t trees, int depth,
                              const uint32_t keys[88]) {
     Ctx& c = *static_cast<Ctx*>(ctx_);
+    uint4* D = static_cast<uint4*>(leaves_);
     const int levels = depth - 1;
     const TwoKeys tk = two_keys(keys);
     check(cudaMemcpyAsync(c.dMsg, msg, size_t(levels) * size_t(trees) * sizeof(uint4), cudaMemcpyHostToDevice, c.stream),
@@ -487,8 +623,8 @@ void Extension::recver_trees(const void* msg, const uint8_t* bits, const void* s
     check(cudaMemsetAsync(c.dSums, 0, 2 * size_t(levels) * size_t(trees) * sizeof(uint4), c.stream), "zero sums");
     for (int L = 1; L <= levels; L++) {
         const int64_t threads = trees << (L - 1);
-        const uint4* in = L == 1 ? c.dSeed : level_buf(c, L - 1, depth);
-        uint4* out = level_buf(c, L, depth);
+        const uint4* in = L == 1 ? c.dSeed : level_buf(D, c, L - 1, depth);
+        uint4* out = level_buf(D, c, L, depth);
         ggm_level<<<unsigned((threads + 255) / 256), 256, kTableBytes, c.stream>>>(out, in, trees, L - 1, levels, c.dSums,
                                                                                     c.dPunct, L == levels, tk);
         check(cudaGetLastError(), "launch tree level");
@@ -504,15 +640,37 @@ void Extension::lpn(int64_t k, uint32_t mask, const uint32_t round_keys[44], int
         return;
     RoundKeys rk;
     std::memcpy(rk.w, round_keys, sizeof(rk.w));
-    lpn_inplace<<<unsigned((groups + 255) / 256), 256, kTableBytes, c.stream>>>(c.dD, c.dkk, start, groups, mask, uint32_t(k), rk);
+    lpn_inplace<<<unsigned((groups + 255) / 256), 256, kTableBytes, c.stream>>>(static_cast<uint4*>(leaves_), c.dkk, start, groups,
+                                                                                 mask, uint32_t(k), rk);
     check(cudaGetLastError(), "launch lpn");
 }
 
-void Extension::download(void* out_, int64_t n) {
+void Extension::lpn_single(int64_t k, const uint32_t round_keys[44], const int64_t* outputs, int count) {
+    Ctx& c = *static_cast<Ctx*>(ctx_);
+    if (count <= 0)
+        return;
+    if (count > kMaxSingles)
+        throw std::runtime_error("LPN GPU: too many single outputs");
+    RoundKeys rk;
+    std::memcpy(rk.w, round_keys, sizeof(rk.w));
+    Singles idx{};
+    for (int i = 0; i < count; i++) idx.i[i] = outputs[i];
+    lpn_one<<<1, 64, kTableBytes, c.stream>>>(static_cast<uint4*>(leaves_), c.dkk, idx, count, uint32_t(k), rk);
+    check(cudaGetLastError(), "launch lpn single");
+}
+
+void Extension::download(void* out, int64_t n) { download_range(out, 0, n); }
+
+void Extension::download_range(void* out_, int64_t first, int64_t n) {
     Ctx& c = *static_cast<Ctx*>(ctx_);
     uint4* out = static_cast<uint4*>(out_);
-    if (pinned(out_, size_t(n) * sizeof(uint4))) {
-        check(cudaMemcpyAsync(out, c.dD, size_t(n) * sizeof(uint4), cudaMemcpyDeviceToHost, c.stream), "copy out");
+    const uint4* D = static_cast<const uint4*>(leaves_) + first;
+    if (n <= 0) {
+        check(cudaStreamSynchronize(c.stream), "download");
+        return;
+    }
+    if (pinned_range(out_, size_t(n) * sizeof(uint4))) {
+        check(cudaMemcpyAsync(out, D, size_t(n) * sizeof(uint4), cudaMemcpyDeviceToHost, c.stream), "copy out");
         check(cudaStreamSynchronize(c.stream), "download");
         return;
     }
@@ -528,10 +686,63 @@ void Extension::download(void* out_, int64_t n) {
             copy_chunk(ch - kRing);
         const int b = int(ch % kRing);
         const int64_t o = ch * chunk, cnt = std::min(chunk, n - o);
-        check(cudaMemcpyAsync(c.hG[b], c.dD + o, size_t(cnt) * sizeof(uint4), cudaMemcpyDeviceToHost, c.stream), "copy out");
+        check(cudaMemcpyAsync(c.hG[b], D + o, size_t(cnt) * sizeof(uint4), cudaMemcpyDeviceToHost, c.stream), "copy out");
         check(cudaEventRecord(c.done[b], c.stream), "event");
     }
     for (int64_t ch = std::max<int64_t>(0, chunks - kRing); ch < chunks; ch++) copy_chunk(ch);
+}
+
+void Extension::use_leaves(void* leaves) { leaves_ = leaves; }
+
+void* device_alloc(size_t bytes) {
+    device();
+    void* p = nullptr;
+    if (cudaMalloc(&p, bytes) != cudaSuccess) {
+        cudaGetLastError();
+        return nullptr;
+    }
+    return p;
+}
+
+void device_free(void* p) {
+    if (p)
+        cudaFree(p);
+}
+
+void rot_bits(const void* cots, bool on_device, int64_t count, const uint64_t s[2], uint64_t gid0, const uint64_t* delta,
+              int k, uint8_t* out, int64_t stride) {
+    if (count <= 0)
+        return;
+    if (stride % 4 != 0 || stride * 8 < ((count + 31) / 32) * 32)
+        throw std::runtime_error("ROT GPU: bad plane stride");
+    device();
+    struct Lease {
+        Ctx* c = acquire();
+        ~Lease() { release(c); }
+    } lease;
+    Ctx& c = *lease.c;
+    const int planes = delta ? 2 * k : 1 + k;
+    grow(c.dRot, c.cap_rot, size_t(planes) * size_t(stride), "alloc rot planes");
+    RotParams prm;
+    prm.s = make_uint4(uint32_t(s[0]), uint32_t(s[0] >> 32), uint32_t(s[1]), uint32_t(s[1] >> 32));
+    prm.delta = delta ? make_uint4(uint32_t(delta[0]), uint32_t(delta[0] >> 32), uint32_t(delta[1]), uint32_t(delta[1] >> 32))
+                      : make_uint4(0, 0, 0, 0);
+    prm.gid0 = gid0;
+    prm.count = count;
+    prm.stride = stride;
+    prm.k = k;
+    prm.sender = delta != nullptr;
+    const uint4* src = static_cast<const uint4*>(cots);
+    if (!on_device) {  // COTs on the host (an extension that fell back to the CPU): upload them first
+        grow(c.dD, c.cap_D, size_t(count), "alloc rot input");
+        check(cudaMemcpyAsync(c.dD, cots, size_t(count) * sizeof(uint4), cudaMemcpyHostToDevice, c.stream), "copy rot input");
+        src = c.dD;
+    }
+    const int64_t threads = ((count + 31) / 32) * 32;
+    rot_hash<<<unsigned((threads + 255) / 256), 256, kTableBytes, c.stream>>>(c.dRot, src, prm);
+    check(cudaGetLastError(), "launch rot hash");
+    check(cudaMemcpyAsync(out, c.dRot, size_t(planes) * size_t(stride), cudaMemcpyDeviceToHost, c.stream), "copy rot planes");
+    check(cudaStreamSynchronize(c.stream), "rot bits");
 }
 
 void aes_reference_check(const uint32_t round_keys[44], const uint32_t* expected, int n) {

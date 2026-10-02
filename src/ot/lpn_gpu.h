@@ -40,12 +40,32 @@ class Extension {
                       const uint32_t keys[88]);
     // the LPN step's groups of 4 outputs start + 4g, g < groups, on the leaves (the sparse vector)
     void lpn(int64_t k, uint32_t mask, const uint32_t round_keys[44], int64_t start, int64_t groups);
-    // the first n outputs into host memory
+    // LpnF2::__compute1 of these outputs (at most 64: the trailing outputs of the task ranges)
+    void lpn_single(int64_t k, const uint32_t round_keys[44], const int64_t* outputs, int count);
+    // the first n outputs into host memory (returns when they are there)
     void download(void* out, int64_t n);
+    // outputs first .. first + n - 1 into out (host)
+    void download_range(void* out, int64_t first, int64_t n);
+    // the leaves (the outputs) in this device buffer (device_alloc, 2^(depth - 1) trees blocks), not the context's:
+    // call before reserve(); the outputs stay there after the extension
+    void use_leaves(void* leaves);
 
   private:
     void* ctx_;
+    void* leaves_ = nullptr;
 };
+
+// device memory (nullptr if there is none left), and its release
+void* device_alloc(size_t bytes);
+void device_free(void* p);
+
+// emp's MITCCRH<8> bits of `count` COTs (cots: a device pointer, or a host one) for SilentOT's rot_bits / rot_bitplanes:
+// OT o's key s ^ makeBlock(gid0 + o, 0), H(x) = x ^ AES_key(x). delta (2 words) for the sender, nullptr for the receiver.
+// out (host): planes of `stride` bytes (a multiple of 4, at least ceil(count / 32) * 4), bit j of byte i = OT 8i + j;
+// sender: k planes of m0 (bit q of H(x)), then k of m1 (H(x ^ Delta)); receiver: the choice bits (x's bit 0), then k
+// planes of H(x). Returns when out is filled.
+void rot_bits(const void* cots, bool on_device, int64_t count, const uint64_t s[2], uint64_t gid0, const uint64_t* delta,
+              int k, uint8_t* out, int64_t stride);
 
 // host memory the device copies into directly (cudaHostRegister): pin() once per buffer (false if that failed), unpin()
 // before the buffer is freed; download() into a pinned buffer skips the bounce buffers

@@ -58,13 +58,18 @@ int64_t mismatches(const block* a, const block* b, int64_t n) {
 // the same ios in the same order as MpcotReg::mpcot, then LpnF2::compute's seed, so the outputs are emp's bit for bit
 // (and either party can run either path). False (nothing sent yet) when the device has no room left.
 // FERRET_GPU_CHECK=1 compares the trees and the outputs with emp's CPU code.
+// With `leaves` (a device buffer of n blocks), the outputs are built there and stay; only outputs keep_from .. n - 1
+// come back to ot_output (the rest on demand, FerretCOT::rcot). Without, all of them.
 bool extend_gpu(int party, block Delta, block* ot_output, MpcotReg<IO::NetIO>* mpcot, OTPre<IO::NetIO>* preot,
-                LpnF2<IO::NetIO, 10>* lpn, const block* kk, block seed, std::chrono::steady_clock::time_point t0) {
+                LpnF2<IO::NetIO, 10>* lpn, const block* kk, block seed, std::chrono::steady_clock::time_point t0,
+                void* leaves, int64_t keep_from) {
     const int depth = mpcot->tree_height, levels = depth - 1;
     const int64_t trees = mpcot->tree_n, leave_n = mpcot->leave_n, n = lpn->n;
     std::unique_ptr<cheetah::lpn_gpu::Extension> gpu;
     try {
         gpu = std::make_unique<cheetah::lpn_gpu::Extension>();
+        if (leaves)
+            gpu->use_leaves(leaves);
         gpu->reserve(trees, depth, lpn->k);
     } catch (const std::exception& e) {
         static std::atomic<bool> said{false};
@@ -149,7 +154,7 @@ bool extend_gpu(int party, block Delta, block* ot_output, MpcotReg<IO::NetIO>* m
     }
     const auto t1 = std::chrono::steady_clock::now();
     cheetah::mpcot_ns() += std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0).count();
-    // LpnF2::compute: the seed, then the groups of 4 of every task range on the GPU, the trailing outputs here
+    // LpnF2::compute: the seed, then the groups of 4 and the trailing outputs of every task range
     lpn->seed = cmpBlock(&seed, &zero_block, 1) ? lpn->seed_gen() : seed;
     PRP prp(lpn->seed);
     uint32_t rk[44];
@@ -160,13 +165,18 @@ bool extend_gpu(int party, block Delta, block* ot_output, MpcotReg<IO::NetIO>* m
         return end - 4 > start ? (end - 4 - start + 3) / 4 : int64_t(0);
     };
     int64_t start, end;
+    std::vector<int64_t> singles;
     for (int t = 0; t < lpn->threads; ++t) {
         const int64_t groups = range(t, start, end);
         gpu->lpn(lpn->k, uint32_t(lpn->mask), rk, start, groups);
+        for (int64_t j = start + 4 * groups; j < end; ++j) singles.push_back(j);
     }
-    gpu->download(ot_output, n);
-    for (int t = 0; t < lpn->threads; ++t)
-        for (int64_t j = start + 4 * range(t, start, end); j < end; ++j) lpn->__compute1(ot_output, kk, j, &prp);
+    for (size_t i = 0; i < singles.size(); i += 64)
+        gpu->lpn_single(lpn->k, rk, singles.data() + i, int(std::min<size_t>(64, singles.size() - i)));
+    if (leaves && !check)
+        gpu->download_range(ot_output + keep_from, keep_from, n - keep_from);
+    else
+        gpu->download(ot_output, n);
     cheetah::lpn_ns() += std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t1).count();
     if (check) {
         for (int t = 0; t < lpn->threads; ++t) {
@@ -181,8 +191,112 @@ bool extend_gpu(int party, block Delta, block* ot_output, MpcotReg<IO::NetIO>* m
     }
     return true;
 }
+
+// FerretCOT instances whose outputs (ot_data's extensions) stay on the device: their buffer, and the part of ot_data
+// that is on the host too
+struct DevState {
+    void* leaves    = nullptr;
+    bool on_device  = false;  // the last extension is in `leaves`
+    int64_t host_lo = 0, host_hi = 0;
+};
+std::mutex g_dev_mutex;
+std::unordered_map<const void*, DevState> g_dev;
+// a FerretCOT's state, made at its first extension into ot_data (no device buffer if there was no room)
+DevState* dev_state(const void* ferret, int64_t n, bool make) {
+    std::lock_guard<std::mutex> lock(g_dev_mutex);
+    auto it = g_dev.find(ferret);
+    if (it != g_dev.end())
+        return &it->second;
+    if (!make)
+        return nullptr;
+    static const bool off = getenv("ROT_GPU") && atoi(getenv("ROT_GPU")) == 0;
+    DevState& d = g_dev[ferret];
+    if (!off)
+        d.leaves = cheetah::lpn_gpu::device_alloc(size_t(n) * sizeof(block));
+    return &d;
+}
 } // namespace
 #endif
+
+namespace cheetah {
+bool ferret_on_device(const void* ferret) {
+#if USE_LPN_GPU
+    std::lock_guard<std::mutex> lock(g_dev_mutex);
+    auto it = g_dev.find(ferret);
+    return it != g_dev.end() && it->second.leaves != nullptr;
+#else
+    (void) ferret;
+    return false;
+#endif
+}
+
+void rot_bits_device(const void* cots, bool on_device, int64_t count, const block& s, uint64_t gid0, const block* delta,
+                     int k, uint8_t* out, int64_t stride) {
+#if USE_LPN_GPU
+    uint64_t sv[2] = {uint64_t(_mm_extract_epi64(s, 0)), uint64_t(_mm_extract_epi64(s, 1))}, dv[2] = {0, 0};
+    if (delta)
+        dv[0] = uint64_t(_mm_extract_epi64(*delta, 0)), dv[1] = uint64_t(_mm_extract_epi64(*delta, 1));
+    lpn_gpu::rot_bits(cots, on_device, count, sv, gid0, delta ? dv : nullptr, k, out, stride);
+    static const bool check = getenv("ROT_GPU_CHECK") && atoi(getenv("ROT_GPU_CHECK")) != 0;
+    if (!check)
+        return;
+    // emp's MITCCRH<8> on the same COTs
+    std::vector<block> x(count);
+    if (on_device) {
+        lpn_gpu::Extension e;
+        e.use_leaves(const_cast<void*>(cots));
+        e.download(x.data(), count);
+    } else
+        std::memcpy(x.data(), cots, size_t(count) * sizeof(block));
+    emp::MITCCRH<8> ref;
+    ref.setS(s);
+    ref.gid = gid0;
+    int64_t bad = 0, first_bad = -1, last_bad = -1;
+    auto bit = [&](int q, int64_t o) { return (out[q * stride + o / 8] >> (o % 8)) & 1; };
+    for (int64_t o0 = 0; o0 < count; o0 += 8) {
+        block pad[16];
+        for (int j = 0; j < 8; ++j) {
+            const block v = o0 + j < count ? x[o0 + j] : zero_block;
+            if (delta)
+                pad[2 * j] = v, pad[2 * j + 1] = v ^ *delta;
+            else
+                pad[j] = v;
+        }
+        if (delta)
+            ref.hash<8, 2>(pad);
+        else
+            ref.hash<8, 1>(pad);
+        for (int j = 0; j < 8 && o0 + j < count; ++j) {
+            const int64_t o = o0 + j;
+            const int64_t bad0 = bad;
+            for (int q = 0; q < k; ++q) {
+                if (delta) {
+                    bad += bit(q, o) != ((uint64_t(_mm_extract_epi64(pad[2 * j], 0)) >> q) & 1);
+                    bad += bit(k + q, o) != ((uint64_t(_mm_extract_epi64(pad[2 * j + 1], 0)) >> q) & 1);
+                } else {
+                    bad += bit(1 + q, o) != ((uint64_t(_mm_extract_epi64(pad[j], 0)) >> q) & 1);
+                }
+            }
+            if (!delta)
+                bad += bit(0, o) != int(_mm_extract_epi64(x[o], 0) & 1);
+            if (bad != bad0) {
+                if (first_bad < 0)
+                    first_bad = o;
+                last_bad = o;
+            }
+        }
+    }
+    static std::atomic<int> shown{0};
+    if (bad || shown++ < 4)
+        std::cerr << "ROT_GPU_CHECK " << (delta ? "sender" : "receiver") << ": " << count << " OTs, k " << k << ", "
+                  << (bad ? "DIFFER" : "equal") << " (" << bad << " bits, OTs " << first_bad << " .. " << last_bad
+                  << ", gid0 " << gid0 << ", " << (on_device ? "device" : "host") << ")\n";
+#else
+    (void) cots, (void) on_device, (void) count, (void) s, (void) gid0, (void) delta, (void) k, (void) out, (void) stride;
+    throw std::logic_error("rot_bits_device without a GPU build");
+#endif
+}
+} // namespace cheetah
 
 template <>
 void FerretCOT<IO::NetIO>::extend(block* ot_output, MpcotReg<IO::NetIO>* mpcot, OTPre<IO::NetIO>* preot,
@@ -197,11 +311,24 @@ void FerretCOT<IO::NetIO>::extend(block* ot_output, MpcotReg<IO::NetIO>* mpcot, 
     if (!is_malicious && cheetah::lpn_gpu::mpcot_available() && int64_t(mpcot->tree_n) * mpcot->leave_n == lpn->n) {
         // ot_data, where rcot's extensions go (ConvTriple takes COTs in chunks), is pinned once: the outputs are copied
         // into it directly (until the destructor)
-        if (ot_output == ot_data && lpn->n == param.n)
+        DevState* dev = nullptr;
+        if (ot_output == ot_data && lpn->n == param.n) {
             cheetah::lpn_gpu::pin(ot_data, size_t(param.n) * sizeof(block));
-        if (extend_gpu(party, Delta, ot_output, mpcot, preot, lpn, ot_input + mpcot->consist_check_cot_num, seed, t0))
+            // the outputs stay on the device; the host gets the last M (the next extension's pre-OTs) now, the rest
+            // when rcot hands it out
+            dev = dev_state(this, param.n, true);
+        }
+        void* leaves = dev ? dev->leaves : nullptr;
+        if (extend_gpu(party, Delta, ot_output, mpcot, preot, lpn, ot_input + mpcot->consist_check_cot_num, seed, t0,
+                       leaves, ot_limit)) {
+            if (dev)
+                dev->on_device = leaves != nullptr, dev->host_lo = leaves ? ot_limit : 0, dev->host_hi = param.n;
             return;
+        }
     }
+    if (ot_output == ot_data)
+        if (DevState* dev = dev_state(this, param.n, false))
+            dev->on_device = false, dev->host_lo = 0, dev->host_hi = param.n;
 #endif
     mpcot->mpcot(ot_output, preot, ot_input);
     cheetah::mpcot_ns() += std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count();
@@ -213,6 +340,14 @@ FerretCOT<IO::NetIO>::~FerretCOT() {
 #if USE_LPN_GPU
     if (ot_data != nullptr)
         cheetah::lpn_gpu::unpin(ot_data);
+    {
+        std::lock_guard<std::mutex> lock(g_dev_mutex);
+        auto it = g_dev.find(this);
+        if (it != g_dev.end()) {
+            cheetah::lpn_gpu::device_free(it->second.leaves);
+            g_dev.erase(it);
+        }
+    }
 #endif
     if (ot_pre_data != nullptr) {
         if (party == ALICE)
@@ -231,6 +366,78 @@ FerretCOT<IO::NetIO>::~FerretCOT() {
         delete lpn_f2;
     if (mpcot != nullptr)
         delete mpcot;
+}
+
+// emp's rcot, with ot_data possibly on the device (GPU builds): a consumer (cheetah::device_consumer, SilentOT's
+// rot_bits) gets each range where it is (on the device, or on the host), instead of a copy in `data`; everything else
+// is copied to the host first (in pieces of at least 1M COTs)
+template <>
+void FerretCOT<IO::NetIO>::rcot(block* data, int64_t num) {
+    if (ot_data == nullptr) {
+        ot_data = new block[param.n];
+        memset(ot_data, 0, param.n * sizeof(block));
+    }
+    if (extend_initialized == false)
+        error("Run setup before extending");
+    cheetah::DeviceConsumer* dc = cheetah::device_consumer();
+    // ot_data[ot_used .. ot_used + k - 1] to dst, or to the device consumer
+    auto take = [&](block* dst, int64_t k) {
+        if (k <= 0)
+            return;
+#if USE_LPN_GPU
+        DevState* dev = dev_state(this, param.n, false);
+        if (dev && dev->on_device) {
+            if (dc) {
+                dc->consume(static_cast<const block*>(dev->leaves) + ot_used, k, true);
+                return;
+            }
+            if (ot_used < dev->host_lo || ot_used + k > dev->host_hi) {
+                const int64_t hi = std::min<int64_t>(ot_limit, ot_used + std::max<int64_t>(k, 1 << 20));
+                cheetah::lpn_gpu::Extension e;
+                e.use_leaves(dev->leaves);
+                e.download_range(ot_data + ot_used, ot_used, hi - ot_used);
+                dev->host_lo = ot_used, dev->host_hi = hi;
+            }
+        }
+#endif
+        if (dc)
+            dc->consume(ot_data + ot_used, k, false);
+        else
+            memcpy(dst, ot_data + ot_used, k * sizeof(block));
+    };
+    if (num <= silent_ot_left()) {
+        take(data, num);
+        ot_used += num;
+        return;
+    }
+    block* pt      = data;
+    int64_t gened  = silent_ot_left();
+    if (gened > 0) {
+        take(pt, gened);
+        pt += gened;
+    }
+    int64_t round_inplace = (num - gened - M) / ot_limit;
+    int64_t last_round_ot = num - gened - round_inplace * ot_limit;
+    bool round_memcpy     = last_round_ot > ot_limit ? true : false;
+    if (round_memcpy)
+        last_round_ot -= ot_limit;
+    if (dc && (round_inplace > 0 || round_memcpy))
+        error("rcot: a consumer takes at most ot_limit COTs per call");
+    for (int64_t i = 0; i < round_inplace; ++i) {
+        extend_f2k(pt);
+        ot_used = ot_limit;
+        pt += ot_limit;
+    }
+    if (round_memcpy) {
+        extend_f2k();
+        take(pt, ot_limit);
+        pt += ot_limit;
+    }
+    if (last_round_ot > 0) {
+        extend_f2k();
+        take(pt, last_round_ot);
+        ot_used = last_round_ot;
+    }
 }
 
 template <>

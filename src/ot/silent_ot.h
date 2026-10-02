@@ -52,6 +52,22 @@ inline int& consumer_depth() {
     return d;
 }
 
+// A consumer of COTs that takes them where ferret has them (FerretCOT<IO::NetIO>::rcot hands it each range instead of
+// copying it into rcot's buffer): on the device in GPU builds (ferret_on_device), else on the host
+struct DeviceConsumer {
+    virtual void consume(const emp::block* cots, int64_t count, bool on_device) = 0;
+    virtual ~DeviceConsumer() = default;
+};
+inline DeviceConsumer*& device_consumer() {
+    thread_local DeviceConsumer* c = nullptr;
+    return c;
+}
+// this FerretCOT keeps its extensions' outputs on the device (GPU builds; defined in the HE library)
+bool ferret_on_device(const void* ferret);
+// emp's MITCCRH<8> bits of these COTs on the GPU (lpn_gpu::rot_bits; defined in the HE library)
+void rot_bits_device(const void* cots, bool on_device, int64_t count, const emp::block& s, uint64_t gid0,
+                     const emp::block* delta, int k, uint8_t* out, int64_t stride);
+
 // SilentOT's construction, summed over instances: ferret's setup (base OTs, IKNP, the small first extension), then the
 // warm-up rcot (the first full extension)
 inline std::atomic<int64_t>& ferret_setup_ns() {
@@ -76,6 +92,9 @@ void FerretCOT<IO::NetIO>::extend(block* ot_output, MpcotReg<IO::NetIO>* mpcot, 
 // and its destructor (emp's, after releasing the GPU's pinning of ot_data); defined in hpmpc_interface.cpp
 template <>
 FerretCOT<IO::NetIO>::~FerretCOT();
+// and rcot (emp's, with the outputs possibly on the device: cheetah::device_consumer); defined in hpmpc_interface.cpp
+template <>
+void FerretCOT<IO::NetIO>::rcot(block* data, int64_t num);
 
 template <>
 inline void LpnF2<IO::NetIO, 10>::task(block* nn, const block* kk, int64_t start, int64_t end) {
@@ -545,6 +564,66 @@ class SilentOT : public sci::OT<SilentOT<IO>> {
         }
     }
 
+    // send/recv_rot_bits(planes) with ferret's outputs on the device (GPU builds): rcot hands every range of COTs to
+    // the GPU's MITCCRH (the same keys as ferret->mitccrh, which is advanced past them), and only the bits come back.
+    // Sender: k planes p0, k planes p1; receiver: the choice bits c, k planes p0. The same COTs in the same order as
+    // the CPU path, so either party may take either path.
+    bool rot_device(const block& s, bool sender, int k, uint8_t* const* p0, uint8_t* const* p1, uint8_t* c,
+                    int64_t length) {
+        if (!ferret_on_device(ferret) || ferret->mitccrh.key_used != ot_bsize || length % 8 != 0)
+            return false;
+        struct Consumer : DeviceConsumer {
+            SilentOT* self;
+            bool sender;
+            int k;
+            uint8_t* const* p0;
+            uint8_t* const* p1;
+            uint8_t* c;
+            block s;
+            uint64_t gid0;
+            int64_t done = 0;
+            std::vector<uint8_t> buf;
+            void consume(const block* cots, int64_t count, bool on_device) override {
+                const int64_t stride = ((count + 31) / 32) * 4;
+                const int planes     = sender ? 2 * k : 1 + k;
+                buf.resize(size_t(planes) * size_t(stride));
+                rot_bits_device(cots, on_device, count, s, gid0 + uint64_t(done), sender ? &self->ferret->Delta : nullptr,
+                                k, buf.data(), stride);
+                for (int q = 0; q < planes; ++q) {
+                    uint8_t* dst = sender ? (q < k ? p0[q] : p1[q - k]) : (q == 0 ? c : p0[q - 1]);
+                    put_bits(dst, done, buf.data() + size_t(q) * size_t(stride), count);
+                }
+                done += count;
+            }
+            // bits 0 .. count - 1 of src to bits at .. at + count - 1 of dst (bits of dst below `at` kept)
+            static void put_bits(uint8_t* dst, int64_t at, const uint8_t* src, int64_t count) {
+                const int64_t bytes = (count + 7) / 8;
+                const int r         = int(at % 8);
+                dst += at / 8;
+                if (r == 0) {
+                    std::memcpy(dst, src, size_t(bytes));
+                    return;
+                }
+                const int64_t end_bits = r + count, out_bytes = (end_bits + 7) / 8;
+                uint8_t carry = uint8_t(dst[0] & ((1u << r) - 1));
+                for (int64_t i = 0; i < out_bytes; ++i) {
+                    const uint8_t v = i < bytes ? src[i] : 0;
+                    dst[i]          = uint8_t(carry | (v << r));
+                    carry           = uint8_t(v >> (8 - r));
+                }
+            }
+        } cons;
+        cons.self = this, cons.sender = sender, cons.k = k, cons.p0 = p0, cons.p1 = p1, cons.c = c, cons.s = s;
+        cons.gid0  = ferret->mitccrh.gid;
+        DeviceConsumer* saved = device_consumer();
+        device_consumer()     = &cons;
+        const int64_t chunk   = std::min<int64_t>(int64_t(1) << 20, ferret->ot_limit);
+        for (int64_t off = 0; off < length; off += chunk) timed_rcot(nullptr, std::min(chunk, length - off));
+        device_consumer() = saved;
+        ferret->mitccrh.gid += uint64_t(length);  // as length / 8 renew_ks() calls would have
+        return true;
+    }
+
     // Random OTs with 1-bit messages, packed 8 per byte (bit j of byte i belongs to OT 8i + j; length a
     // multiple of 8). The COTs are taken from ferret, hashed and reduced to bits in cache-sized chunks,
     // where send_ot_rm_rc<T> stores two 16-byte blocks and a T per OT and makes several passes over them.
@@ -555,6 +634,8 @@ class SilentOT : public sci::OT<SilentOT<IO>> {
         ferret->io->send_block(&s, 1);
         ferret->mitccrh.setS(s);
         ferret->io->flush();
+        if (rot_device(s, true, 1, &m0, &m1, nullptr, length))
+            return;
         std::vector<block> buf(std::min<int64_t>(rot_chunk, length));
         block pad[2 * ot_bsize];
         for (int64_t i0 = 0; i0 < length; i0 += rot_chunk) {
@@ -583,6 +664,8 @@ class SilentOT : public sci::OT<SilentOT<IO>> {
         block s;
         ferret->io->recv_block(&s, 1);
         ferret->mitccrh.setS(s);
+        if (rot_device(s, false, 1, &mc, nullptr, c, length))
+            return;
         std::vector<block> buf(std::min<int64_t>(rot_chunk, length));
         block pad[ot_bsize];
         for (int64_t i0 = 0; i0 < length; i0 += rot_chunk) {
@@ -612,6 +695,8 @@ class SilentOT : public sci::OT<SilentOT<IO>> {
         ferret->io->send_block(&s, 1);
         ferret->mitccrh.setS(s);
         ferret->io->flush();
+        if (rot_device(s, true, k, m0, m1, nullptr, length))
+            return;
         std::vector<block> buf(std::min<int64_t>(rot_chunk, length));
         block pad[2 * ot_bsize];
         for (int64_t i0 = 0; i0 < length; i0 += rot_chunk) {
@@ -647,6 +732,8 @@ class SilentOT : public sci::OT<SilentOT<IO>> {
         block s;
         ferret->io->recv_block(&s, 1);
         ferret->mitccrh.setS(s);
+        if (rot_device(s, false, k, mc, nullptr, c, length))
+            return;
         std::vector<block> buf(std::min<int64_t>(rot_chunk, length));
         block pad[ot_bsize];
         for (int64_t i0 = 0; i0 < length; i0 += rot_chunk) {
