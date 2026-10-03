@@ -56,7 +56,18 @@ struct Beaver4TuplesD {
     Datatype* abcd;
 };
 
+// Fan-out pairs: fields a, b, c and the products ab, ac (two AND gates on a common wire share field a)
+template <typename Datatype>
+struct FanoutPairsD {
+    Datatype* a;
+    Datatype* b;
+    Datatype* c;
+    Datatype* ab;
+    Datatype* ac;
+};
+
 using Beaver3Tuples = Beaver3TuplesD<uint8_t>;
+using FanoutPairs = FanoutPairsD<uint8_t>;
 using Beaver4Tuples = Beaver4TuplesD<uint8_t>; 
 
 /// Packs bits in-place without resizing the buffer.
@@ -192,6 +203,41 @@ void cot_outer_multiply(int party, const sci::OTPack<IO>* otpack, uint8_t* const
             const uint8_t rcv = rs[p * nb + i] ^ (y[i] & m[p * nb + i]);
             const uint8_t snd = (~ei & r0[p * nb + i]) ^ (ei & r1[p * nb + i]);
             out[p][i] = (x[p][i] & y[i]) ^ rcv ^ snd;
+        }
+}
+
+/// Random fan-out pairs (paper: Protocol Pi_fan): shares of uniform a, b, c and of ab, ac from one random OT per
+/// direction with 2-bit messages and no other message. Each party's share of a is the choice of its receiving OT, its
+/// shares of b and c are the two bits r0 ^ r1 of its sending OT. With the other party's receiving output
+/// r0 ^ a' (b, c) and its own receiving output, out = (b, c) & a ^ rs ^ r0 shares the products.
+template <typename IO>
+void rot_fanout_pairs(int party, const sci::OTPack<IO>* otpack, FanoutPairs d, size_t num) {
+    const size_t nb = (num + 7) / 8;
+    constexpr int k = 2;
+    std::vector<uint8_t> rs(k * nb), r0(k * nb), r1(k * nb), s(nb);
+    std::vector<uint8_t*> prs(k), pr0(k), pr1(k);
+    for (int p = 0; p < k; p++) prs[p] = rs.data() + p * nb, pr0[p] = r0.data() + p * nb, pr1[p] = r1.data() + p * nb;
+    switch (party) {  // the directions of cot_outer_multiply
+        case emp::ALICE:
+            otpack->silent_ot_reversed->recv_rot_bitplanes(prs.data(), s.data(), k, int64_t(num));
+            otpack->io->flush();
+            otpack->silent_ot->send_rot_bitplanes(pr0.data(), pr1.data(), k, int64_t(num));
+            break;
+        case emp::BOB:
+            otpack->silent_ot_reversed->send_rot_bitplanes(pr0.data(), pr1.data(), k, int64_t(num));
+            otpack->io->flush();
+            otpack->silent_ot->recv_rot_bitplanes(prs.data(), s.data(), k, int64_t(num));
+            break;
+    }
+    otpack->io->flush();
+    uint8_t* const fields[k] = {d.b, d.c};
+    uint8_t* const prods[k] = {d.ab, d.ac};
+    std::memcpy(d.a, s.data(), nb);
+    for (int p = 0; p < k; p++)
+        for (size_t i = 0; i < nb; ++i) {
+            const uint8_t x = r0[p * nb + i] ^ r1[p * nb + i];
+            fields[p][i] = x;
+            prods[p][i] = (x & s[i]) ^ rs[p * nb + i] ^ r0[p * nb + i];
         }
 }
 

@@ -67,6 +67,9 @@ void generateBool3TupleCheetah(Beaver3Tuples tuples, uint64_t num_tuples, const 
                                int port, int party, int threads = 1, unsigned io_offset = 1,
                                bool party_local_bc = false);
 
+void generateFanoutPairCheetah(FanoutPairs pairs, uint64_t num_pairs, const std::string& ip, int port, int party,
+                               int threads, unsigned io_offset);
+
 void generateBool4TupleCheetah(Beaver4Tuples tuples, uint64_t num_tuples, const std::string& ip,
                                int port, int party, int threads = 1, unsigned io_offset = 1);
 

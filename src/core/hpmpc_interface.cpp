@@ -976,6 +976,45 @@ void generateBool3TupleCheetah(Beaver3Tuples tuples, uint64_t num_tuples, const 
     accumulateTripleStat("BOOL3", data_sent, data_recv, Utils::to_sec(Utils::time_diff(start)));
 }
 
+void generateFanoutPairCheetah(FanoutPairs pairs, uint64_t num_pairs, const std::string& ip, int port, int party,
+                               int threads, unsigned io_offset) {
+    Utils::log(Utils::Level::INFO, "P", party - 1, ", PID", io_offset, ": Generating ", num_pairs, " fan-out pairs");
+    require_tuple_count_multiple_of_8(num_pairs);
+    const uint64_t num_bytes = (num_pairs + 7) / 8;
+    auto& keys = Keys<IO::NetIO>::instance(party, ip, port, threads, io_offset);
+    auto start = measure::now();
+    auto** ios = keys.get_ios(threads);
+    keys.ensure_ot(uint64_t(num_pairs));
+    const int ot_threads = keys.ot_workers();
+    const uint64_t ot_call = keys.next_ot_call();
+    auto func = [&](int wid, int start, int end) -> Code {
+        emp::DetSeedScope det_scope(Keys<IO::NetIO>::ot_seed_tag(ot_call, wid), gemini::kSeeded);  // reproducible OT
+        if (start >= end)
+            return Code::OK;
+        const int cur_party = wid & 1 ? OTHER_PARTY(party) : party;  // the per-wid OT packs' roles
+        for (int total = start; total < end;) {
+            const int current = std::min(end - total, static_cast<int>(MAX_BOOL / ot_threads / 8));
+            FanoutPairs sub{pairs.a + total, pairs.b + total, pairs.c + total, pairs.ab + total, pairs.ac + total};
+            rot_fanout_pairs(cur_party, keys.get_otpack(wid), sub, size_t(current) * 8);
+            total += current;
+        }
+        return Code::OK;
+    };
+    gemini::ThreadPool tpool(ot_threads);
+    gemini::LaunchWorks(tpool, num_bytes, func);
+    std::string unit;
+    double data_sent = 0, data_recv = 0;
+    for (int i = 0; i < threads; ++i) {
+        data_sent += Utils::to_MB(ios[i]->counter, unit);
+        data_recv += Utils::to_MB(ios[i]->recv_counter, unit);
+        ios[i]->counter = 0;
+        ios[i]->recv_counter = 0;
+    }
+    Utils::log(Utils::Level::INFO, "P", party - 1, ", PID", io_offset, ": Fan-out pairs   MB SENT PRE: ", data_sent,
+               "   MB RECEIVED PRE: ", data_recv);
+    accumulateTripleStat("FAN2", data_sent, data_recv, Utils::to_sec(Utils::time_diff(start)));
+}
+
 void generateBool4TupleCheetah(Beaver4Tuples tuples, uint64_t num_tuples, const std::string& ip,
                                int port, int party, int threads, unsigned io_offset) {
     Utils::log(Utils::Level::INFO, "P", party - 1, ", PID", io_offset, ": Generating ", num_tuples, " BOOL4 tuples (threads: ", threads, ")");
