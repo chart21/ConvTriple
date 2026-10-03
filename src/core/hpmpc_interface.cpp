@@ -1037,10 +1037,78 @@ void generateBool4TupleCheetah(Beaver4Tuples tuples, uint64_t num_tuples, const 
     accumulateTripleStat("BOOL4", data_sent, data_recv, Utils::to_sec(Utils::time_diff(start)));
 }
 
+// Shares of x * y mod 2^BIT_LEN, x ALICE's, y BOB's (Gilboa): for every bit j of y one COT with ALICE's correlation x,
+// BOB choosing bit j, of width BIT_LEN - j (the product's bits above BIT_LEN drop out after the shift by j). Adds the
+// party's share to out.
+static void gilboa_mult(Keys<IO::NetIO>& keys, int party, const UINT_TYPE* x, const UINT_TYPE* y, UINT_TYPE* out,
+                        uint64_t n) {
+    keys.ensure_ot(n * BIT_LEN);
+    const int ot_threads = keys.ot_workers();
+    const uint64_t ot_call = keys.next_ot_call();
+    auto func = [&](int wid, size_t start, size_t end) -> Code {
+        emp::DetSeedScope det_scope(Keys<IO::NetIO>::ot_seed_tag(ot_call, wid), gemini::kSeeded);  // reproducible OT
+        if (start >= end)
+            return Code::OK;
+        const size_t m = end - start;
+        auto* ot = keys.get_otpack(wid);
+        auto* silent = wid & 1 ? ot->silent_ot_reversed : ot->silent_ot;  // ALICE sends (see generateCOT)
+        std::vector<UINT_TYPE> r(m);
+        std::vector<uint8_t> sel(party == emp::BOB ? m : 0);
+        for (int j = 0; j < BIT_LEN; ++j) {
+            if (party == emp::ALICE) {
+                silent->send_cot(r.data(), x + start, m, BIT_LEN - j);
+                for (size_t i = 0; i < m; ++i) out[start + i] -= r[i] << j;
+            } else {
+                for (size_t i = 0; i < m; ++i) sel[i] = uint8_t((y[start + i] >> j) & 1);
+                silent->recv_cot(r.data(), (bool*) sel.data(), m, BIT_LEN - j);
+                for (size_t i = 0; i < m; ++i) out[start + i] += r[i] << j;
+            }
+        }
+        return Code::OK;
+    };
+    gemini::ThreadPool tpool(ot_threads);
+    gemini::LaunchWorks(tpool, n, func);
+}
+
 void generateArithTriplesCheetah(const UINT_TYPE a[], const UINT_TYPE b[], UINT_TYPE c[],
                                  int bitlength, uint64_t num_triples, const std::string& ip,
                                  int port, int party, int threads, Utils::PROTO proto,
                                  unsigned io_offset) {
+    if constexpr (BIT_LEN == 64) {
+        // gemini's elementwise product computes in SEAL's plaintext space (at most 60 bits): Gilboa multiplication
+        // over the silent COTs instead. AB2: c = a * b, a ALICE's (hpmpc P0), b BOB's. AB: both hold shares,
+        // c = a0 b0 + a1 b1 + a0 b1 + b0 a1, the cross terms with ALICE's a0 / b0 as the correlation.
+        if (bitlength != 64)
+            throw std::runtime_error("generateArithTriplesCheetah: bitlength must match the 64-bit build");
+        Utils::log(Utils::Level::INFO, "P", party - 1, ", PID", io_offset, ": Generating ", num_triples,
+                   " ARITH triples ", Utils::proto_str(proto), " by Gilboa multiplication (threads: ", threads, ")");
+        auto& keys = Keys<IO::NetIO>::instance(party, ip, port, threads, io_offset);
+        auto start = measure::now();
+        auto** ios = keys.get_ios(threads);
+        for (uint64_t i = 0; i < num_triples; ++i) c[i] = 0;
+        if (proto == Utils::PROTO::AB) {
+            for (uint64_t i = 0; i < num_triples; ++i) c[i] = a[i] * b[i];
+            gilboa_mult(keys, party, party == emp::ALICE ? a : nullptr, party == emp::BOB ? b : nullptr, c, num_triples);
+            gilboa_mult(keys, party, party == emp::ALICE ? b : nullptr, party == emp::BOB ? a : nullptr, c, num_triples);
+        } else {
+            gilboa_mult(keys, party, party == emp::ALICE ? a : nullptr, party == emp::BOB ? b : nullptr, c, num_triples);
+        }
+        Utils::log(Utils::Level::INFO, "P", party - 1, ", PID", io_offset,
+                   ": Arith triple   s PRE: ", Utils::to_sec(Utils::time_diff(start)));
+        std::string unit;
+        double data_sent = 0, data_recv = 0;
+        for (int i = 0; i < threads; ++i) {
+            data_sent += Utils::to_MB(ios[i]->counter, unit);
+            data_recv += Utils::to_MB(ios[i]->recv_counter, unit);
+            ios[i]->counter = 0;
+            ios[i]->recv_counter = 0;
+        }
+        Utils::log(Utils::Level::INFO, "P", party - 1, ", PID", io_offset, ": Arith triple   MB SENT PRE: ", data_sent,
+                   "   MB RECEIVED PRE: ", data_recv);
+        accumulateTripleStat("ARITH", data_sent, data_recv, Utils::to_sec(Utils::time_diff(start)));
+        keys.disconnect();
+        return;
+    }
     assert(bitlength == 32 && "[arith. triples] Unsupported bitlength");
     Utils::log(Utils::Level::INFO, "P", party - 1, ", PID", io_offset, ": Generating ", num_triples,
                " ARITH triples ", Utils::proto_str(proto), " (threads: ", threads, ")");
