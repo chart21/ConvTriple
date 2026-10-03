@@ -324,9 +324,13 @@ struct PackedConv2D::Wide {
         if (!seal::util::try_invert_uint_mod(p1 % p0, p0, crt[0]) || !seal::util::try_invert_uint_mod(p0 % p1, p1, crt[1]))
             throw std::runtime_error("PackedConv2D: primes not coprime");
         q_out_bits = 128 - __builtin_clzll(uint64_t(q_out >> 64));
-        // the noise budget at q' (see setUp's wire widths): the flooding below 2^(n_delta - 3) after the switch,
-        // which divides by the dropped prime p > 2^(bits(p) - 1)
-        flood_bits = in.q.back().bit_count() - 1 + (q_out_bits - 64) - 3;
+        // the noise budget (see setUp's wire widths): the flooding below Delta / 16 at the input level, Delta = q / t >=
+        // 2^(bits(q) - 65), which the switch scales to Delta' / 16
+        const auto& cd = *ctx.first_context_data();
+        const size_t words = cd.parms().coeff_modulus().size();
+        const uint64_t top = cd.total_coeff_modulus()[words - 1];
+        const int q_bits = int(64 * (words - 1)) + 64 - __builtin_clzll(top);
+        flood_bits = q_bits - 65 - 4;
     }
     // the integer below q' with residues (a0, a1)
     u128 compose(uint64_t a0, uint64_t a1) const {
@@ -586,15 +590,17 @@ void PackedConv2D::setUp(const seal::SEALContext& context, const seal::SecretKey
             wire->in_bytes += packed_size(wire->N, q.bit_count());
         }
         if (wide_) {
-            // t = 2^64 at q' (two primes): decryption is exact while the noise stays below Delta'/2, Delta' = q'/t.
-            // Budget: the flooding after the switch below 2^(n_delta - 3) (flood_bits), the truncation of c0
-            // below 2^(n_delta - 4), that of c1 times the ternary secret below 2^(c1_shift + log2 N) = 2^(n_delta - 4)
-            // (worst case), the products, the switch and the encryption of zero far below
+            // t = 2^64 at q' (two primes): decryption is exact while the noise stays below Delta'/2, Delta' = q'/t >=
+            // 2^(n_delta - 1). Budget: the flooding after the switch below Delta'/16 (flood_bits), the truncation of c0
+            // below 2^(n_delta - 4) <= Delta'/8, that of c1 times the ternary secret: delta uniform below 2^c1_shift
+            // over ~2N/3 terms of random sign, std 2^c1_shift sqrt(2N/9), below 2^(c1_shift + 10) = Delta'/8 at
+            // 14 sigma for N = 8192 (the 32-bit wire keeps 12 sigma); the products, the switch and the encryption of
+            // zero far below. Total under 5/16 Delta'.
             const int q_bits       = wide_->q_out_bits;
             const int n_delta_bits = q_bits - 64;
             const int log_n        = __builtin_ctzll(wire->N);
             wire->c0_shift         = n_delta_bits - 4;
-            wire->c1_shift         = n_delta_bits - 4 - log_n;
+            wire->c1_shift         = n_delta_bits - 4 - (log_n - 3);
             wire->c0_bits          = q_bits - wire->c0_shift;
             wire->c1_bits          = q_bits - wire->c1_shift;
         } else {
@@ -685,12 +691,16 @@ void PackedConv2D::setUp(const seal::SEALContext& context, const seal::SecretKey
 
 void PackedConv2D::setUpWide(IO::NetIO** ios, int party) {
     if (conv_repack())
-        throw std::runtime_error("PackedConv2D: no repacking with 64-bit triples");
-    constexpr size_t N = 8192; // the 180-bit modulus takes N = 8192 (128-bit security: up to 218 bits)
+        throw std::runtime_error("PackedConv2D: with repacking, setUpRepack sets up the 64-bit ring");
+    // Noise (t = 2^64): a product's is sum_g (e_g + rho_g) w_g with |w| <= 2^63 (centered), up to ~2^19.4 weight terms
+    // per output coefficient (ResNet50's widest layers) and Gaussian e (sigma 3.2): below 2^78 except with probability
+    // 2^-40 (13 sigma), 2^86 in the worst case. The flooding stays 19 bits above the former (the margin of the 32-bit
+    // parameters: 2^64 against 2^45.4) and both fit Delta / 2: q of 165 bits (N = 8192; 128-bit security allows 218)
+    constexpr size_t N = 8192;
     seal::EncryptionParameters params(seal::scheme_type::bfv);
     params.set_poly_modulus_degree(N);
     params.set_n_special_primes(0);
-    params.set_coeff_modulus(seal::CoeffModulus::Create(N, {60, 60, 60}));
+    params.set_coeff_modulus(seal::CoeffModulus::Create(N, {55, 55, 55}));
     params.set_plain_modulus(uint64_t(1) << 20); // SEAL's context wants one; t = 2^64 is done here
 #if PRG_SEED != -1
     params.set_random_generator(std::make_shared<seal::Blake2xbPRNGFactory>(seal::prng_seed_type{gemini::party_seed64(0x6464)}));
@@ -713,6 +723,38 @@ void PackedConv2D::setUpWide(IO::NetIO** ios, int party) {
     else
         get(*other_pk), put(*pk);
     wide_ = std::make_shared<Wide>(ctx);
+    setUp(ctx, keygen.secret_key(), other_pk);
+}
+
+void PackedConv2D::setUpN8192(IO::NetIO** ios, int party) {
+    if (conv_repack())
+        throw std::runtime_error("PackedConv2D: conv_poly_n 8192 is the plain packing (repacking has its own ring)");
+    constexpr size_t N = 8192;
+    seal::EncryptionParameters params(seal::scheme_type::bfv);
+    params.set_poly_modulus_degree(N);
+    params.set_n_special_primes(0);
+    params.set_coeff_modulus(seal::CoeffModulus::Create(N, {60, 49})); // the shared context's modulus
+    params.set_plain_modulus(PLAIN_MOD);
+#if PRG_SEED != -1
+    params.set_random_generator(std::make_shared<seal::Blake2xbPRNGFactory>(seal::prng_seed_type{gemini::party_seed64(0x8193)}));
+#endif
+    seal::SEALContext ctx(params, true, seal::sec_level_type::tc128);
+    seal::KeyGenerator keygen(ctx);
+    auto pk = std::make_shared<seal::PublicKey>(), other_pk = std::make_shared<seal::PublicKey>();
+    keygen.create_public_key(*pk);
+    auto put = [&](const auto& obj) {
+        std::stringstream ss;
+        obj.save(ss);
+        send(ios, ss.str());
+    };
+    auto get = [&](auto& obj) {
+        std::stringstream ss(recv(ios));
+        obj.load(ctx, ss);
+    };
+    if (party == emp::ALICE)
+        put(*pk), get(*other_pk);
+    else
+        get(*other_pk), put(*pk);
     setUp(ctx, keygen.secret_key(), other_pk);
 }
 
@@ -746,8 +788,15 @@ void PackedConv2D::setUpRepack(IO::NetIO** ios, int party, bool both_evaluate) {
     seal::EncryptionParameters params(seal::scheme_type::bfv);
     params.set_poly_modulus_degree(N);
     params.set_n_special_primes(1); // the last prime is only for key switching
-    params.set_coeff_modulus(seal::CoeffModulus::Create(N, {60, 49, 60}));
-    params.set_plain_modulus(PLAIN_MOD);
+    if constexpr (BIT_LEN == 64) {
+        // t = 2^64 (setUpWide's data modulus) and a 53-bit special prime: 218 bits, 128-bit security's limit at N = 8192;
+        // the key switching adds about 2^19 per automorphism, far below the flooding
+        params.set_coeff_modulus(seal::CoeffModulus::Create(N, {55, 55, 55, 53}));
+        params.set_plain_modulus(uint64_t(1) << 20); // a placeholder, see setUpWide
+    } else {
+        params.set_coeff_modulus(seal::CoeffModulus::Create(N, {60, 49, 60}));
+        params.set_plain_modulus(PLAIN_MOD);
+    }
 #if PRG_SEED != -1
     params.set_random_generator(std::make_shared<seal::Blake2xbPRNGFactory>(seal::prng_seed_type{gemini::party_seed64(0x8192)}));
 #endif
@@ -783,6 +832,8 @@ void PackedConv2D::setUpRepack(IO::NetIO** ios, int party, bool both_evaluate) {
             get(*gk);
     }
     const seal::SecretKey sk = keygen.secret_key();
+    if constexpr (BIT_LEN == 64)
+        wide_ = std::make_shared<Wide>(ctx);
     setUp(ctx, sk, other_pk);
     if (evaluates)
         other_gk_ = gk;

@@ -41,6 +41,13 @@ inline bool& conv_repack_ab() {
     static bool ab = false;
     return ab;
 }
+// The ring of the packed convolutions with 32-bit triples (hpmpc CHEETAH_CONV_POLY_N, set before the first Keys::instance;
+// the environment variable CONV_POLY_N overrides it): 4096 (the shared context, default) or 8192 (own context with the
+// same 109-bit modulus: twice the slots per ciphertext, fewer and larger ciphertexts). 64-bit triples take 8192 anyway.
+inline size_t& conv_poly_n() {
+    static size_t n = 4096;
+    return n;
+}
 // A limit on the threads of the packed convolutions, read at every encryption, evaluation and decryption (0: the
 // caller's count). hpmpc's CHEETAH_CONV_EARLY lowers it while the OT phase runs next to the conv triples and lifts it
 // afterwards, so that the conv triples take the idle cores first and all of them once the OT phase is done.
@@ -64,6 +71,8 @@ class PackedConv2D {
     // (own keys, public keys exchanged on ios[0]). Encoding round(q m / t) is exact; the inputs and the weights are
     // centered 64-bit values.
     void setUpWide(IO::NetIO** ios, int party);
+    // conv_poly_n() == 8192 with 32-bit triples: setUp's context replaced by an N = 8192 one with its 109-bit modulus
+    void setUpN8192(IO::NetIO** ios, int party);
 
     // Shares c of the stride-1, unpadded conv(x, w) (NCHW input, OIHW weights) of bs images.
     // AB2: the party without w encrypts its x, the other one evaluates (and adds its own x if given);
