@@ -47,9 +47,11 @@ class HomBNSS {
 
     inline std::string get_str() const { return "bn"; }
 
+    // n_base_bits > 0: shares modulo 2^n_base_bits (64 bits, which target_base_mod cannot hold) instead of
+    // target_base_mod; the CRT plaintext must hold 2 n + 1 + kStatBits bits
     Code setUp(uint64_t target_base_mod, const std::vector<seal::SEALContext>& contexts,
                std::vector<std::optional<seal::SecretKey>> sks,
-               std::vector<std::shared_ptr<seal::PublicKey>> pks);
+               std::vector<std::shared_ptr<seal::PublicKey>> pks, int n_base_bits = 0);
 
     Code setUp(uint64_t target_base_mod, const seal::SEALContext& context,
                std::optional<seal::SecretKey> sk   = std::nullopt,

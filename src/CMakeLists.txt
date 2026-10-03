@@ -159,6 +159,15 @@ target_compile_options(
     "-march=native;-Wno-ignored-attributes;-Wno-ignored-qualifiers;-Wno-unused-parameter"
 )
 
+add_executable(cheetah_arith_test arith_triple_test.cpp)
+target_link_libraries(cheetah_arith_test PRIVATE ${HE_LIB} Eigen3::Eigen)
+target_include_directories(cheetah_arith_test PRIVATE ${EIGEN3_INCLUDE_DIR})
+target_compile_definitions(cheetah_arith_test PUBLIC USE_CHEETAH=1)
+target_compile_definitions(cheetah_arith_test PRIVATE LOGLEVEL=${TRIPLE_LOG_LEVEL} PRG_SEED=${TRIPLE_SEED}
+                           TRIPLE_BITLEN=${TRIPLE_BITLEN})
+target_compile_options(cheetah_arith_test PRIVATE
+    "-march=native;-Wno-ignored-attributes;-Wno-ignored-qualifiers;-Wno-unused-parameter")
+
 set(mul_gen_test cheetah_mul_gen_test)
 add_executable(${mul_gen_test} mul_gen_test.cpp)
 target_link_libraries(${mul_gen_test} PRIVATE ${HE_LIB} Eigen3::Eigen)

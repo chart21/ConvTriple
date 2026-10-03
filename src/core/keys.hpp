@@ -174,6 +174,8 @@ class Keys {
             // gemini's FC, conv and BN stay in SEAL's plaintext space (at most 60 bits) and are not used
             if (!conv_repack()) // setUpRepack did (t = 2^64 with the special prime)
                 _packed_conv.setUpWide(_ios, party);
+            // the elementwise (arithmetic) triples: gemini's CRT batching, generalized to 64-bit shares
+            setupBn(_ios, ctx, party);
         } else {
             _bn.setUp(PLAIN_MOD, ctx, skey, o_pkey);
             setupBn(_ios, ctx, party);
@@ -242,7 +244,9 @@ void Keys<Channel>::setupBn(Channel** ios, const seal::SEALContext& ctx, const i
     size_t crt_bits     = 2 * ntarget_bits + 1 + gemini::HomBNSS::kStatBits;
 
     const size_t nbits_per_crt_plain = [](size_t crt_bits) {
-        constexpr size_t kMaxCRTPrime = 50;
+        // 64-bit shares (169 bits of CRT plaintext): five 34-bit primes, as small as the 32-bit ones (36 bits), so
+        // that the switch to the 49-bit prime still decrypts (Delta' = 2^15); four 43-bit primes would leave 2^6
+        constexpr size_t kMaxCRTPrime = BIT_LEN == 64 ? 36 : 50;
         for (size_t nCRT = 1;; ++nCRT) {
             size_t np = gemini::CeilDiv(crt_bits, nCRT);
             if (np <= kMaxCRTPrime)
@@ -290,7 +294,7 @@ void Keys<Channel>::setupBn(Channel** ios, const seal::SEALContext& ctx, const i
         opt_sks.emplace_back(*bn_sks_[i]);
     }
 
-    auto code = _bn.setUp(PLAIN_MOD, contexts, opt_sks, bn_pks_);
+    auto code = _bn.setUp(PLAIN_MOD, contexts, opt_sks, bn_pks_, int(BIT_LEN));
     if (code != Code::OK)
         Utils::log(Utils::Level::ERROR, "P", party - 1, ": ", CodeMessage(code));
 }

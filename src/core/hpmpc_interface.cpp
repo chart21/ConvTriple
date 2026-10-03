@@ -1074,10 +1074,16 @@ void generateArithTriplesCheetah(const UINT_TYPE a[], const UINT_TYPE b[], UINT_
                                  int bitlength, uint64_t num_triples, const std::string& ip,
                                  int port, int party, int threads, Utils::PROTO proto,
                                  unsigned io_offset) {
-    if constexpr (BIT_LEN == 64) {
-        // gemini's elementwise product computes in SEAL's plaintext space (at most 60 bits): Gilboa multiplication
-        // over the silent COTs instead. AB2: c = a * b, a ALICE's (hpmpc P0), b BOB's. AB: both hold shares,
-        // c = a0 b0 + a1 b1 + a0 b1 + b0 a1, the cross terms with ALICE's a0 / b0 as the correlation.
+    // 64 bits: gemini's CRT-batched elementwise product with five 34-bit plaintext primes (HomBNSS with 64-bit shares:
+    // the product plus a 169-bit mask composed by CRT, its low 64 bits); ARITH_OT=1: Gilboa multiplication over the
+    // silent COTs instead
+    static const bool arith_ot = [] {
+        const char* e = std::getenv("ARITH_OT");
+        return e && std::atoi(e) != 0;
+    }();
+    if (BIT_LEN == 64 && arith_ot) {
+        // Gilboa multiplication over the silent COTs. AB2: c = a * b, a ALICE's (hpmpc P0), b BOB's. AB: both hold
+        // shares, c = a0 b0 + a1 b1 + a0 b1 + b0 a1, the cross terms with ALICE's a0 / b0 as the correlation.
         if (bitlength != 64)
             throw std::runtime_error("generateArithTriplesCheetah: bitlength must match the 64-bit build");
         Utils::log(Utils::Level::INFO, "P", party - 1, ", PID", io_offset, ": Generating ", num_triples,
@@ -1109,7 +1115,8 @@ void generateArithTriplesCheetah(const UINT_TYPE a[], const UINT_TYPE b[], UINT_
         keys.disconnect();
         return;
     }
-    assert(bitlength == 32 && "[arith. triples] Unsupported bitlength");
+    if (bitlength != int(BIT_LEN))
+        throw std::runtime_error("generateArithTriplesCheetah: bitlength must match the build (TRIPLE_BITLEN)");
     Utils::log(Utils::Level::INFO, "P", party - 1, ", PID", io_offset, ": Generating ", num_triples,
                " ARITH triples ", Utils::proto_str(proto), " (threads: ", threads, ")");
     auto& keys = Keys<IO::NetIO>::instance(party, ip, port, threads, io_offset);

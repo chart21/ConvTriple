@@ -5,6 +5,7 @@
 #include <seal/seal.h>
 #include <seal/secretkey.h>
 #include <seal/util/polyarithsmallmod.h>
+#include <seal/util/uintarithsmallmod.h>
 #include <seal/util/rlwe.h>
 
 #include "gemini/cheetah/sliced_3d_tensor.h"
@@ -109,7 +110,7 @@ Code HomBNSS::setUp(uint64_t target_base_mod, const seal::SEALContext& context,
 
 Code HomBNSS::setUp(uint64_t target_base_mod, const std::vector<seal::SEALContext>& contexts,
                     std::vector<std::optional<seal::SecretKey>> sks,
-                    std::vector<std::shared_ptr<seal::PublicKey>> pks) {
+                    std::vector<std::shared_ptr<seal::PublicKey>> pks, int n_base_bits) {
     ENSURE_OR_RETURN(!contexts.empty(), Code::ERR_CONFIG);
     ENSURE_OR_RETURN(sks.empty() || contexts.size() == sks.size(), Code::ERR_CONFIG);
 
@@ -161,7 +162,7 @@ Code HomBNSS::setUp(uint64_t target_base_mod, const std::vector<seal::SEALContex
     } else {
         const int nbits_crt_plain
             = crt_context.key_context_data()->total_coeff_modulus_bit_count() - 1;
-        const int n_base_mod_bits = Log2(target_base_mod);
+        const int n_base_mod_bits = n_base_bits > 0 ? n_base_bits : Log2(target_base_mod);
         if (nbits_crt_plain < 2 * n_base_mod_bits + 1 + kStatBits) {
             LOG(FATAL) << "HomBNSS require more primes to convert the target nbits of "
                           "shares. Require "
@@ -174,7 +175,7 @@ Code HomBNSS::setUp(uint64_t target_base_mod, const std::vector<seal::SEALContex
     scheme_          = scheme;
     poly_degree_     = degree;
     target_base_mod_ = target_base_mod;
-    n_base_mod_bits_ = Log2(target_base_mod);
+    n_base_mod_bits_ = n_base_bits > 0 ? n_base_bits : Log2(target_base_mod);
     crt_context_     = std::make_shared<seal::SEALContext>(crt_context);
 
     contexts_.resize(nCRT);
@@ -234,7 +235,11 @@ Code HomBNSS::encryptVector(const Tensor<uint64_t>& in_vec, const Meta& meta,
             auto vec_pos_end = std::min<size_t>(vec_pos_bgn + sub_vec_len, meta.vec_shape.length());
             auto len         = vec_pos_end - vec_pos_bgn;
 
-            std::copy(in_vec.data() + vec_pos_bgn, in_vec.data() + vec_pos_end, tmp.data());
+            // reduced modulo the slot prime: shares wider than it (64 bits) are taken as integers, which is
+            // what the CRT composition of the product expects
+            const auto& prime = contexts_[crt_idx]->first_context_data()->parms().plain_modulus();
+            for (size_t d = 0; d < len; ++d)
+                tmp[d] = seal::util::barrett_reduce_64(in_vec.data()[vec_pos_bgn + d], prime);
             std::fill(tmp.begin() + len, tmp.end(), 0);
 
             encoders_[crt_idx]->encode(tmp, enc[k]);
@@ -276,7 +281,11 @@ Code HomBNSS::encryptVector(const Tensor<uint64_t>& in_vec, const Meta& meta,
             auto vec_pos_end = std::min<size_t>(vec_pos_bgn + sub_vec_len, meta.vec_shape.length());
             auto len         = vec_pos_end - vec_pos_bgn;
 
-            std::copy(in_vec.data() + vec_pos_bgn, in_vec.data() + vec_pos_end, tmp.data());
+            // reduced modulo the slot prime: shares wider than it (64 bits) are taken as integers, which is
+            // what the CRT composition of the product expects
+            const auto& prime = contexts_[crt_idx]->first_context_data()->parms().plain_modulus();
+            for (size_t d = 0; d < len; ++d)
+                tmp[d] = seal::util::barrett_reduce_64(in_vec.data()[vec_pos_bgn + d], prime);
             std::fill(tmp.begin() + len, tmp.end(), 0);
 
             encoders_[crt_idx]->encode(tmp, pt);
@@ -332,7 +341,11 @@ Code HomBNSS::encodeVector(const Tensor<uint64_t>& in_vec, const Meta& meta,
             auto vec_pos_end = std::min<size_t>(vec_pos_bgn + sub_vec_len, meta.vec_shape.length());
             auto len         = vec_pos_end - vec_pos_bgn;
 
-            std::copy(in_vec.data() + vec_pos_bgn, in_vec.data() + vec_pos_end, tmp.data());
+            // reduced modulo the slot prime: shares wider than it (64 bits) are taken as integers, which is
+            // what the CRT composition of the product expects
+            const auto& prime = contexts_[crt_idx]->first_context_data()->parms().plain_modulus();
+            for (size_t d = 0; d < len; ++d)
+                tmp[d] = seal::util::barrett_reduce_64(in_vec.data()[vec_pos_bgn + d], prime);
             std::fill(tmp.begin() + len, tmp.end(), 0);
             encoders_[crt_idx]->encode(tmp, out.at(k));
         }
@@ -409,12 +422,14 @@ Code HomBNSS::addMaskRing(std::vector<seal::Ciphertext>& cts, Tensor<uint64_t>& 
     // sample uniform random in r \in [0, 2^{2k+1+sigma})
     const int n_random_bits  = 2 * n_base_mod_bits_ + 1 + kStatBits;
     const int n_random_limbs = CeilDiv(n_random_bits, 64);
-    if (n_random_limbs > 2) {
+    if (n_random_limbs > 3) {
         LOG(FATAL) << "Not implement yet";
     }
+    // the top limb keeps n_random_bits - 64 (limbs - 1) bits (it kept the complement before: an 87-bit r for
+    // 32-bit shares instead of 105 bits, so 2^-22 statistical hiding instead of 2^-40)
     const uint64_t msb_mask = [&]() -> uint64_t {
-        int nlow = n_random_limbs * 64 - n_random_bits;
-        return nlow == 0 ? static_cast<uint64_t>(-1) : (1ULL << nlow) - 1;
+        int ntop = n_random_bits - 64 * (n_random_limbs - 1);
+        return ntop >= 64 ? static_cast<uint64_t>(-1) : (1ULL << ntop) - 1;
     }();
 
     std::vector<uint64_t> random(meta.vec_shape.length() * n_random_limbs);
@@ -427,7 +442,7 @@ Code HomBNSS::addMaskRing(std::vector<seal::Ciphertext>& cts, Tensor<uint64_t>& 
     // -r mod 2^k
     // mask.Reshape(meta.vec_shape);
     assert(mask.shape() == meta.vec_shape);
-    const uint64_t mod_mask = (1ULL << n_base_mod_bits_) - 1;
+    const uint64_t mod_mask = n_base_mod_bits_ >= 64 ? ~0ULL : (1ULL << n_base_mod_bits_) - 1;
     for (size_t i = 0, j = 0; i < random.size(); i += n_random_limbs, ++j) {
         mask(j) = (-random[i]) & mod_mask;
     }
@@ -440,15 +455,12 @@ Code HomBNSS::addMaskRing(std::vector<seal::Ciphertext>& cts, Tensor<uint64_t>& 
         for (size_t i = start; i < end; ++i) {
             size_t crt_idx = i / n_sub_vecs;
             size_t j       = (i % n_sub_vecs);
-            // nlimbs = 2
-            auto rnd_ptr     = random.cbegin() + 2 * j * sub_vec_len;
+            auto rnd_ptr     = random.data() + n_random_limbs * j * sub_vec_len;
             auto vec_pos_bgn = (i % n_sub_vecs) * sub_vec_len;
             auto vec_pos_end = std::min<size_t>(vec_pos_bgn + sub_vec_len, meta.vec_shape.length());
             auto slot_dst    = slots.begin();
-            for (size_t d = vec_pos_bgn; d < vec_pos_end; ++d) {
-                uint64_t u128[2]{*rnd_ptr++, *rnd_ptr++};
-                *slot_dst++ = seal::util::barrett_reduce_128(u128, crt_primes[crt_idx]);
-            }
+            for (size_t d = vec_pos_bgn; d < vec_pos_end; ++d, rnd_ptr += n_random_limbs)
+                *slot_dst++ = seal::util::modulo_uint(rnd_ptr, n_random_limbs, crt_primes[crt_idx]);
             // zero-padding the un-used slots.
             std::fill(slot_dst, slots.end(), 0);
             encoders_[crt_idx]->encode(slots, pt);
@@ -525,7 +537,7 @@ Code HomBNSS::decryptToVector(const std::vector<seal::Ciphertext>& in_vec, const
     if (nCRT > 1) {
         auto tl = seal::MemoryManager::GetPool(seal::mm_force_thread_local);
         rns_tool->base_q()->compose_array(tmp.data(), meta.vec_shape.length(), tl);
-        const uint64_t mod_mask = (1UL << n_base_mod_bits_) - 1;
+        const uint64_t mod_mask = n_base_mod_bits_ >= 64 ? ~0ULL : (1UL << n_base_mod_bits_) - 1;
         for (long i = 0, j = 0; i < meta.vec_shape.length(); ++i, j += nCRT) {
             out_vec(i) = tmp[j] & mod_mask;
         }
